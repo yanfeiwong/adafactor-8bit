@@ -2,9 +2,9 @@
 
 # Adafactor 8-bit with Fused CUDA Kernels
 
-A highly memory-efficient and fast 8-bit Adafactor optimizer.
+An 8-bit Adafactor optimizer designed for memory-efficient large-scale model training.
 
-By leveraging fused CUDA operators and block-wise quantization, it further reduces the memory footprint of optimizer states while maintaining training stability, providing a superior memory solution for training large models such as LLMs and Diffusion models.
+It uses fused CUDA kernels and block-wise quantization to reduce optimizer state memory while maintaining training stability, making it suitable for training large models such as LLMs and diffusion models.
 
 ## Key Features
 
@@ -24,11 +24,15 @@ Rebuilt upon the official PyTorch Adafactor, the mathematical logic **aligns mor
 
 - **Memory Footprint**: The memory usage of optimizer states is **significantly lower than `AdamW8Bit`** (bitsandbytes), making it an ideal choice for training massive models or when memory-constrained.
 - **Training Speed**: The Fused Kernel and Zero-Sync design enable it to achieve step speeds comparable to mainstream 8-bit optimizers.
-- **Quantization Precision & Stability**: The second moment (variance) in Adafactor is always non-negative, so we map it to `UINT8 (0~255)`. Compared to traditional 8-bit optimizers that map to `INT8 (-127~127)`, the effective precision is doubled, yielding better numerical stability during training.
+- **Quantization Precision & Stability**: The second moment (variance) in Adafactor is always non-negative, so we map it to `UINT8 (0~255)`. Compared to traditional 8-bit optimizers that map to `INT8 (-127~127)`, providing higher effective quantization precision within the non-negative variance domain.
 
 ## Installation
 
-This project uses JIT (Just-In-Time) compilation. If CUDA compilation fails, the optimizer will automatically fall back to the pure PyTorch implementation. Please ensure `torch` and `ninja` are installed in your environment, and a CUDA compiler (like MSVC or GCC) is configured.
+This project uses JIT (Just-In-Time) compilation.
+
+Please ensure torch and ninja are installed, and a CUDA compiler (such as MSVC or GCC) is available in your environment.
+
+If CUDA compilation fails, the optimizer will automatically fall back to the pure PyTorch implementation.
 
 
 ```bash
@@ -75,7 +79,7 @@ For a complete example, please refer to [basic_usage.py](./examples/basic_usage.
 
 ## Acknowledgements
 
-Thanks to the large language models Qwen and DeepSeek for their valuable technical discussions and code reviews on CUDA low-level optimization, memory safety mechanisms, and cross-platform compilation pipeline design.
+Thanks to the large language models Qwen and DeepSeek for valuable technical discussions and code reviews on CUDA low-level optimization, memory safety mechanisms, and cross-platform compilation pipeline design.
 
 Thanks to Tim Dettmers for the inspiration from the paper [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/pdf/2110.02861) and the [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) library.
 
@@ -83,4 +87,4 @@ Thanks to the PyTorch team for providing the foundational Optimizer implementati
 
 ## License
 
-[MIT License](./LICENSE)
+[The project is released under the MIT License.](./LICENSE)
