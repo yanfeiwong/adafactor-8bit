@@ -1,0 +1,3 @@
+include adafactor8bit/*.cu
+include LICENSE
+include README.md
