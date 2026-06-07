@@ -34,10 +34,19 @@ Please ensure torch and ninja are installed, and a CUDA compiler (such as MSVC o
 
 If CUDA compilation fails, the optimizer will automatically fall back to the pure PyTorch implementation.
 
+### From PyPI
+
+```bash
+pip install -U adafactor8bit
+```
+
+### From Source
 
 ```bash
 pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 ```
+
+**Note**: The first time you instantiate the optimizer (or run the example script), it will automatically trigger the JIT compilation of the CUDA source code in the background. This may take anywhere from a few seconds to a couple of minutes depending on your system, and the terminal might appear unresponsive. Please be patient. Once compiled, the binary will be cached, and all subsequent runs will be instantaneous.
 
 ## Usage Example
 

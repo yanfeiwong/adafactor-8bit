@@ -35,9 +35,19 @@
 如果 CUDA 编译失败，优化器会自动回退到纯 PyTorch 实现。
 
 
+### From PyPI
+
+```bash
+pip install -U adafactor8bit
+```
+
+### From Source
+
 ```bash
 pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 ```
+
+**注意**：首次实例化优化器（或运行示例代码）时，系统会在后台自动触发 CUDA 源码的 JIT 编译。这可能需要几十秒到几分钟的时间（取决于您的硬件与编译器），期间终端可能无明显输出，请耐心等待。编译完成后结果会被自动缓存，后续的所有运行都将瞬间完成。
 
 ## 使用示例
 
