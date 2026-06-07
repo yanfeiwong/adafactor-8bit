@@ -12,7 +12,7 @@ It uses fused CUDA kernels and block-wise quantization to reduce optimizer state
 - **Zero CPU-GPU Sync**: Refactored the control flow to eliminate implicit synchronizations, ensuring the GPU computation pipeline runs asynchronously at high speed.
 - **Cross-Platform JIT**: Utilizes JIT (Just-In-Time) automatic compilation for seamless setup across Windows and Linux environments.
 
-## Algorithm Implementation
+## Algorithm Details
 
 Rebuilt upon the official PyTorch Adafactor, the mathematical logic **aligns more closely with the original paper and `HuggingFace transformers`**. Key differences include:
 

@@ -12,7 +12,7 @@
 - **Zero CPU-GPU Sync**: 重构了控制流，消除了一些隐式同步，确保 GPU 计算流水线高速异步运行。
 - **Cross-Platform JIT**: 使用 Windows/Linux 环境下的 JIT 自动编译。
 
-## 算法实现说明
+## 算法细节改动
 
 项目基于 PyTorch 官方 Adafactor 的基础上进行了重构，数学逻辑**更贴近原版论文代码与 `HuggingFace transformers` 的实现**，主要区别如下：
 
