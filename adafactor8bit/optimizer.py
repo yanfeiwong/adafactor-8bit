@@ -61,7 +61,6 @@ def _load_cuda_module() -> bool:
 
     return _CUDA_AVAILABLE
 
-
 # ==========================================
 # 2. Quantization Utilities
 # ==========================================
@@ -90,7 +89,6 @@ def _pad_to_block_size(tensor: Tensor, block_size: int) -> Tensor:
     if pad_len > 0:
         return torch.nn.functional.pad(flat, (0, pad_len))
     return flat
-
 
 # ==========================================
 # 3. Optimizer Core
@@ -165,10 +163,13 @@ class Adafactor8Bit(Optimizer):
                 state["block_size"] = block_size
 
                 if p.grad.dim() >= 2:
-                    R = p.grad.shape[0]
-                    C = p.grad.numel() // R
-                    r_shape = [R, 1]
-                    c_shape = [1, C]
+                    shape = p.grad.shape
+                    R = shape[-2]
+                    C = shape[-1]
+                    batch_shape = shape[:-2]
+                    
+                    r_shape = list(batch_shape) + [R, 1]
+                    c_shape = list(batch_shape) + [1, C]
                     
                     if use_quant:
                         r_tmp = torch.zeros(r_shape, device=p.device)
@@ -182,7 +183,6 @@ class Adafactor8Bit(Optimizer):
                         state["row_var"] = torch.zeros(r_shape, device=p.device)
                         state["col_var"] = torch.zeros(c_shape, device=p.device)
                 else:
-                    # 纯 1D 逻辑 (Embedding/Norm) 保持不变
                     if use_quant:
                         v_tmp = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
                         q, s, sh, pad = _quantize_nonneg(v_tmp, block_size)
@@ -264,7 +264,6 @@ class Adafactor8Bit(Optimizer):
                 )
         return loss
 
-
 # ==========================================
 # 4. Parameter Update Logic
 # ==========================================
@@ -324,77 +323,11 @@ def _update_param_8bit(
     if weight_decay != 0:
         param_work.mul_(1.0 - alpha * weight_decay)
 
-    if grad_fp32.dim() >= 2:
-        R = grad_fp32.shape[0]
-        C = grad_fp32.numel() // R
-        
-        # 零拷贝视图 (Zero-copy View)
-        grad_2d = grad_fp32.reshape(R, C)
-        param_2d = param_work.reshape(R, C)
+    # 兼容 0-D 标量和 1-D 向量
+    is_1d = grad_fp32.dim() < 2 
 
-        # 1. 计算行列均值 (避免物化 grad_sq)
-        row_mean = torch.norm(grad_2d, dim=-1, keepdim=True).square_().div_(C).add_(eps1)
-        col_mean = torch.norm(grad_2d, dim=-2, keepdim=True).square_().div_(R).add_(eps1)
-
-        if quantize:
-            if _load_cuda_module():
-                row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
-                col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
-
-                _CUDA_MODULE.fused_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size)
-                _CUDA_MODULE.fused_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
-
-                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
-                row_mean_val_tensor = row_var.mean().clamp_(min=eps1)
-                
-                numel = R * C
-                total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
-                
-                # 2. 传入 2D Kernel
-                _CUDA_MODULE.compute_update_norm_2d(
-                    state["row_var_q"], state["row_var_scale"],
-                    state["col_var_q"], state["col_var_scale"],
-                    grad_2d, total_sum_sq, row_mean_val_tensor, eps1, R, C, numel, curr_block_size
-                )
-                
-                # 3. 原地更新参数
-                _CUDA_MODULE.apply_update_2d(
-                    param_2d, grad_2d,
-                    state["row_var_q"], state["row_var_scale"],
-                    state["col_var_q"], state["col_var_scale"],
-                    total_sum_sq, alpha, row_mean_val_tensor, d, eps1, R, C, numel, curr_block_size
-                )
-            else:
-                # Fallback 逻辑
-                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
-                col_var = _dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
-                row_var.lerp_(row_mean, beta_val)
-                col_var.lerp_(col_mean, beta_val)
-                q, s, sh, pad = _quantize_nonneg(row_var, curr_block_size)
-                state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
-                q, s, sh, pad = _quantize_nonneg(col_var, curr_block_size)
-                state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
-                
-                var_estimate = row_var @ col_var
-                var_estimate.div_(row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1))
-                update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_2d)
-                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-                param_2d.add_(update, alpha=-alpha / denom)
-        else:
-            # FP32 Fallback 逻辑
-            row_var = state["row_var"]
-            col_var = state["col_var"]
-            row_var.lerp_(row_mean, beta_val)
-            col_var.lerp_(col_mean, beta_val)
-            
-            var_estimate = row_var @ col_var
-            var_estimate.div_(row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1))
-            update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_2d)
-            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-            param_2d.add_(update, alpha=-alpha / denom)
-
-    else:
-        # 1D 路径 (Embedding/Norm) 保持不变
+    if is_1d:
+        # 1D/0D 逻辑 (参数量小，物化 grad_sq 无妨)
         grad_sq = grad_fp32.square().add_(eps1)
         if quantize:
             if _load_cuda_module():
@@ -414,7 +347,7 @@ def _update_param_8bit(
                 )
                 
                 _CUDA_MODULE.apply_update_1d(
-                    param_work, grad_fp32_flat,
+                    param_work.view(-1), grad_fp32_flat,
                     variance_q_flat, variance_scale_flat,
                     total_sum_sq, alpha, d, eps1, numel, curr_block_size
                 )
@@ -431,6 +364,80 @@ def _update_param_8bit(
             variance = state["variance"]
             variance.lerp_(grad_sq, beta_val)
             update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+            param_work.add_(update, alpha=-alpha / denom)
+
+    else:
+        #N-D 张量严格沿最后两维分解
+        shape = grad_fp32.shape
+        R = shape[-2]
+        C = shape[-1]
+        numel = grad_fp32.numel()
+        
+        #使用 torch.norm：避免在 Eager Mode 下物化 [R, C] 的 grad_sq 中间张量
+        row_mean = torch.norm(grad_fp32, dim=-1, keepdim=True).square_().div_(C).add_(eps1)
+        col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R).add_(eps1)
+
+        if quantize:
+            if _load_cuda_module():
+                row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
+                col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
+
+                _CUDA_MODULE.fused_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size)
+                _CUDA_MODULE.fused_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
+
+                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
+                
+                #链式调用清理冗余变量
+                row_mean_val_flat = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1).flatten().contiguous()
+                
+                grad_flat = grad_fp32.reshape(-1)
+                row_var_q_flat = state["row_var_q"].reshape(-1)
+                col_var_q_flat = state["col_var_q"].reshape(-1)
+                
+                total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
+                
+                _CUDA_MODULE.compute_update_norm_2d(
+                    row_var_q_flat, state["row_var_scale"],
+                    col_var_q_flat, state["col_var_scale"],
+                    grad_flat, total_sum_sq, row_mean_val_flat, eps1, R, C, numel, curr_block_size
+                )
+                
+                param_flat = param_work.reshape(-1)
+                _CUDA_MODULE.apply_update_2d(
+                    param_flat, grad_flat,
+                    row_var_q_flat, state["row_var_scale"],
+                    col_var_q_flat, state["col_var_scale"],
+                    total_sum_sq, alpha, row_mean_val_flat, d, eps1, R, C, numel, curr_block_size
+                )
+            else:
+                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
+                col_var = _dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
+                row_var.lerp_(row_mean, beta_val)
+                col_var.lerp_(col_mean, beta_val)
+                q, s, sh, pad = _quantize_nonneg(row_var, curr_block_size)
+                state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
+                q, s, sh, pad = _quantize_nonneg(col_var, curr_block_size)
+                state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
+                
+                var_estimate = row_var * col_var 
+                row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
+                var_estimate.div_(row_mean_val)
+                
+                update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+                param_work.add_(update, alpha=-alpha / denom)
+        else:
+            row_var = state["row_var"]
+            col_var = state["col_var"]
+            row_var.lerp_(row_mean, beta_val)
+            col_var.lerp_(col_mean, beta_val)
+            
+            var_estimate = row_var * col_var
+            row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
+            var_estimate.div_(row_mean_val)
+            
+            update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
             denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
             param_work.add_(update, alpha=-alpha / denom)
 

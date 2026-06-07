@@ -132,7 +132,7 @@ torch::Tensor fused_quantize_lerp_cuda(
 
 
 // ==========================================
-// 2. Phase 1: Compute Update Norm (2D Matrix)
+// 2. Phase 1: Compute Update Norm (N-D Matrix mapped to 2D)
 // ==========================================
 __global__ void compute_update_norm_2d_kernel(
     const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
@@ -141,15 +141,21 @@ __global__ void compute_update_norm_2d_kernel(
     const float* __restrict__ row_mean_val_ptr, float eps, int R, int C, int numel, int block_size)
 {
     float sq = 0.0f;
-    float row_mean_val = *row_mean_val_ptr; 
     
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int i = idx / C;
-        int j = idx - i * C;
         
-        float r_val = (float)row_var_q[i] * INV_255 * row_var_scale[i / block_size];
-        float c_val = (float)col_var_q[j] * INV_255 * col_var_scale[j / block_size];
+        int b = idx / (R * C);
+        int r = (idx / C) % R;
+        int c = idx % C;
+        
+        int row_var_idx = b * R + r;
+        int col_var_idx = b * C + c;
+        
+        float r_val = (float)row_var_q[row_var_idx] * INV_255 * row_var_scale[row_var_idx / block_size];
+        float c_val = (float)col_var_q[col_var_idx] * INV_255 * col_var_scale[col_var_idx / block_size];
+        
+        float row_mean_val = row_mean_val_ptr[b];
         
         float v_ij = (r_val * c_val) / row_mean_val;
         float u_ij = grad[idx] * rsqrtf(fmaxf(v_ij, eps));
@@ -201,7 +207,7 @@ void compute_update_norm_2d_cuda(
 
 
 // ==========================================
-// 3. Phase 2: Apply Update (2D Matrix)
+// 3. Phase 2: Apply Update (N-D Matrix mapped to 2D)
 // ==========================================
 template <typename scalar_t>
 __global__ void apply_update_2d_kernel(
@@ -213,17 +219,22 @@ __global__ void apply_update_2d_kernel(
 {
     float sum_sq_val = *sum_sq_ptr;
     float alpha_val = *alpha;
-    float row_mean_val = *row_mean_val_ptr;
     float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
     float step_size = alpha_val / denom;
 
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int i = idx / C;
-        int j = idx - i * C; 
+        int b = idx / (R * C);
+        int r = (idx / C) % R;
+        int c = idx % C;
         
-        float r_val = (float)row_var_q[i] * INV_255 * row_var_scale[i / block_size];
-        float c_val = (float)col_var_q[j] * INV_255 * col_var_scale[j / block_size];
+        int row_var_idx = b * R + r;
+        int col_var_idx = b * C + c;
+        
+        float r_val = (float)row_var_q[row_var_idx] * INV_255 * row_var_scale[row_var_idx / block_size];
+        float c_val = (float)col_var_q[col_var_idx] * INV_255 * col_var_scale[col_var_idx / block_size];
+        
+        float row_mean_val = row_mean_val_ptr[b];
         
         float v_ij = (r_val * c_val) / row_mean_val;
         float u_ij = grad[idx] * rsqrtf(fmaxf(v_ij, eps));
@@ -287,7 +298,7 @@ __global__ void compute_update_norm_1d_kernel(
             float other = __shfl_down_sync(0xffffffff, sq, offset);
             if (lane + offset < num_warps) sq += other;
         }
-        if (lane == 0) atomicAdd(total_sum_sq, sq); 
+        if (lane == 0) atomicAdd(total_sum_sq, sq);
     }
 }
 
