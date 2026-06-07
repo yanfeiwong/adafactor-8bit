@@ -22,12 +22,17 @@ logger = logging.getLogger(__name__)
 _CUDA_MODULE = None
 _CUDA_AVAILABLE = False
 
-
 def _load_cuda_module() -> bool:
     global _CUDA_MODULE, _CUDA_AVAILABLE
     if _CUDA_MODULE is not None or _CUDA_AVAILABLE:
         return _CUDA_AVAILABLE
 
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 7:
+            logger.warning(f"Adafactor8Bit: GPU Compute Capability {cap[0]}.{cap[1]} < 7.0. Falling back to PyTorch.")
+            return False
+        
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cu_path = os.path.join(current_dir, "kernels.cu")
 
@@ -61,7 +66,6 @@ def _load_cuda_module() -> bool:
 # 2. Quantization Utilities
 # ==========================================
 def _quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Tensor, torch.Size, int]:
-    """将非负 FP32 张量分块量化为 UINT8 (0-255)"""
     shape = tensor.shape
     flat = tensor.flatten()
     pad = (block_size - flat.numel() % block_size) % block_size
@@ -73,14 +77,12 @@ def _quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Te
     q = torch.round((blocks / scale * 255.0).clamp_(0, 255)).to(torch.uint8)
     return q, scale.squeeze(-1), shape, pad
 
-
 def _dequantize_nonneg(q: Tensor, scale: Tensor, shape: torch.Size, pad: int) -> Tensor:
     blocks = q.float() * scale.unsqueeze(-1) / 255.0
     flat = blocks.flatten()
     if pad:
         flat = flat[:-pad]
     return flat.view(shape)
-
 
 def _pad_to_block_size(tensor: Tensor, block_size: int) -> Tensor:
     flat = tensor.contiguous().flatten()
@@ -94,13 +96,6 @@ def _pad_to_block_size(tensor: Tensor, block_size: int) -> Tensor:
 # 3. Optimizer Core
 # ==========================================
 class Adafactor8Bit(Optimizer):
-    """
-    8-bit Adafactor Optimizer with Fused CUDA Kernels.
-
-    Implements block-wise quantization for optimizer states, drastically reducing
-    memory footprint while maintaining training stability.
-    """
-
     def __init__(
         self,
         params: Iterable[Union[Tensor, Dict[str, Any]]],
@@ -116,26 +111,16 @@ class Adafactor8Bit(Optimizer):
         block_size: int = 2048,
         min_8bit_size: int = 4096,
     ):
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 >= beta2_decay:
-            raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
-
+        if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")
+        if not 0.0 >= beta2_decay: raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
         eps1, eps2 = eps
-        if eps1 is not None and not 0.0 <= eps1:
-            raise ValueError(f"Invalid epsilon1: {eps1}")
-        if not 0.0 <= eps2:
-            raise ValueError(f"Invalid epsilon2: {eps2}")
-        if not 1.0 <= d:
-            raise ValueError(f"Invalid clipping threshold d: {d}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if eps1 is not None and not 0.0 <= eps1: raise ValueError(f"Invalid eps1: {eps1}")
+        if not 0.0 <= eps2: raise ValueError(f"Invalid eps2: {eps2}")
+        if not 1.0 <= d: raise ValueError(f"Invalid d: {d}")
+        if not 0.0 <= weight_decay: raise ValueError(f"Invalid weight_decay: {weight_decay}")
         
         if quantize and block_size % 1024 != 0:
-            raise ValueError(
-                f"block_size must be a multiple of 1024 for CUDA float4 vectorization, "
-                f"but got {block_size}. (Recommended: 2048 or 4096)"
-            )
+            raise ValueError(f"block_size must be a multiple of 1024, but got {block_size}.")
 
         defaults = dict(
             lr=lr, beta2_decay=beta2_decay, eps=eps, d=d, weight_decay=weight_decay,
@@ -144,21 +129,13 @@ class Adafactor8Bit(Optimizer):
         )
         super().__init__(params, defaults)
 
-    def _init_group(
-        self,
-        group: Dict[str, Any],
-        params_with_grad: List[Tensor],
-        grads: List[Tensor],
-        states: List[Dict[str, Any]],
-        state_steps: List[float]
-    ):
+    def _init_group(self, group, params_with_grad, grads, states, state_steps):
         group_quantize = group.get("quantize", True)
         block_size = group.get("block_size", 2048)
         min_8bit_size = group.get("min_8bit_size", 4096)
 
         for p in group["params"]:
-            if p.grad is None:
-                continue
+            if p.grad is None: continue
 
             force_fp32 = p.numel() < min_8bit_size
             use_quant = group_quantize and not force_fp32
@@ -167,21 +144,37 @@ class Adafactor8Bit(Optimizer):
             grads.append(p.grad)
             state = self.state[p]
 
+            needs_init = False
             if len(state) == 0:
-                state["step"] = 0.0
+                needs_init = True
+            else:
+                is_nd = (p.grad.dim() >= 2)
+                has_row_col = ("row_var" in state or "row_var_q" in state)
+                has_var = ("variance" in state or "variance_q" in state)
+                
+                if (is_nd and has_var) or (not is_nd and has_row_col):
+                    logger.warning(f"Adafactor8Bit: State structure mismatch for param shape {p.shape}. Re-initializing state.")
+                    step_backup = state.get("step", 0.0)
+                    state.clear()
+                    state["step"] = step_backup
+                    needs_init = True
+
+            if needs_init:
+                state.setdefault("step", 0.0)
                 state["is_quantized"] = use_quant
                 state["block_size"] = block_size
 
-                if p.grad.dim() > 1:
-                    r_shape = list(p.grad.shape)
-                    r_shape[-1] = 1
-                    c_shape = list(p.grad.shape)
-                    c_shape[-2] = 1
+                if p.grad.dim() >= 2:
+                    R = p.grad.shape[0]
+                    C = p.grad.numel() // R
+                    r_shape = [R, 1]
+                    c_shape = [1, C]
+                    
                     if use_quant:
                         r_tmp = torch.zeros(r_shape, device=p.device)
                         q, s, sh, pad = _quantize_nonneg(r_tmp, block_size)
                         state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
-
+                        
                         c_tmp = torch.zeros(c_shape, device=p.device)
                         q, s, sh, pad = _quantize_nonneg(c_tmp, block_size)
                         state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
@@ -189,6 +182,7 @@ class Adafactor8Bit(Optimizer):
                         state["row_var"] = torch.zeros(r_shape, device=p.device)
                         state["col_var"] = torch.zeros(c_shape, device=p.device)
                 else:
+                    # 纯 1D 逻辑 (Embedding/Norm) 保持不变
                     if use_quant:
                         v_tmp = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
                         q, s, sh, pad = _quantize_nonneg(v_tmp, block_size)
@@ -196,7 +190,6 @@ class Adafactor8Bit(Optimizer):
                     else:
                         state["variance"] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
             else:
-                # Checkpoint Compatibility & Device Alignment
                 if torch.is_tensor(state["step"]):
                     state["step"] = float(state["step"].item())
                 elif not isinstance(state["step"], (int, float)):
@@ -206,8 +199,6 @@ class Adafactor8Bit(Optimizer):
                     if isinstance(state[k], torch.Tensor):
                         if state[k].device != p.device:
                             state[k] = state[k].to(p.device)
-
-                        # Defensive dtype casting for legacy checkpoints
                         if k.endswith("_q") and state[k].dtype != torch.uint8:
                             state[k] = state[k].to(torch.uint8)
                             scale_key = k.replace("_q", "_scale")
@@ -216,9 +207,8 @@ class Adafactor8Bit(Optimizer):
 
                 curr_block_size = state.get("block_size", block_size)
 
-                # Auto Upgrade: FP32 -> 8-bit
                 if use_quant and not state.get("is_quantized", False):
-                    if p.grad.dim() > 1:
+                    if p.grad.dim() >= 2:
                         if "row_var" in state and "row_var_q" not in state:
                             q, s, sh, pad = _quantize_nonneg(state["row_var"], curr_block_size)
                             state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
@@ -233,10 +223,9 @@ class Adafactor8Bit(Optimizer):
                             state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                             del state["variance"]
                     state["is_quantized"] = True
-
-                # Auto Downgrade: 8-bit -> FP32
+                
                 elif not use_quant and state.get("is_quantized", False):
-                    if p.grad.dim() > 1:
+                    if p.grad.dim() >= 2:
                         if "row_var_q" in state:
                             state["row_var"] = _dequantize_nonneg(state.pop("row_var_q"), state.pop("row_var_scale"), state.pop("row_var_shape"), state.pop("row_var_pad"))
                         if "col_var_q" in state:
@@ -256,11 +245,9 @@ class Adafactor8Bit(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        """Performs a single optimization step."""
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+            with torch.enable_grad(): loss = closure()
 
         for group in self.param_groups:
             params_with_grad, grads, states, state_steps = [], [], [], []
@@ -293,43 +280,61 @@ def _update_param_8bit(
     scale_parameter: bool, 
     block_size: int
 ):
-    if maximize:
-        grad = -grad
     if eps1 is None:
         eps1 = torch.finfo(param.dtype).eps
+
+    original_dtype = param.dtype
+    
+    grad_fp32 = grad.float()
+    if not grad_fp32.is_contiguous():
+        grad_fp32 = grad_fp32.contiguous()
+    if maximize:
+        grad_fp32 = grad_fp32.neg()
+
+    if not param.is_contiguous():
+        param_work = param.contiguous()
+        needs_copy_back = True
+    else:
+        param_work = param
+        needs_copy_back = False
 
     quantize = state.get("is_quantized", False)
     curr_block_size = state.get("block_size", block_size)
 
-    # 1. Pure CPU step increment (Zero Sync)
     step = state["step"] + 1.0
     state["step"] = step
     beta_val = math.pow(step, beta2_decay)
 
-    # 2. Learning Rate scheduling
     if isinstance(lr, float):
         rho = min(lr, 1.0 / math.sqrt(step)) if relative_step else lr
-        rho_t = torch.tensor(rho, device=param.device, dtype=torch.float32)
+        rho_t = torch.tensor(rho, device=param_work.device, dtype=torch.float32)
     else:
         if relative_step:
-            step_t = torch.tensor(step, device=param.device, dtype=torch.float32)
+            step_t = torch.tensor(step, device=param_work.device, dtype=torch.float32)
             rho_t = torch.minimum(step_t.rsqrt(), lr)
         else:
             rho_t = lr
 
     if scale_parameter:
-        param_rms = param.norm(2) / math.sqrt(param.numel())
+        param_rms = param_work.float().norm(2) / math.sqrt(param_work.numel())
         alpha = torch.clamp(param_rms, min=eps2) * rho_t
     else:
         alpha = rho_t
 
     if weight_decay != 0:
-        param.mul_(1 - alpha * weight_decay)
+        param_work.mul_(1.0 - alpha * weight_decay)
 
-    # 3. Second Moment Estimation
-    if grad.dim() > 1:
-        row_mean = torch.norm(grad, dim=-1, keepdim=True).square_().div_(grad.size(-1)).add_(eps1)
-        col_mean = torch.norm(grad, dim=-2, keepdim=True).square_().div_(grad.size(-2)).add_(eps1)
+    if grad_fp32.dim() >= 2:
+        R = grad_fp32.shape[0]
+        C = grad_fp32.numel() // R
+        
+        # 零拷贝视图 (Zero-copy View)
+        grad_2d = grad_fp32.reshape(R, C)
+        param_2d = param_work.reshape(R, C)
+
+        # 1. 计算行列均值 (避免物化 grad_sq)
+        row_mean = torch.norm(grad_2d, dim=-1, keepdim=True).square_().div_(C).add_(eps1)
+        col_mean = torch.norm(grad_2d, dim=-2, keepdim=True).square_().div_(R).add_(eps1)
 
         if quantize:
             if _load_cuda_module():
@@ -340,8 +345,27 @@ def _update_param_8bit(
                 _CUDA_MODULE.fused_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
 
                 row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
-                col_var = _dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
+                row_mean_val_tensor = row_var.mean().clamp_(min=eps1)
+                
+                numel = R * C
+                total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
+                
+                # 2. 传入 2D Kernel
+                _CUDA_MODULE.compute_update_norm_2d(
+                    state["row_var_q"], state["row_var_scale"],
+                    state["col_var_q"], state["col_var_scale"],
+                    grad_2d, total_sum_sq, row_mean_val_tensor, eps1, R, C, numel, curr_block_size
+                )
+                
+                # 3. 原地更新参数
+                _CUDA_MODULE.apply_update_2d(
+                    param_2d, grad_2d,
+                    state["row_var_q"], state["row_var_scale"],
+                    state["col_var_q"], state["col_var_scale"],
+                    total_sum_sq, alpha, row_mean_val_tensor, d, eps1, R, C, numel, curr_block_size
+                )
             else:
+                # Fallback 逻辑
                 row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
                 col_var = _dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
                 row_var.lerp_(row_mean, beta_val)
@@ -350,34 +374,65 @@ def _update_param_8bit(
                 state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
                 q, s, sh, pad = _quantize_nonneg(col_var, curr_block_size)
                 state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
+                
+                var_estimate = row_var @ col_var
+                var_estimate.div_(row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1))
+                update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_2d)
+                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+                param_2d.add_(update, alpha=-alpha / denom)
         else:
+            # FP32 Fallback 逻辑
             row_var = state["row_var"]
             col_var = state["col_var"]
             row_var.lerp_(row_mean, beta_val)
             col_var.lerp_(col_mean, beta_val)
-
-        var_estimate = row_var @ col_var
-        var_estimate.div_(row_var.mean(dim=-2, keepdim=True).clamp_(min=torch.finfo(param.dtype).eps))
+            
+            var_estimate = row_var @ col_var
+            var_estimate.div_(row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1))
+            update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_2d)
+            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+            param_2d.add_(update, alpha=-alpha / denom)
 
     else:
-        grad_sq = grad.square().add_(eps1)
+        # 1D 路径 (Embedding/Norm) 保持不变
+        grad_sq = grad_fp32.square().add_(eps1)
         if quantize:
             if _load_cuda_module():
                 grad_sq_padded = _pad_to_block_size(grad_sq, curr_block_size)
                 _CUDA_MODULE.fused_quantize_lerp(state["variance_q"], state["variance_scale"], grad_sq_padded, beta_val, curr_block_size)
-                variance = _dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
+                
+                numel = param_work.numel()
+                grad_fp32_flat = grad_fp32.view(-1)
+                variance_q_flat = state["variance_q"].view(-1)
+                variance_scale_flat = state["variance_scale"].view(-1)
+                
+                total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
+                
+                _CUDA_MODULE.compute_update_norm_1d(
+                    variance_q_flat, variance_scale_flat,
+                    grad_fp32_flat, total_sum_sq, eps1, numel, curr_block_size
+                )
+                
+                _CUDA_MODULE.apply_update_1d(
+                    param_work, grad_fp32_flat,
+                    variance_q_flat, variance_scale_flat,
+                    total_sum_sq, alpha, d, eps1, numel, curr_block_size
+                )
             else:
                 variance = _dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
                 variance.lerp_(grad_sq, beta_val)
                 q, s, sh, pad = _quantize_nonneg(variance, curr_block_size)
                 state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
+                
+                update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+                param_work.add_(update, alpha=-alpha / denom)
         else:
             variance = state["variance"]
             variance.lerp_(grad_sq, beta_val)
+            update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+            param_work.add_(update, alpha=-alpha / denom)
 
-        var_estimate = variance
-
-    # 4. Parameter Update & Gradient Clipping
-    update = var_estimate.clamp_(min=torch.finfo(param.dtype).eps).rsqrt_().mul_(grad)
-    denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-    param.add_(update, alpha=-alpha / denom)
+    if needs_copy_back:
+        param.copy_(param_work)
