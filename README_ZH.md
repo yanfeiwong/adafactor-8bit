@@ -1,15 +1,17 @@
-[English](./README.md) | **中文**
+<div align="center">
 
-# Adafactor 8-bit with Fused CUDA Kernels
+# 8-bit Adafactor with Fused CUDA Kernels
+
+[English](./README.md) | **中文**
 
 [![PyPI version](https://badge.fury.io/py/adafactor8bit.svg)](https://badge.fury.io/py/adafactor8bit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
 
-一个面向大规模模型训练的高显存效率 8-bit Adafactor 优化器。
+</div>
 
-通过 CUDA 融合算子与分块量化（Block-wise Quantization），在保持训练稳定性的同时降低优化器状态的显存占用，适用于 LLM 与 Diffusion 等大模型训练。
+一个专为显存高效的大规模模型训练而设计的 8-bit Adafactor 优化器。结合了融合 CUDA 算子与对数空间分块量化技术，旨在进一步降低优化器状态显存占用的同时，保持极低的单步更新开销与训练稳定性，适合训练 LLMs 和 Diffusion 模型。
 
 ## 核心特性
 

@@ -1,15 +1,17 @@
-**English** | [中文](https://github.com/yanfeiwong/adafactor-8bit/blob/main/README_ZH.md)
+<div align="center">
 
-# Adafactor 8-bit with Fused CUDA Kernels
+# 8-bit Adafactor with Fused CUDA Kernels
+
+**English** | [中文](https://github.com/yanfeiwong/adafactor-8bit/blob/main/README_ZH.md)
 
 [![PyPI version](https://badge.fury.io/py/adafactor8bit.svg)](https://badge.fury.io/py/adafactor8bit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
 
-An 8-bit Adafactor optimizer designed for memory-efficient large-scale model training.
+</div>
 
-It uses fused CUDA kernels and **log-space block-wise quantization** to reduce optimizer state memory while maintaining training stability, making it suitable for training large models such as LLMs and diffusion models.
+An 8-bit Adafactor optimizer featuring fused CUDA kernels and log-space block-wise quantization, designed to further reduce optimizer state memory while maintaining low step overhead and stability — suitable for large models such as LLMs and diffusion models.
 
 
 ## Key Features
