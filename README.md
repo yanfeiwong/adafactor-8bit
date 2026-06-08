@@ -2,35 +2,35 @@
 
 # Adafactor 8-bit with Fused CUDA Kernels
 
+[![PyPI version](https://badge.fury.io/py/adafactor8bit.svg)](https://badge.fury.io/py/adafactor8bit)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
+
 An 8-bit Adafactor optimizer designed for memory-efficient large-scale model training.
 
-It uses fused CUDA kernels and block-wise quantization to reduce optimizer state memory while maintaining training stability, making it suitable for training large models such as LLMs and diffusion models.
+It uses fused CUDA kernels and **log-space block-wise quantization** to reduce optimizer state memory while maintaining training stability, making it suitable for training large models such as LLMs and diffusion models.
+
 
 ## Key Features
 
-- **Fused CUDA Kernel**: Integrates dequantization, EMA updates, Warp-Shuffle reduction, and requantization into a single kernel, utilizing `float4` vectorization to maximize memory bandwidth utilization.
-- **Zero CPU-GPU Sync**: Refactored the control flow to eliminate implicit synchronizations, ensuring the GPU computation pipeline runs asynchronously at high speed.
-- **Cross-Platform JIT**: Utilizes JIT (Just-In-Time) automatic compilation for seamless setup across Windows and Linux environments.
-
-## Algorithm Details
-
-Rebuilt upon the official PyTorch Adafactor, the mathematical logic **aligns more closely with the original paper and `HuggingFace transformers`**. Key differences include:
-
-1. **Safe Injection of `eps1`**: The official PyTorch implementation defaults to `eps1=None` and relies on `clamp`, which can lead to NaNs when encountering zero or extremely small gradients. This project adopts the original `grad_squared + eps1` approach, fundamentally guaranteeing the strict positive definiteness of the second moment and preventing training crashes caused by `rsqrt(0)`.
-2. **Coupled Weight Decay**: Unlike the official PyTorch implementation which decouples Weight Decay from RMS, this project retains the Coupled mechanism from the original paper (Weight Decay multiplied by the effective learning rate that includes RMS scaling).
-3. **Standard Parameter Support**: Fully retains core Adafactor switches such as `relative_step` and `scale_parameter`, ensuring compatibility with existing learning rate scheduling strategies.
+- **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small gradient values being truncated to zero and improving overall training stability.
+- **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
+- **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
+- **Transformers Compatibility**: Aligns with the `transformers` Adafactor behavior (e.g., coupled weight decay, robust epsilon handling) to ensure stable large-scale training, while fully supporting standard scheduling switches like `relative_step`.
+- **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
 ## Performance
 
-- **Memory Footprint**: The memory usage of optimizer states is **significantly lower than `AdamW8Bit`** (bitsandbytes), making it an ideal choice for training massive models or when memory-constrained.
-- **Training Speed**: The Fused Kernel and Zero-Sync design enable it to achieve step speeds comparable to mainstream 8-bit optimizers.
-- **Quantization Precision & Stability**: The second moment (variance) in Adafactor is always non-negative, so we map it to `UINT8 (0~255)`. Compared to traditional 8-bit optimizers that map to `INT8 (-127~127)`, providing higher effective quantization precision within the non-negative variance domain.
+- **Memory Footprint**: Due to Adafactor's factorized second-moment estimation and 8-bit quantization, the optimizer state memory usage is generally lower than that of `AdamW8Bit`.
+- **Training Speed**: The fused kernel design and reduced synchronization overhead allow it to achieve step times comparable to other mainstream 8-bit optimizers.
+- **Quantization Precision**: The second moment (variance) in Adafactor is strictly non-negative and spans multiple orders of magnitude. By mapping it to `UINT8` in log2 space rather than linear space, the optimizer preserves relative precision for small variances, mitigating the instability often caused by outlier gradients in standard 8-bit quantization.
 
 ## Installation
 
 This project uses JIT (Just-In-Time) compilation.
 
-Please ensure torch and ninja are installed, and a CUDA compiler (such as MSVC or GCC) is available in your environment.
+Please ensure `torch` and `ninja` are installed, and a CUDA compiler (such as MSVC or GCC) is available in your environment.
 
 If CUDA compilation fails, the optimizer will automatically fall back to the pure PyTorch implementation.
 
@@ -46,7 +46,7 @@ pip install -U adafactor8bit
 pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 ```
 
-**Note**: The first time you instantiate the optimizer (or run the example script), it will automatically trigger the JIT compilation of the CUDA source code in the background. This may take anywhere from a few seconds to a couple of minutes depending on your system, and the terminal might appear unresponsive. Please be patient. Once compiled, the binary will be cached, and all subsequent runs will be instantaneous.
+**Note**: The first time you instantiate the optimizer (or run the example script), it will automatically trigger the JIT compilation of the CUDA source code in the background. This may take anywhere from a few seconds to a couple of minutes depending on your system, and the terminal might appear unresponsive. Once compiled, the binary will be cached, and all subsequent runs will be instantaneous.
 
 ## Usage Example
 
@@ -97,8 +97,3 @@ Thanks to the PyTorch team for providing the foundational Optimizer implementati
 ## License
 
 [The project is released under the MIT License.](./LICENSE)
-
-[![PyPI version](https://badge.fury.io/py/adafactor8bit.svg)](https://badge.fury.io/py/adafactor8bit)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)

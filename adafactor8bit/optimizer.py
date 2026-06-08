@@ -16,6 +16,9 @@ __all__ = ["Adafactor8Bit"]
 
 logger = logging.getLogger(__name__)
 
+_FP32_TINY = 1.17549435e-38 
+_FP32_MIN_LOG = -126.0
+
 # ==========================================
 # 1. CUDA Kernel JIT Loading
 # ==========================================
@@ -62,9 +65,10 @@ def _load_cuda_module() -> bool:
     return _CUDA_AVAILABLE
 
 # ==========================================
-# 2. Quantization Utilities
+# 2. Log-Quantization Utilities
 # ==========================================
-def _quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Tensor, torch.Size, int]:
+def _log_quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Tensor, torch.Size, int]:
+    """将非负 FP32 张量映射到对数空间后分块量化为 UINT8 (0-255)"""
     shape = tensor.shape
     flat = tensor.flatten()
     pad = (block_size - flat.numel() % block_size) % block_size
@@ -72,12 +76,17 @@ def _quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Te
         flat = torch.nn.functional.pad(flat, (0, pad))
 
     blocks = flat.view(-1, block_size)
-    scale = blocks.amax(dim=1, keepdim=True).clamp(min=1e-12)
-    q = torch.round((blocks / scale * 255.0).clamp_(0, 255)).to(torch.uint8)
+    log_blocks = torch.log2(blocks.clamp(min=_FP32_TINY))
+    max_log = log_blocks.amax(dim=1, keepdim=True)
+    
+    scale = ((max_log - _FP32_MIN_LOG) / 255.0).clamp(min=1e-12)
+    q = torch.round((log_blocks - _FP32_MIN_LOG) / scale * 255.0).clamp(0, 255).to(torch.uint8)
     return q, scale.squeeze(-1), shape, pad
 
-def _dequantize_nonneg(q: Tensor, scale: Tensor, shape: torch.Size, pad: int) -> Tensor:
-    blocks = q.float() * scale.unsqueeze(-1) / 255.0
+def _log_dequantize_nonneg(q: Tensor, scale: Tensor, shape: torch.Size, pad: int) -> Tensor:
+    """从对数空间反量化回线性空间"""
+    log_blocks = q.float() * scale.unsqueeze(-1) / 255.0 + _FP32_MIN_LOG
+    blocks = torch.pow(2.0, log_blocks)
     flat = blocks.flatten()
     if pad:
         flat = flat[:-pad]
@@ -152,13 +161,13 @@ class Adafactor8Bit(Optimizer):
                 
                 if (is_nd and has_var) or (not is_nd and has_row_col):
                     logger.warning(f"Adafactor8Bit: State structure mismatch for param shape {p.shape}. Re-initializing state.")
-                    step_backup = state.get("step", 0.0)
+                    step_backup = state.get("step", 0)
                     state.clear()
                     state["step"] = step_backup
                     needs_init = True
 
             if needs_init:
-                state.setdefault("step", 0.0)
+                state["step"] = 0 
                 state["is_quantized"] = use_quant
                 state["block_size"] = block_size
 
@@ -172,28 +181,28 @@ class Adafactor8Bit(Optimizer):
                     c_shape = list(batch_shape) + [1, C]
                     
                     if use_quant:
-                        r_tmp = torch.zeros(r_shape, device=p.device)
-                        q, s, sh, pad = _quantize_nonneg(r_tmp, block_size)
+                        r_tmp = torch.full(r_shape, _FP32_TINY, device=p.device)
+                        q, s, sh, pad = _log_quantize_nonneg(r_tmp, block_size)
                         state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
                         
-                        c_tmp = torch.zeros(c_shape, device=p.device)
-                        q, s, sh, pad = _quantize_nonneg(c_tmp, block_size)
+                        c_tmp = torch.full(c_shape, _FP32_TINY, device=p.device)
+                        q, s, sh, pad = _log_quantize_nonneg(c_tmp, block_size)
                         state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
                     else:
                         state["row_var"] = torch.zeros(r_shape, device=p.device)
                         state["col_var"] = torch.zeros(c_shape, device=p.device)
                 else:
                     if use_quant:
-                        v_tmp = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
-                        q, s, sh, pad = _quantize_nonneg(v_tmp, block_size)
+                        v_tmp = torch.full_like(p.grad, _FP32_TINY, memory_format=torch.preserve_format)
+                        q, s, sh, pad = _log_quantize_nonneg(v_tmp, block_size)
                         state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                     else:
                         state["variance"] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
             else:
                 if torch.is_tensor(state["step"]):
-                    state["step"] = float(state["step"].item())
-                elif not isinstance(state["step"], (int, float)):
-                    state["step"] = float(state["step"])
+                    state["step"] = int(state["step"].cpu().item())
+                elif not isinstance(state["step"], int):
+                    state["step"] = int(state["step"])
 
                 for k in list(state.keys()):
                     if isinstance(state[k], torch.Tensor):
@@ -210,16 +219,19 @@ class Adafactor8Bit(Optimizer):
                 if use_quant and not state.get("is_quantized", False):
                     if p.grad.dim() >= 2:
                         if "row_var" in state and "row_var_q" not in state:
-                            q, s, sh, pad = _quantize_nonneg(state["row_var"], curr_block_size)
+                            state["row_var"].clamp_(min=_FP32_TINY)
+                            q, s, sh, pad = _log_quantize_nonneg(state["row_var"], curr_block_size)
                             state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
                             del state["row_var"]
                         if "col_var" in state and "col_var_q" not in state:
-                            q, s, sh, pad = _quantize_nonneg(state["col_var"], curr_block_size)
+                            state["col_var"].clamp_(min=_FP32_TINY)
+                            q, s, sh, pad = _log_quantize_nonneg(state["col_var"], curr_block_size)
                             state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
                             del state["col_var"]
                     else:
                         if "variance" in state and "variance_q" not in state:
-                            q, s, sh, pad = _quantize_nonneg(state["variance"], curr_block_size)
+                            state["variance"].clamp_(min=_FP32_TINY)
+                            q, s, sh, pad = _log_quantize_nonneg(state["variance"], curr_block_size)
                             state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                             del state["variance"]
                     state["is_quantized"] = True
@@ -227,12 +239,12 @@ class Adafactor8Bit(Optimizer):
                 elif not use_quant and state.get("is_quantized", False):
                     if p.grad.dim() >= 2:
                         if "row_var_q" in state:
-                            state["row_var"] = _dequantize_nonneg(state.pop("row_var_q"), state.pop("row_var_scale"), state.pop("row_var_shape"), state.pop("row_var_pad"))
+                            state["row_var"] = _log_dequantize_nonneg(state.pop("row_var_q"), state.pop("row_var_scale"), state.pop("row_var_shape"), state.pop("row_var_pad"))
                         if "col_var_q" in state:
-                            state["col_var"] = _dequantize_nonneg(state.pop("col_var_q"), state.pop("col_var_scale"), state.pop("col_var_shape"), state.pop("col_var_pad"))
+                            state["col_var"] = _log_dequantize_nonneg(state.pop("col_var_q"), state.pop("col_var_scale"), state.pop("col_var_shape"), state.pop("col_var_pad"))
                     else:
                         if "variance_q" in state:
-                            state["variance"] = _dequantize_nonneg(state.pop("variance_q"), state.pop("variance_scale"), state.pop("variance_shape"), state.pop("variance_pad"))
+                            state["variance"] = _log_dequantize_nonneg(state.pop("variance_q"), state.pop("variance_scale"), state.pop("variance_shape"), state.pop("variance_pad"))
                     state["is_quantized"] = False
 
                 if "is_quantized" not in state:
@@ -300,8 +312,8 @@ def _update_param_8bit(
     quantize = state.get("is_quantized", False)
     curr_block_size = state.get("block_size", block_size)
 
-    step = state["step"] + 1.0
-    state["step"] = step
+    step = state["step"] + 1
+    state["step"] = step 
     beta_val = math.pow(step, beta2_decay)
 
     if isinstance(lr, float):
@@ -323,16 +335,16 @@ def _update_param_8bit(
     if weight_decay != 0:
         param_work.mul_(1.0 - alpha * weight_decay)
 
-    # 兼容 0-D 标量和 1-D 向量
     is_1d = grad_fp32.dim() < 2 
 
     if is_1d:
-        # 1D/0D 逻辑 (参数量小，物化 grad_sq 无妨)
-        grad_sq = grad_fp32.square().add_(eps1)
+        # 1D 路径：绝对无偏，底层 _FP32_TINY 兜底
+        grad_sq = grad_fp32.square() 
+        
         if quantize:
             if _load_cuda_module():
                 grad_sq_padded = _pad_to_block_size(grad_sq, curr_block_size)
-                _CUDA_MODULE.fused_quantize_lerp(state["variance_q"], state["variance_scale"], grad_sq_padded, beta_val, curr_block_size)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_sq_padded, beta_val, curr_block_size)
                 
                 numel = param_work.numel()
                 grad_fp32_flat = grad_fp32.view(-1)
@@ -352,9 +364,9 @@ def _update_param_8bit(
                     total_sum_sq, alpha, d, eps1, numel, curr_block_size
                 )
             else:
-                variance = _dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
+                variance = _log_dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
                 variance.lerp_(grad_sq, beta_val)
-                q, s, sh, pad = _quantize_nonneg(variance, curr_block_size)
+                q, s, sh, pad = _log_quantize_nonneg(variance, curr_block_size)
                 state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                 
                 update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
@@ -368,27 +380,24 @@ def _update_param_8bit(
             param_work.add_(update, alpha=-alpha / denom)
 
     else:
-        #N-D 张量严格沿最后两维分解
         shape = grad_fp32.shape
         R = shape[-2]
         C = shape[-1]
         numel = grad_fp32.numel()
         
-        #使用 torch.norm：避免在 Eager Mode 下物化 [R, C] 的 grad_sq 中间张量
-        row_mean = torch.norm(grad_fp32, dim=-1, keepdim=True).square_().div_(C).add_(eps1)
-        col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R).add_(eps1)
+        # 2D 路径：绝对无偏 EMA
+        row_mean = torch.norm(grad_fp32, dim=-1, keepdim=True).square_().div_(C)
+        col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R)
 
         if quantize:
             if _load_cuda_module():
                 row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
                 col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
 
-                _CUDA_MODULE.fused_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size)
-                _CUDA_MODULE.fused_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
 
-                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
-                
-                #链式调用清理冗余变量
+                row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
                 row_mean_val_flat = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1).flatten().contiguous()
                 
                 grad_flat = grad_fp32.reshape(-1)
@@ -411,13 +420,13 @@ def _update_param_8bit(
                     total_sum_sq, alpha, row_mean_val_flat, d, eps1, R, C, numel, curr_block_size
                 )
             else:
-                row_var = _dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
-                col_var = _dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
+                row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
+                col_var = _log_dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
                 row_var.lerp_(row_mean, beta_val)
                 col_var.lerp_(col_mean, beta_val)
-                q, s, sh, pad = _quantize_nonneg(row_var, curr_block_size)
+                q, s, sh, pad = _log_quantize_nonneg(row_var, curr_block_size)
                 state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
-                q, s, sh, pad = _quantize_nonneg(col_var, curr_block_size)
+                q, s, sh, pad = _log_quantize_nonneg(col_var, curr_block_size)
                 state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
                 
                 var_estimate = row_var * col_var 
