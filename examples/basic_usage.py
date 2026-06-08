@@ -59,8 +59,6 @@ def main():
         get_param_groups(model), 
         lr=1e-3, 
         relative_step=False,
-        block_size=2048,
-        min_8bit_size=4096
     )
     
     print("Starting dummy training loop...")
@@ -80,7 +78,7 @@ def main():
         optimizer.step()
         print(f"Step {step+1} | Loss: {loss.item():.4f}")
         
-    print("✅ Dummy training completed successfully!")
+    print("Training completed successfully!")
 
 
 if __name__ == "__main__":

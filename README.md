@@ -1,4 +1,4 @@
-**English** | [中文](./README_ZH.md)
+**English** | [中文](https://github.com/yanfeiwong/adafactor-8bit/blob/main/README_ZH.md)
 
 # Adafactor 8-bit with Fused CUDA Kernels
 
@@ -14,10 +14,9 @@ It uses fused CUDA kernels and **log-space block-wise quantization** to reduce o
 
 ## Key Features
 
-- **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small gradient values being truncated to zero and improving overall training stability.
+- **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
-- **Transformers Compatibility**: Aligns with the `transformers` Adafactor behavior (e.g., coupled weight decay, robust epsilon handling) to ensure stable large-scale training, while fully supporting standard scheduling switches like `relative_step`.
 - **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
 ## Performance
@@ -77,14 +76,12 @@ optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
     relative_step=False,
-    block_size=2048,
-    min_8bit_size=4096
 )
 
 # Training loop...
 ```
 
-For a complete example, please refer to [basic_usage.py](./examples/basic_usage.py).
+For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py).
 
 ## Acknowledgements
 
@@ -96,4 +93,4 @@ Thanks to the PyTorch team for providing the foundational Optimizer implementati
 
 ## License
 
-[The project is released under the MIT License.](./LICENSE)
+[The project is released under the MIT License.](https://github.com/yanfeiwong/adafactor-8bit/blob/main/LICENSE)

@@ -13,10 +13,9 @@
 
 ## 核心特性
 
-- **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小梯度值被截断为零的风险，提升了训练稳定性。
+- **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升了训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
-- **零同步开销**：重构了控制流，减少了隐式的 CPU-GPU 同步，使 GPU 计算流水线能够异步运行。
-- **Transformers 兼容**：对齐 `transformers` 中 Adafactor 的行为（如耦合权重衰减、稳健的 epsilon 处理），确保大规模训练的稳定性，同时完整支持 `relative_step` 等标准调度开关。
+- **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
 - **跨平台 JIT 编译**：使用即时编译（JIT），在 Windows 和 Linux 环境下均可便捷配置。
 
 ## 性能表现
@@ -76,8 +75,6 @@ optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
     relative_step=False,
-    block_size=2048,
-    min_8bit_size=4096
 )
 
 # Training loop...

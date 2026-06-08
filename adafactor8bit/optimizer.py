@@ -108,12 +108,13 @@ class Adafactor8Bit(Optimizer):
         params: Iterable[Union[Tensor, Dict[str, Any]]],
         lr: float = 1e-2,
         beta2_decay: float = -0.8,
-        eps: Tuple[Optional[float], float] = (1e-30, 1e-3),
+        eps: Tuple[Optional[float], float] = (None, 1e-3),
         d: float = 1.0,
         weight_decay: float = 0.0,
         maximize: bool = False,
-        relative_step: bool = False,
+        relative_step: bool = True,
         scale_parameter: bool = True,
+        scale_weight_decay: bool = True,
         quantize: bool = True,
         block_size: int = 2048,
         min_8bit_size: int = 4096,
@@ -132,6 +133,7 @@ class Adafactor8Bit(Optimizer):
         defaults = dict(
             lr=lr, beta2_decay=beta2_decay, eps=eps, d=d, weight_decay=weight_decay,
             maximize=maximize, relative_step=relative_step, scale_parameter=scale_parameter,
+            scale_weight_decay=scale_weight_decay,
             quantize=quantize, block_size=block_size, min_8bit_size=min_8bit_size,
         )
         super().__init__(params, defaults)
@@ -272,7 +274,8 @@ class Adafactor8Bit(Optimizer):
                     d=group["d"], lr=group["lr"], beta2_decay=group["beta2_decay"],
                     weight_decay=group["weight_decay"], eps1=eps1, eps2=eps2,
                     maximize=group["maximize"], relative_step=group["relative_step"],
-                    scale_parameter=group["scale_parameter"], block_size=group.get("block_size", 2048),
+                    scale_parameter=group["scale_parameter"], scale_weight_decay=group.get("scale_weight_decay", True),
+                    block_size=group.get("block_size", 2048),
                 )
         return loss
 
@@ -289,13 +292,14 @@ def _update_param_8bit(
     maximize: bool, 
     relative_step: bool,
     scale_parameter: bool, 
+    scale_weight_decay: bool,
     block_size: int
 ):
     if eps1 is None:
         eps1 = torch.finfo(param.dtype).eps
+        
+    eps_sq = max(eps1 * eps1, torch.finfo(torch.float32).tiny)
 
-    original_dtype = param.dtype
-    
     grad_fp32 = grad.float()
     if not grad_fp32.is_contiguous():
         grad_fp32 = grad_fp32.contiguous()
@@ -333,12 +337,12 @@ def _update_param_8bit(
         alpha = rho_t
 
     if weight_decay != 0:
-        param_work.mul_(1.0 - alpha * weight_decay)
+        wd_multiplier = alpha if scale_weight_decay else rho_t
+        param_work.mul_(1.0 - (wd_multiplier * weight_decay))
 
     is_1d = grad_fp32.dim() < 2 
 
     if is_1d:
-        # 1D 路径：绝对无偏，底层 _FP32_TINY 兜底
         grad_sq = grad_fp32.square() 
         
         if quantize:
@@ -369,13 +373,13 @@ def _update_param_8bit(
                 q, s, sh, pad = _log_quantize_nonneg(variance, curr_block_size)
                 state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                 
-                update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+                update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
                 denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
                 param_work.add_(update, alpha=-alpha / denom)
         else:
             variance = state["variance"]
             variance.lerp_(grad_sq, beta_val)
-            update = variance.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+            update = variance.clamp(min=eps_sq).rsqrt().mul_(grad_fp32)
             denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
             param_work.add_(update, alpha=-alpha / denom)
 
@@ -385,7 +389,6 @@ def _update_param_8bit(
         C = shape[-1]
         numel = grad_fp32.numel()
         
-        # 2D 路径：绝对无偏 EMA
         row_mean = torch.norm(grad_fp32, dim=-1, keepdim=True).square_().div_(C)
         col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R)
 
@@ -433,7 +436,7 @@ def _update_param_8bit(
                 row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
                 var_estimate.div_(row_mean_val)
                 
-                update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+                update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
                 denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
                 param_work.add_(update, alpha=-alpha / denom)
         else:
@@ -446,7 +449,7 @@ def _update_param_8bit(
             row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
             var_estimate.div_(row_mean_val)
             
-            update = var_estimate.clamp_(min=eps1).rsqrt_().mul_(grad_fp32)
+            update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
             denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
             param_work.add_(update, alpha=-alpha / denom)
 

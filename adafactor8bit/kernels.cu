@@ -5,8 +5,8 @@
 #include <torch/extension.h>
 
 __device__ constexpr float INV_255 = 1.0f / 255.0f;
-__device__ constexpr float MIN_LOG = -126.0f; // 对应 FP32 最小正规格化数 2^-126
-__device__ constexpr float MIN_VAL = 1.17549435e-38f; // 2^-126
+__device__ constexpr float MIN_LOG = -126.0f; 
+__device__ constexpr float MIN_VAL = 1.17549435e-38f; 
 
 // ==========================================
 // 1. Fused Log-Quantize Lerp (EMA Update)
@@ -43,19 +43,21 @@ __global__ void fused_log_quantize_lerp_kernel(
         float4 nv = new_val_vec[idx];
         uchar4 q_val = q_vec[idx];
 
-        // 1. 反量化旧值到线性空间 (exp2)
         float v_old0 = exp2f((float)q_val.x * INV_255 * old_scale + MIN_LOG);
         float v_old1 = exp2f((float)q_val.y * INV_255 * old_scale + MIN_LOG);
         float v_old2 = exp2f((float)q_val.z * INV_255 * old_scale + MIN_LOG);
         float v_old3 = exp2f((float)q_val.w * INV_255 * old_scale + MIN_LOG);
 
-        // 2. 在线性空间做 EMA (Lerp)，保证数学正确性
-        float v_upd0 = v_old0 * one_minus_b + fmaxf(nv.x, MIN_VAL) * beta;
-        float v_upd1 = v_old1 * one_minus_b + fmaxf(nv.y, MIN_VAL) * beta;
-        float v_upd2 = v_old2 * one_minus_b + fmaxf(nv.z, MIN_VAL) * beta;
-        float v_upd3 = v_old3 * one_minus_b + fmaxf(nv.w, MIN_VAL) * beta;
+        float val_x = (isnan(nv.x) || isinf(nv.x)) ? 0.0f : nv.x;
+        float val_y = (isnan(nv.y) || isinf(nv.y)) ? 0.0f : nv.y;
+        float val_z = (isnan(nv.z) || isinf(nv.z)) ? 0.0f : nv.z;
+        float val_w = (isnan(nv.w) || isinf(nv.w)) ? 0.0f : nv.w;
 
-        // 3. 转回对数空间 (log2) 并寻找 Max
+        float v_upd0 = v_old0 * one_minus_b + fmaxf(val_x, MIN_VAL) * beta;
+        float v_upd1 = v_old1 * one_minus_b + fmaxf(val_y, MIN_VAL) * beta;
+        float v_upd2 = v_old2 * one_minus_b + fmaxf(val_z, MIN_VAL) * beta;
+        float v_upd3 = v_old3 * one_minus_b + fmaxf(val_w, MIN_VAL) * beta;
+
         float log0 = log2f(v_upd0);
         float log1 = log2f(v_upd1);
         float log2 = log2f(v_upd2);
@@ -69,7 +71,6 @@ __global__ void fused_log_quantize_lerp_kernel(
         thread_max = fmaxf(thread_max, fmaxf(fmaxf(log0, log1), fmaxf(log2, log3)));
     }
 
-    // Warp & Block Reduce 找 max_log
     float val = thread_max;
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
@@ -92,7 +93,6 @@ __global__ void fused_log_quantize_lerp_kernel(
     float new_scale = (max_log - MIN_LOG) / 255.0f;
     float inv_scale = 255.0f / (max_log - MIN_LOG);
 
-    // 4. 量化并写回
     for (int i = 0; i < vec_iters; i++) {
         int idx = tid + i * stride;
         
@@ -149,23 +149,21 @@ __global__ void compute_update_norm_2d_kernel(
         int r = (idx / C) % R;
         int c = idx % C;
         
-        // 对数空间反量化 (exp2)
         float r_val = exp2f((float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / block_size] + MIN_LOG);
         float c_val = exp2f((float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / block_size] + MIN_LOG);
         
         float row_mean_val = fmaxf(row_mean_val_ptr[b], MIN_VAL);
         float v_ij = (r_val * c_val) / row_mean_val;
         
-        // 限制放大倍数 & 限制最终更新量
-        float inv_std = rsqrtf(fmaxf(v_ij, MIN_VAL));
-        inv_std = fminf(inv_std, 1e8f); 
+        float eps_sq = eps * eps;
+        float safe_eps_sq = fmaxf(eps_sq, MIN_VAL); 
+        
+        float inv_std = rsqrtf(fmaxf(v_ij, safe_eps_sq));
         float u_ij = grad[idx] * inv_std;
-        u_ij = fmaxf(fminf(u_ij, 1e4f), -1e4f); 
         
         sq += u_ij * u_ij;
     }
     
-    // Warp & Block Reduce
     for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
     int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
@@ -225,10 +223,11 @@ __global__ void apply_update_2d_kernel(
         float row_mean_val = fmaxf(row_mean_val_ptr[b], MIN_VAL);
         float v_ij = (r_val * c_val) / row_mean_val;
         
-        float inv_std = rsqrtf(fmaxf(v_ij, MIN_VAL));
-        inv_std = fminf(inv_std, 1e8f);
+        float eps_sq = eps * eps;
+        float safe_eps_sq = fmaxf(eps_sq, MIN_VAL);
+        
+        float inv_std = rsqrtf(fmaxf(v_ij, safe_eps_sq));
         float u_ij = grad[idx] * inv_std;
-        u_ij = fmaxf(fminf(u_ij, 1e4f), -1e4f);
         
         float p_val = static_cast<float>(param[idx]);
         p_val -= step_size * u_ij;
@@ -269,10 +268,13 @@ __global__ void compute_update_norm_1d_kernel(
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float v_val = exp2f((float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG);
-        float inv_std = rsqrtf(fmaxf(v_val, MIN_VAL));
-        inv_std = fminf(inv_std, 1e8f);
+        
+        float eps_sq = eps * eps;
+        float safe_eps_sq = fmaxf(eps_sq, MIN_VAL);
+        
+        float inv_std = rsqrtf(fmaxf(v_val, safe_eps_sq));
         float u_val = grad[idx] * inv_std;
-        u_val = fmaxf(fminf(u_val, 1e4f), -1e4f);
+        
         sq += u_val * u_val;
     }
     for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
@@ -317,10 +319,12 @@ __global__ void apply_update_1d_kernel(
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float v_val = exp2f((float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG);
-        float inv_std = rsqrtf(fmaxf(v_val, MIN_VAL));
-        inv_std = fminf(inv_std, 1e8f);
+        
+        float eps_sq = eps * eps;
+        float safe_eps_sq = fmaxf(eps_sq, MIN_VAL);
+        
+        float inv_std = rsqrtf(fmaxf(v_val, safe_eps_sq));
         float u_val = grad[idx] * inv_std;
-        u_val = fmaxf(fminf(u_val, 1e4f), -1e4f);
         
         float p_val = static_cast<float>(param[idx]);
         p_val -= step_size * u_val;
