@@ -344,6 +344,7 @@ def _update_param_8bit(
         eps1 = torch.finfo(param.dtype).eps
         
     eps_sq = max(eps1 * eps1, torch.finfo(torch.float32).tiny)
+    log_eps_sq = math.log2(eps_sq)
 
     grad_fp32 = grad.float()
     if not grad_fp32.is_contiguous():
@@ -367,7 +368,6 @@ def _update_param_8bit(
     if beta2 is not None:
         beta_val = 1.0 - beta2
     else:
-        # 原版 Adafactor 的动态衰减
         beta_val = math.pow(step, beta2_decay)
 
     if isinstance(lr, float):
@@ -409,13 +409,13 @@ def _update_param_8bit(
                 
                 _CUDA_MODULE.compute_update_norm_1d(
                     variance_q_flat, variance_scale_flat,
-                    grad_fp32_flat, total_sum_sq, eps1, numel, curr_block_size
+                    grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size
                 )
                 
                 _CUDA_MODULE.apply_update_1d(
                     param_work.view(-1), grad_fp32_flat,
                     variance_q_flat, variance_scale_flat,
-                    total_sum_sq, alpha, d, eps1, numel, curr_block_size
+                    total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
                 )
             else:
                 variance = _log_dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
@@ -462,7 +462,7 @@ def _update_param_8bit(
                 _CUDA_MODULE.compute_update_norm_2d(
                     row_var_q_flat, state["row_var_scale"],
                     col_var_q_flat, state["col_var_scale"],
-                    grad_flat, total_sum_sq, row_mean_val_flat, eps1, R, C, numel, curr_block_size
+                    grad_flat, total_sum_sq, row_mean_val_flat, log_eps_sq, R, C, numel, curr_block_size
                 )
                 
                 param_flat = param_work.reshape(-1)
@@ -470,7 +470,7 @@ def _update_param_8bit(
                     param_flat, grad_flat,
                     row_var_q_flat, state["row_var_scale"],
                     col_var_q_flat, state["col_var_scale"],
-                    total_sum_sq, alpha, row_mean_val_flat, d, eps1, R, C, numel, curr_block_size
+                    total_sum_sq, alpha, row_mean_val_flat, d, log_eps_sq, R, C, numel, curr_block_size
                 )
             else:
                 row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
