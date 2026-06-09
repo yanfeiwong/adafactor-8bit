@@ -53,10 +53,11 @@ __global__ void fused_log_quantize_lerp_kernel(
         float val_z = (isnan(nv.z) || isinf(nv.z)) ? 0.0f : nv.z;
         float val_w = (isnan(nv.w) || isinf(nv.w)) ? 0.0f : nv.w;
 
-        float v_upd0 = v_old0 * one_minus_b + fmaxf(val_x, MIN_VAL) * beta;
-        float v_upd1 = v_old1 * one_minus_b + fmaxf(val_y, MIN_VAL) * beta;
-        float v_upd2 = v_old2 * one_minus_b + fmaxf(val_z, MIN_VAL) * beta;
-        float v_upd3 = v_old3 * one_minus_b + fmaxf(val_w, MIN_VAL) * beta;
+        float v_upd0 = fmaxf(v_old0 * one_minus_b + fmaxf(val_x, MIN_VAL) * beta, MIN_VAL);
+        float v_upd1 = fmaxf(v_old1 * one_minus_b + fmaxf(val_y, MIN_VAL) * beta, MIN_VAL);
+        float v_upd2 = fmaxf(v_old2 * one_minus_b + fmaxf(val_z, MIN_VAL) * beta, MIN_VAL);
+        float v_upd3 = fmaxf(v_old3 * one_minus_b + fmaxf(val_w, MIN_VAL) * beta, MIN_VAL);
+
 
         float log0 = log2f(v_upd0);
         float log1 = log2f(v_upd1);
@@ -89,7 +90,8 @@ __global__ void fused_log_quantize_lerp_kernel(
     }
     __syncthreads(); 
 
-    float max_log = fmaxf(s_max[0], MIN_LOG + 1e-12f);
+    // 防止未知的底层浮点异常击穿清洗盾，导致 scale 变 INF 进而产生 NaN
+    float max_log = fminf(fmaxf(s_max[0], MIN_LOG + 1e-12f), 50.0f);
     float new_scale = (max_log - MIN_LOG) / 255.0f;
     float inv_scale = 255.0f / (max_log - MIN_LOG);
 
@@ -121,11 +123,15 @@ torch::Tensor fused_log_quantize_lerp_cuda(
     TORCH_CHECK(q.is_contiguous() && scale.is_contiguous() && new_val.is_contiguous());
     
     int threads = 256;
-    TORCH_CHECK(block_size >= threads && block_size % 4 == 0 && block_size % (4 * threads) == 0);
+    TORCH_CHECK(block_size >= threads && block_size % 4 == 0 && block_size % (4 * threads) == 0,
+                "block_size must be a multiple of 4 * threads for vectorization.");
 
     int num_blocks = scale.size(0);   
     int num_warps = threads / 32;
     size_t shared_mem = (block_size + num_warps) * sizeof(float); 
+
+    //防止 block_size 过大导致 Shared Memory 越界 (48KB 限制)
+    TORCH_CHECK(shared_mem <= 49152, "block_size is too large, exceeding 48KB shared memory limit.");
     
     fused_log_quantize_lerp_kernel<<<num_blocks, threads, shared_mem>>>(
         q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), beta, block_size
@@ -156,6 +162,10 @@ __global__ void compute_update_norm_2d_kernel(
         float log_v_ij = log_r + log_c - log_row_mean; 
         
         float max_log = fmaxf(log_v_ij, log_eps_sq);
+        // 限制 max_log 下界为 -53.0f 
+        // (即限制 inv_std 最大为 exp2f(26.5) ≈ 9.4e7)。
+        // 确保 (grad * inv_std)^2 在累加时不会触碰 FP32 上限 (~3.4e38) 导致 total_sum_sq 溢出为 INF。
+        max_log = fmaxf(max_log, -53.0f);
         float inv_std = exp2f(-0.5f * max_log); 
         
         float u_ij = grad[idx] * inv_std;
@@ -223,6 +233,7 @@ __global__ void apply_update_2d_kernel(
         float log_v_ij = log_r + log_c - log_row_mean; 
         
         float max_log = fmaxf(log_v_ij, log_eps_sq);
+        max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
         float u_ij = grad[idx] * inv_std;
@@ -268,6 +279,7 @@ __global__ void compute_update_norm_1d_kernel(
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
         
         float max_log = fmaxf(log_v, log_eps_sq);
+        max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
         float u_val = grad[idx] * inv_std;
@@ -318,6 +330,7 @@ __global__ void apply_update_1d_kernel(
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
         
         float max_log = fmaxf(log_v, log_eps_sq);
+        max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
         float u_val = grad[idx] * inv_std;
