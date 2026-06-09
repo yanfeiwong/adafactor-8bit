@@ -76,7 +76,9 @@ model = MyModel().cuda()
 optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
-    relative_step=False,
+    # 针对长期连续训练和搭配外部学习率调度的情况
+    relative_step=False,     # 禁用内部LR的调度
+    beta2=0.999,             # 如果设置了 beta2，那么优化器将会恒定保持对新梯度分布的自适应能力，不会随着训练步骤的推进而钝化，适合长期连续的训练
 )
 
 # Training loop...
@@ -84,13 +86,48 @@ optimizer = Adafactor8Bit(
 
 更多完整示例请参考 [basic_usage.py](./examples/basic_usage.py)
 
+
+
+## 高级配置
+
+### 长期连续训练 (`beta2` 与 `relative_step`)
+默认情况下，Adafactor 的二阶矩衰减率会随着训练步数动态衰减，内部学习率调度 (`relative_step`) 也会相应地缩放学习率。
+
+对于无休止的微调或持续学习场景，这通常会导致 `后期学习率过小` 和 `二阶矩估计“钝化”` 。为了避免这些问题并保持优化器对新梯度分布的自适应能力：
+- 设置 `relative_step=False` 以禁用内置的学习率调度（从而允许您使用外部的学习率调度器）。
+- 设置 `beta2=0.999` 以锁定 EMA 窗口（类似于 Adam）。
+
+### 解耦权重衰减 (`scale_weight_decay=False`)
+默认情况下，Adafactor 的权重衰减与参数的 RMS 缩放相耦合。
+- 如果您倾向于 AdamW 风格的解耦权重衰减，请设置 `scale_weight_decay=False`。
+
+### 无编译器环境 (`use_cuda_kernel=False`)
+如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
+- 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
+
+
+## 新手学习率指南
+
+如果你是从 AdamW 等优化器迁移过来的，可能会发现 Adafactor 的学习率表现有些不同。这主要与 `scale_parameter` 选项有关。
+
+- **`scale_parameter=True`（默认）**
+  由于 RMS 缩放效应，设置过小的 `lr`（例如 `1e-5`）通常会导致训练进展极其缓慢。建议从 `lr=1e-3` 开始，并根据需要在 `1e-4` 到 `5e-3` 的范围内进行微调。
+
+- **`scale_parameter=False`**
+  关闭 RMS 缩放后，更新步长的量级会更接近 AdamW。此时可以使用你熟悉的 AdamW 学习率，并按常规方式进行调参。（注：由于二阶矩依然采用分解估计，其实际行为与 AdamW 并不完全相同。）
+
+*以上仅为安全的初始配置参考；请务必在你自己的任务和 batch size 下进行验证。*
+
+
 ## 致谢
 
-感谢来自 Qwen 与 DeepSeek 的大语言模型在 CUDA 底层优化、内存安全防御机制以及跨平台编译链路设计上提供的深度技术探讨与代码审查。
+感谢 **Noam Shazeer** 与 **Mitchell Stern** 在论文 [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235) 中提出了原版的 Adafactor 算法。
 
-感谢 Tim Dettmers 的 [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/pdf/2110.02861) 论文及 [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 库带来的启发。
+感谢 **Tim Dettmers** 的 [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/abs/2110.02861) 论文及 [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 库带来的启发。
 
-感谢 PyTorch 团队提供的基础 Optimizer 实现与 C++ Extension 工具链。
+感谢 **PyTorch 团队**提供的基础 Optimizer 实现与 C++ Extension 工具链。
+
+感谢来自 **Qwen** 与 **DeepSeek** 的大语言模型在 CUDA 底层优化、内存安全防御机制以及跨平台编译链路设计上提供的深度技术探讨与代码审查。
 
 ## License
 

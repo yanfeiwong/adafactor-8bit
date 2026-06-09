@@ -58,7 +58,9 @@ def main():
     optimizer = Adafactor8Bit(
         get_param_groups(model), 
         lr=1e-3, 
-        relative_step=False,
+        # For continual learning with external scheduler
+        # relative_step=False,     # Disable internal LR scheduling
+        # beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
     )
     
     print("Starting dummy training loop...")

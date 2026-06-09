@@ -77,7 +77,9 @@ model = MyModel().cuda()
 optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
-    relative_step=False,
+    # For continual learning with external scheduler
+    relative_step=False,     # Disable internal LR scheduling
+    beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
 )
 
 # Training loop...
@@ -85,13 +87,53 @@ optimizer = Adafactor8Bit(
 
 For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py).
 
+
+## Advanced Configuration
+
+### Continual Learning (`beta2` & `relative_step`)
+By default, Adafactor's second-moment decay rate dynamically decays with the training step, and the internal learning rate schedule (`relative_step`) scales the learning rate accordingly. 
+
+For endless fine-tuning or lifelong learning, this often leads to overly small learning rates and "blunted" second-moment estimates. To avoid these issues and keep the optimizer responsive:
+- Set `relative_step=False` to disable the built-in LR schedule (allowing you to use an external scheduler).
+- Set `beta2=0.999` to lock the EMA window (similar to Adam).
+
+### Decoupled Weight Decay (`scale_weight_decay=False`)
+By default, Adafactor's weight decay is coupled with the parameter's RMS scale. 
+- If you prefer the AdamW-style decoupled weight decay, set `scale_weight_decay=False`.
+
+### No-Compiler Environments (`use_cuda_kernel=False`)
+If you are in an environment without a CUDA compiler and want to bypass JIT compilation entirely:
+- Set `use_cuda_kernel=False` to fall back to the pure PyTorch implementation.
+
+
+
+
+## Learning Rate Guide for Beginners
+
+If you are migrating from optimizers like AdamW, Adafactor's learning rate behavior might feel a bit different. This is mainly due to the `scale_parameter` option.
+
+- **`scale_parameter=True` (default)**
+  Because of RMS scaling, a very small `lr` (e.g., `1e-5`) often leads to extremely slow progress. Start with `lr=1e-3` and adjust in the range `1e-4`–`5e-3` if needed.
+
+- **`scale_parameter=False`**
+  Disables RMS scaling, making the update scale more similar to AdamW. Use the learning rates you're familiar with for AdamW and tune as usual. (Note: the second moment is still factorized, so behavior is not identical.)
+
+*These are safe starting points; Always validate on your own task and batch size.*
+
+
+
+
+
 ## Acknowledgements
 
-Thanks to the large language models Qwen and DeepSeek for valuable technical discussions and code reviews on CUDA low-level optimization, memory safety mechanisms, and cross-platform compilation pipeline design.
+Thanks to **Noam Shazeer** and **Mitchell Stern** for proposing the original Adafactor algorithm in the paper [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235).
 
-Thanks to Tim Dettmers for the inspiration from the paper [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/pdf/2110.02861) and the [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) library.
+Thanks to **Tim Dettmers** for the inspiration from the paper [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/abs/2110.02861) and the [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) library.
 
-Thanks to the PyTorch team for providing the foundational Optimizer implementation and the C++ Extension toolchain.
+Thanks to the **PyTorch team** for providing the foundational Optimizer implementation and the C++ Extension toolchain.
+
+Thanks to the large language models **Qwen** and **DeepSeek** for valuable technical discussions and code reviews on CUDA low-level optimization, memory safety mechanisms, and cross-platform compilation pipeline design.
+
 
 ## License
 

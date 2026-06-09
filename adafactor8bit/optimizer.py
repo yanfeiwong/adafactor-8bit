@@ -5,7 +5,7 @@ import os
 import sys
 import math
 import logging
-from typing import Tuple, Optional, Union, List, Dict, Any, Iterable
+from typing import Tuple, Optional, Union, Dict, Any, Iterable
 
 import torch
 from torch import Tensor
@@ -24,12 +24,19 @@ _FP32_MIN_LOG = -126.0
 # ==========================================
 _CUDA_MODULE = None
 _CUDA_AVAILABLE = False
+_CUDA_LOAD_ATTEMPTED = False
 
-def _load_cuda_module() -> bool:
-    global _CUDA_MODULE, _CUDA_AVAILABLE
-    if _CUDA_MODULE is not None or _CUDA_AVAILABLE:
+def _load_cuda_module(enable: bool = True) -> bool:
+    global _CUDA_MODULE, _CUDA_AVAILABLE, _CUDA_LOAD_ATTEMPTED
+
+    if not enable:
+        return False
+    
+    if _CUDA_LOAD_ATTEMPTED:
         return _CUDA_AVAILABLE
-
+    
+    _CUDA_LOAD_ATTEMPTED = True
+    
     if torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
         if cap[0] < 7:
@@ -103,10 +110,40 @@ def _pad_to_block_size(tensor: Tensor, block_size: int) -> Tensor:
 # 3. Optimizer Core
 # ==========================================
 class Adafactor8Bit(Optimizer):
+    """
+    8-bit Adafactor optimizer with fused CUDA kernels for memory-efficient large-scale training.
+    
+    Args:
+        params (Iterable): Iterable of parameters to optimize or dictionaries defining parameter groups.
+        lr (float, optional): External learning rate. Defaults to 1e-2.
+        beta2 (float, optional): Fixed second-moment decay rate (e.g., 0.999 like Adam). 
+            Locks the EMA window size, preventing "blunting" in long-term continual learning. 
+            Mutually exclusive with `beta2_decay`. Defaults to None.
+        beta2_decay (float): Dynamic decay rate coefficient. 
+            The EMA weight is computed as `step ** beta2_decay`. Ignored if `beta2` is specified. 
+            Defaults to -0.8.
+        eps (Tuple[Optional[float], float]): Regularization constants (eps1, eps2).
+            - `eps1`: Added to the squared gradient. If `None`, defaults to the machine epsilon 
+              of the parameter's dtype (e.g., ~1.19e-7 for FP32), aligning with PyTorch official 
+              behavior and preventing underflow.
+            - `eps2`: Lower threshold for parameter RMS scaling. Defaults to (None, 1e-3).
+        d (float): Clipping threshold for the final gradient update RMS. Defaults to 1.0.
+        weight_decay (float): Weight decay (L2 penalty). Defaults to 0.0.
+        scale_weight_decay (bool): If `True` (default), weight decay is coupled with the 
+            parameter's RMS scale. If `False`, weight decay is decoupled and only scaled by the 
+            base learning rate (AdamW-style).
+        maximize (bool): Maximize the params based on the objective. Defaults to False.
+        relative_step (bool): If `True`, uses time-dependent learning rate. Defaults to True.
+        scale_parameter (bool): If `True`, scales learning rate by parameter RMS. Defaults to True.
+        quantize (bool): Enable 8-bit log-space quantization for optimizer states. Defaults to True.
+        block_size (int): Block size for quantization. Must be a multiple of 1024. Defaults to 2048.
+        min_8bit_size (int): Minimum number of elements to apply 8-bit quantization. Defaults to 4096.
+    """
     def __init__(
         self,
         params: Iterable[Union[Tensor, Dict[str, Any]]],
         lr: float = 1e-2,
+        beta2: Optional[float] = None, #新的可选参数：如果设置了 beta2，那么优化器将会恒定保持新梯度分布的自适应能力，不会随着训练步骤的推进而钝化，适合长期连续的训练
         beta2_decay: float = -0.8,
         eps: Tuple[Optional[float], float] = (None, 1e-3),
         d: float = 1.0,
@@ -118,6 +155,7 @@ class Adafactor8Bit(Optimizer):
         quantize: bool = True,
         block_size: int = 2048,
         min_8bit_size: int = 4096,
+        use_cuda_kernel: bool = True,
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")
         if not 0.0 >= beta2_decay: raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
@@ -126,15 +164,19 @@ class Adafactor8Bit(Optimizer):
         if not 0.0 <= eps2: raise ValueError(f"Invalid eps2: {eps2}")
         if not 1.0 <= d: raise ValueError(f"Invalid d: {d}")
         if not 0.0 <= weight_decay: raise ValueError(f"Invalid weight_decay: {weight_decay}")
+
+        if beta2 is not None and not (0.0 <= beta2 < 1.0):
+            raise ValueError(f"Invalid beta2: {beta2}, must be in [0.0, 1.0)")
         
         if quantize and block_size % 1024 != 0:
             raise ValueError(f"block_size must be a multiple of 1024, but got {block_size}.")
 
         defaults = dict(
-            lr=lr, beta2_decay=beta2_decay, eps=eps, d=d, weight_decay=weight_decay,
+            lr=lr, beta2_decay=beta2_decay, beta2=beta2, eps=eps, d=d, weight_decay=weight_decay,
             maximize=maximize, relative_step=relative_step, scale_parameter=scale_parameter,
             scale_weight_decay=scale_weight_decay,
             quantize=quantize, block_size=block_size, min_8bit_size=min_8bit_size,
+            use_cuda_kernel=use_cuda_kernel,
         )
         super().__init__(params, defaults)
 
@@ -271,11 +313,11 @@ class Adafactor8Bit(Optimizer):
             for i in range(len(params_with_grad)):
                 _update_param_8bit(
                     params_with_grad[i], grads[i], states[i],
-                    d=group["d"], lr=group["lr"], beta2_decay=group["beta2_decay"],
+                    d=group["d"], lr=group["lr"],beta2=group["beta2"], beta2_decay=group["beta2_decay"],
                     weight_decay=group["weight_decay"], eps1=eps1, eps2=eps2,
                     maximize=group["maximize"], relative_step=group["relative_step"],
                     scale_parameter=group["scale_parameter"], scale_weight_decay=group.get("scale_weight_decay", True),
-                    block_size=group.get("block_size", 2048),
+                    block_size=group.get("block_size", 2048), use_cuda_kernel=group.get("use_cuda_kernel", True),
                 )
         return loss
 
@@ -286,14 +328,17 @@ def _update_param_8bit(
     param: Tensor, grad: Tensor, 
     state: Dict[str, Any],
     d: float, lr: Union[float, Tensor], 
-    beta2_decay: float, weight_decay: float,
+    beta2: Optional[float],
+    beta2_decay: float, 
+    weight_decay: float,
     eps1: Optional[float], 
     eps2: float, 
     maximize: bool, 
     relative_step: bool,
     scale_parameter: bool, 
     scale_weight_decay: bool,
-    block_size: int
+    block_size: int,
+    use_cuda_kernel: bool,
 ):
     if eps1 is None:
         eps1 = torch.finfo(param.dtype).eps
@@ -318,7 +363,12 @@ def _update_param_8bit(
 
     step = state["step"] + 1
     state["step"] = step 
-    beta_val = math.pow(step, beta2_decay)
+
+    if beta2 is not None:
+        beta_val = 1.0 - beta2
+    else:
+        # 原版 Adafactor 的动态衰减
+        beta_val = math.pow(step, beta2_decay)
 
     if isinstance(lr, float):
         rho = min(lr, 1.0 / math.sqrt(step)) if relative_step else lr
@@ -346,7 +396,7 @@ def _update_param_8bit(
         grad_sq = grad_fp32.square() 
         
         if quantize:
-            if _load_cuda_module():
+            if _load_cuda_module(use_cuda_kernel):
                 grad_sq_padded = _pad_to_block_size(grad_sq, curr_block_size)
                 _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_sq_padded, beta_val, curr_block_size)
                 
@@ -393,7 +443,7 @@ def _update_param_8bit(
         col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R)
 
         if quantize:
-            if _load_cuda_module():
+            if _load_cuda_module(use_cuda_kernel):
                 row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
                 col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
 
