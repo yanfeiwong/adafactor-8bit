@@ -58,9 +58,13 @@ def main():
     optimizer = Adafactor8Bit(
         get_param_groups(model), 
         lr=1e-3, 
-        # For continual learning with external scheduler
+        # Uncomment for continual learning with external scheduler
         # relative_step=False,     # Disable internal LR scheduling
         # beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
+
+        # Uncomment to try the new APOLLO Subspace Projection
+        # Simulates full-rank adaptive scaling in a low-rank space for faster convergence.
+        # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
     )
     
     print("Starting dummy training loop...")
@@ -80,7 +84,7 @@ def main():
         optimizer.step()
         print(f"Step {step+1} | Loss: {loss.item():.4f}")
         
-    print("Training completed successfully!")
+    print("Training completed!")
 
 
 if __name__ == "__main__":
