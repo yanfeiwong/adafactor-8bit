@@ -18,6 +18,7 @@
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升了训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
+- **APOLLO 低秩投影与 Fira 减震器**：内置了可选的随机正交投影路径，在低秩子空间内估计梯度缩放因子以加速收敛，同时搭配了 Fira 范数增长限制器（Norm-Growth Limiter）。
 - **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
 - **跨平台 JIT 编译**：使用即时编译（JIT），在 Windows 和 Linux 环境下均可便捷配置。
 
@@ -79,7 +80,11 @@ optimizer = Adafactor8Bit(
     lr=1e-3, 
     # 针对长期连续训练和搭配外部学习率调度的情况
     relative_step=False,     # 禁用内部LR的调度
-    beta2=0.999,             # 如果设置了 beta2，那么优化器将会恒定保持对新梯度分布的自适应能力，不会随着训练步骤的推进而钝化，适合长期连续的训练
+    beta2=0.999,             # 锁定 EMA 窗口，防止随着训练步骤推进而“钝化”
+
+    # --- 🚀 解除注释尝试新的：APOLLO 低秩投影 ---
+    # 在低秩空间内模拟全秩自适应缩放，往往能带来更快的收敛速度。
+    # apollo_rank=256,             # 0 为禁用。256 是 APOLLO 官方默认值。
 )
 
 # Training loop...
@@ -106,6 +111,15 @@ optimizer = Adafactor8Bit(
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
 - 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
 
+## APOLLO 低秩子空间投影
+启用 APOLLO 路径，在极低显存占用的低秩子空间内计算梯度缩放因子。与 Adafactor 标准的行列分解（假设空间独立）相比，APOLLO 利用随机正交投影捕获更丰富的协方差信息，在保持极低显存开销的同时，往往能带来更快的收敛速度。
+
+- **`apollo_rank`**：投影子空间的目标秩。默认为 `0`（禁用）。对于大多数 1B 到 7B 的模型，可以尝试设置为 `256`（同标准 APOLLO）。  
+  *注意：设置为 `1`（APOLLO-Mini 风格）时，可以将显存节省推向极限（甚至比 Adafactor 路径更省）。但是，原版 APOLLO-Mini 依赖 Adam 的一阶动量（beta1）来平滑噪声。由于我们的实现采用纯二阶矩架构，rank=1 可能会导致缩放因子严重失真及训练不稳定。*
+- **`apollo_scale_type`**：缩放因子的应用方式。`'channel'` 按通道应用（标准 APOLLO），而 `'tensor'` 全局应用（APOLLO-Mini）。
+- **`apollo_update_proj_gap`**：投影矩阵刷新的步数间隔。默认为 `200`。设置过小可能导致子空间频繁震荡，阻碍 EMA 积累稳定的方差估计；设置过大可能导致投影基底长时间不更新，无法捕获梯度流形在训练过程中的漂移，导致低秩空间逐渐“过时”（Stale），失去 APOLLO 捕获动态协方差的优势。
+- **`apollo_factorize` (实验性功能)**：在低秩子空间内应用 Adafactor 的行列分解。利用随机投影的保范性来近似主维度的方差，而副维度的方差则在随机基底上估计，从而引入固有噪声。双重压缩了优化器状态的开销。但是，对于较小的模型，实际节省的显存可能并不明显，但引入的噪声可能会影响收敛稳定性。请谨慎使用。
+
 
 ## 新手学习率指南
 
@@ -125,6 +139,10 @@ optimizer = Adafactor8Bit(
 感谢 **Noam Shazeer** 与 **Mitchell Stern** 在论文 [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235) 中提出了原版的 Adafactor 算法。
 
 感谢 **Tim Dettmers** 的 [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/abs/2110.02861) 论文及 [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 库带来的启发。
+
+感谢 **Hanqing Zhu**、**Zhenyu Zhang** 及其团队在论文 [APOLLO: SGD-Like Memory, AdamW-level Performance](https://arxiv.org/abs/2412.05270) 中提出的近似梯度缩放方法。
+
+感谢 **Xi Chen**、**Kaituo Feng** 及其团队在论文 [Fira: Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint?](https://arxiv.org/abs/2410.01623) 中引入的范数增长限制器（Norm-Growth Limiter）机制。
 
 感谢 **PyTorch 团队**提供的基础 Optimizer 实现与 C++ Extension 工具链。
 
