@@ -53,7 +53,7 @@ pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 
 ## Usage Example
 
-It is recommended to use `param_groups` to keep sensitive layers (Embedding, Norm, Bias) in FP32, enabling 8-bit quantization only for large 2D weight matrices.
+It is recommended to use `param_groups` to keep sensitive layers (Embedding, Norm, Bias) in FP32, enabling 8-bit quantization only for large weight matrices.
 
 ```python
 import torch

@@ -52,7 +52,7 @@ pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 
 ## 使用示例
 
-建议通过 `param_groups` 将敏感层（Embedding, Norm, Bias）保持在 FP32，仅对大型 2D 权重矩阵启用 8-bit 量化。
+建议通过 `param_groups` 将敏感层（Embedding, Norm, Bias）保持在 FP32，仅对大型权重矩阵启用 8-bit 量化。
 
 ```python
 import torch
