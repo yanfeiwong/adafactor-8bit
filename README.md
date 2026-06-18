@@ -19,7 +19,7 @@ An 8-bit Adafactor optimizer featuring fused CUDA kernels and log-space block-wi
 
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
-- **APOLLO Subspace Projection with Fira Limiter**: Opt-in random subspace projection that estimates gradient scaling in a low-rank subspace for better generalization, combined with the Fira Norm-Growth Limiter to suppress destructive gradient spikes.
+- **APOLLO Subspace Projection with Fira Limiter**: Opt-in random subspace projection that estimates gradient scaling in a low‑rank space to improve generalization and potentially accelerate convergence, coupled with the Fira norm‑growth limiter that automatically suppresses destructive gradient spikes.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
 - **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
@@ -84,7 +84,7 @@ optimizer = Adafactor8Bit(
     beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
 
     # --- 🚀 Uncomment to try the new APOLLO Subspace Projection ---
-    # Simulates full-rank adaptive scaling in a low-rank space, potentially leading to better generalization.
+    # Simulates full-rank adaptive scaling in a low-rank space, improving generalization and potentially accelerating convergence.
     # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
 )
 

@@ -63,7 +63,7 @@ def main():
         # beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
 
         # Uncomment to try the new APOLLO Subspace Projection
-        # Simulates full-rank adaptive scaling in a low-rank space, potentially leading to better generalization.
+        # Simulates full-rank adaptive scaling in a low-rank space, improving generalization and potentially accelerating convergence.
         # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
     )
     
