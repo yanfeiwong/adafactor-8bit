@@ -19,7 +19,7 @@ An 8-bit Adafactor optimizer featuring fused CUDA kernels and log-space block-wi
 
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
-- **APOLLO Subspace Projection with Fira Limiter**: Opt-in random subspace projection that estimates gradient scaling in a low-rank subspace for faster convergence with the Fira Norm-Growth Limiter to suppress destructive gradient spikes.
+- **APOLLO Subspace Projection with Fira Limiter**: Opt-in random subspace projection that estimates gradient scaling in a low-rank subspace for better generalization, combined with the Fira Norm-Growth Limiter to suppress destructive gradient spikes.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
 - **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
@@ -84,7 +84,7 @@ optimizer = Adafactor8Bit(
     beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
 
     # --- 🚀 Uncomment to try the new APOLLO Subspace Projection ---
-    # Simulates full-rank adaptive scaling in a low-rank space for faster convergence.
+    # Simulates full-rank adaptive scaling in a low-rank space, potentially leading to better generalization.
     # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
 )
 
@@ -112,7 +112,7 @@ If you are in an environment without a CUDA compiler and want to bypass JIT comp
 - Set `use_cuda_kernel=False` to fall back to the pure PyTorch implementation.
 
 ## APOLLO Low-Rank Subspace Projection
-Enable the APOLLO path to compute gradient scaling factors in a memory-efficient low-rank subspace. Compared to Adafactor's standard row/column factorization (which assumes spatial independence), APOLLO uses random subspace projection to capture richer covariance information, potentially leading to faster convergence while keeping memory overhead extremely low.
+Enable the APOLLO path to compute gradient scaling factors in a memory-efficient low-rank subspace. Compared to Adafactor's standard row/column factorization (which assumes spatial independence), APOLLO uses random subspace projection to capture cross-dimensional covariance information, potentially leading to better generalization while keeping memory overhead extremely low.
 
 - **`apollo_rank`**: The target rank for the projection subspace. The default is `0` (disabled). Setting it to `256` might work well for most 1B to 7B models.  
   *Note: Setting this to `1` (APOLLO-Mini style) pushes VRAM savings to the limit (saves even more VRAM than the Adafactor path). However, the original APOLLO-Mini relies on Adam's first-moment (beta1) to smooth out noise. Since our implementation uses a pure second-moment architecture, rank=1 may lead to distorted scaling factors and training instability.*
