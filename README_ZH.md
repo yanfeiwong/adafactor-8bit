@@ -18,7 +18,8 @@
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升了训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
-- **APOLLO 低秩投影与 Fira 限制器**：内置了可选的随机子空间投影路径，同时搭配了 Fira 范数增长限制器（Norm-Growth Limiter），可能带来更好的泛化和收敛效果。
+- **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，防止二阶矩统计信息过时，可能带来更好的收敛与泛化效果。
+- **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升了训练稳定性，通常允许安全地移除外部梯度裁剪。
 - **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
 - **跨平台 JIT 编译**：使用即时编译（JIT），在 Windows 和 Linux 环境下均可便捷配置。
 
@@ -90,7 +91,49 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-更多完整示例请参考 [basic_usage.py](./examples/basic_usage.py)
+## 高级示例：混合路由与 Fira 限制器
+
+对于包含 2D 权重矩阵和高维张量（如卷积）混合的复杂架构（例如视觉语言模型、Diffusion UNets），我们推荐采用**混合路由**策略。
+
+虽然 APOLLO 在 2D 矩阵上表现极其优异，但将其应用于 >2D 张量需要进行 reshape 操作，这可能会破坏固有的空间结构并扰乱按通道缩放。因此，我们将 2D 权重路由至 APOLLO 路径，而将 >2D/1D 参数路由至标准的 Adafactor 路径。
+
+此外，为 Adafactor 路径启用 **Fira 限制器**有助于抑制破坏性的梯度尖峰，通常允许您安全地移除外部梯度裁剪（`torch.nn.utils.clip_grad_norm_`）。
+
+```python
+def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
+    group_1d_sensitive, group_2d_weights, group_nd_weights = [], [], []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad: continue
+        
+        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name
+        if is_sensitive:
+            group_1d_sensitive.append(param)
+        elif param.ndim == 2:
+            group_2d_weights.append(param)
+        else:
+            group_nd_weights.append(param)
+
+    return [
+        # 1D / 敏感层: FP32, 无 WD, Adafactor
+        {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
+        # 2D 权重: 8-bit, WD, APOLLO
+        {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        # >2D 权重 (如 Conv2d): 8-bit, WD, Adafactor (禁用 APOLLO 以保留空间结构)
+        {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
+    ]
+
+optimizer = Adafactor8Bit(
+    get_hybrid_param_groups(model, weight_decay=1e-2, apollo_rank=256),
+    lr=1e-3,
+    relative_step=False,
+    beta2=0.999,
+    enable_fira_for_adafactor=True, # 为 Adafactor 路径启用 Fira 限制器
+    fira_margin=0.01,               # 允许 1% 的范数增长后触发限制
+)
+```
+
+更多完整示例请参考 [basic_usage.py](./examples/basic_usage.py) 和 [advanced_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/advanced_usage.py)。
 
 
 
@@ -107,6 +150,11 @@ optimizer = Adafactor8Bit(
 默认情况下，Adafactor 的权重衰减与参数的 RMS 缩放相耦合。
 - 如果您倾向于 AdamW 风格的解耦权重衰减，请设置 `scale_weight_decay=False`。
 
+### Fira 限制器 (`enable_fira_for_adafactor` 与 `fira_margin`)
+范数增长限制器（在 Fira 论文中提出）通过限制更新范数的相对增长来平滑梯度更新，从而有效抑制破坏性的 Loss 尖峰。
+- **`enable_fira_for_adafactor`**：默认为 `False`。设置为 `True` 可为标准 Adafactor 路径启用该限制器。*（注：在 APOLLO 路径中默认处于激活状态）*。启用后，通常可以安全地移除外部梯度裁剪（如 `torch.nn.utils.clip_grad_norm_`），从而简化训练流水线。
+- **`fira_margin`**：默认为 `0.01`。范数增长的容忍裕度。仅当当前更新范数相较于上一步的增长超过此裕度（例如 `0.01` 代表 1% 的增长）时，限制器才会被激活。
+
 ### 无编译器环境 (`use_cuda_kernel=False`)
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
 - 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
@@ -119,6 +167,7 @@ optimizer = Adafactor8Bit(
 - **`apollo_scale_type`**：缩放因子的应用方式。`'channel'` 按通道应用（标准 APOLLO），而 `'tensor'` 全局应用（APOLLO-Mini）。
 - **`apollo_update_proj_gap`**：投影矩阵刷新的步数间隔。默认为 `200`。设置过小可能导致子空间频繁震荡，阻碍 EMA 积累稳定的方差估计；设置过大可能导致投影基底长时间不更新，无法捕获梯度流形在训练过程中的漂移，导致低秩空间逐渐“过时”（Stale），失去 APOLLO 捕获动态协方差的优势。
 - **`apollo_factorize` (实验性功能)**：在低秩子空间内应用 Adafactor 的行列分解。利用随机投影的保范性来近似主维度的方差，而副维度的方差则在随机基底上估计，从而引入固有噪声。双重压缩了优化器状态的开销。但是，对于较小的模型，实际节省的显存可能并不明显，但引入的噪声可能会影响收敛稳定性。请谨慎使用。
+- **Fira 限制器集成**：APOLLO 路径会自动将 Fira 范数增长限制器应用于缩放后的梯度，以防止梯度突然增大导致 Loss 尖峰。您可以通过全局的 `fira_margin` 参数来调整其灵敏度。
 
 
 ## 新手学习率指南

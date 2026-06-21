@@ -172,6 +172,10 @@ class Adafactor8Bit(Optimizer):
         apollo_factorize (bool): If True, uses Adafactor-style row/col factorization in the 
             low-rank space (FP32, ~16KB state) instead of full matrix variance (8-bit, ~100KB+ state). 
             For large models to drastically reduce optimizer state memory. Defaults to False.
+        enable_fira_for_adafactor (bool): If `True`, enables Fira Limiter for the standard Adafactor path 
+            to prevent gradient explosion by smoothing update norms. Defaults to False.
+        fira_margin (float): The tolerance margin for Fira Limiter. The limiter activates when the 
+            update norm grows by more than `fira_margin` (e.g., 0.01 for 1%). Shared with Apollo path. Defaults to 0.01.
     """
     def __init__(
         self,
@@ -196,6 +200,8 @@ class Adafactor8Bit(Optimizer):
         apollo_scale_type: str = 'channel',
         apollo_eps: float = 1e-8,
         apollo_factorize: bool = False,
+        enable_fira_for_adafactor: bool = False,
+        fira_margin: float = 0.01,
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")
         if not 0.0 >= beta2_decay: raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
@@ -213,6 +219,8 @@ class Adafactor8Bit(Optimizer):
 
         if apollo_rank > 0 and apollo_scale_type not in ('channel', 'tensor'):
             raise ValueError(f"apollo_scale_type must be 'channel' or 'tensor', got {apollo_scale_type}.")
+            
+        if not 0.0 <= fira_margin: raise ValueError(f"Invalid fira_margin: {fira_margin}")
 
         defaults = dict(
             lr=lr, beta2_decay=beta2_decay, beta2=beta2, eps=eps, d=d, weight_decay=weight_decay,
@@ -224,6 +232,8 @@ class Adafactor8Bit(Optimizer):
             apollo_update_proj_gap=apollo_update_proj_gap,
             apollo_scale_type=apollo_scale_type, apollo_eps=apollo_eps,
             apollo_factorize=apollo_factorize,
+            enable_fira_for_adafactor=enable_fira_for_adafactor,
+            fira_margin=fira_margin,
         )
         super().__init__(params, defaults)
 
@@ -376,7 +386,7 @@ class Adafactor8Bit(Optimizer):
 
                 if "is_quantized" not in state:
                     if use_apollo:
-                        state["is_quantized"] = use_quant # APOLLO 直接信任当前配置
+                        state["is_quantized"] = use_quant
                     else:
                         state["is_quantized"] = ("row_var_q" in state or "col_var_q" in state or "variance_q" in state)
                 if "block_size" not in state:
@@ -413,6 +423,7 @@ class Adafactor8Bit(Optimizer):
                         apollo_scale_type=group.get("apollo_scale_type", "channel"),
                         apollo_eps=group.get("apollo_eps", 1e-8),
                         apollo_factorize=group.get("apollo_factorize", False),
+                        fira_margin=group.get("fira_margin", 0.01),
                     )
                 else:
                     _update_param_8bit(
@@ -422,12 +433,58 @@ class Adafactor8Bit(Optimizer):
                         maximize=group["maximize"], relative_step=group["relative_step"],
                         scale_parameter=group["scale_parameter"], scale_weight_decay=group.get("scale_weight_decay", True),
                         block_size=group.get("block_size", 2048), use_cuda_kernel=group.get("use_cuda_kernel", True),
+                        enable_fira_for_adafactor=group.get("enable_fira_for_adafactor", False),
+                        fira_margin=group.get("fira_margin", 0.01),
                     )
         return loss
 
 # ==========================================
 # 5. Parameter Update Logic
 # ==========================================
+def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor, fira_margin: float) -> Tuple[Tensor, Tensor]:
+    current_norm = total_sum_sq.sqrt().view([]) 
+    fira_threshold = 1.0 + fira_margin
+    
+    prev_norm = state.get("fira_prev_norm", None)
+    if prev_norm is not None:
+        if not isinstance(prev_norm, Tensor):
+            prev_norm = torch.tensor(prev_norm, device=total_sum_sq.device, dtype=torch.float32)
+        
+        ratio = current_norm / (prev_norm + 1e-8)
+        limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
+        final_scale = 1.0 / limiter
+    else:
+        final_scale = torch.tensor(1.0, device=total_sum_sq.device, dtype=torch.float32)
+        
+    state["fira_prev_norm"] = current_norm * final_scale
+    
+    alpha_scaled = alpha * final_scale
+    total_sum_sq.mul_(final_scale.square()) 
+    
+    return alpha_scaled, total_sum_sq
+
+def _apply_fira_pytorch(state: Dict[str, Any], update: Tensor, fira_margin: float, numel: int, d: float) -> Tuple[Tensor, Tensor]:
+    current_norm = update.norm(2)
+    fira_threshold = 1.0 + fira_margin
+    
+    prev_norm = state.get("fira_prev_norm", None)
+    if prev_norm is not None:
+        if not isinstance(prev_norm, Tensor):
+            prev_norm = torch.tensor(prev_norm, device=update.device, dtype=torch.float32)
+        ratio = current_norm / (prev_norm + 1e-8)
+        limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
+        final_scale = 1.0 / limiter
+    else:
+        final_scale = torch.tensor(1.0, device=update.device, dtype=torch.float32)
+        
+    state["fira_prev_norm"] = current_norm * final_scale
+    
+    update_scaled = update * final_scale
+    norm_final = current_norm * final_scale
+    denom = torch.clamp(norm_final / (math.sqrt(numel) * d), min=1.0)
+    
+    return update_scaled, denom
+
 def _update_param_8bit(
     param: Tensor, grad: Tensor, 
     state: Dict[str, Any],
@@ -443,6 +500,8 @@ def _update_param_8bit(
     scale_weight_decay: bool,
     block_size: int,
     use_cuda_kernel: bool,
+    enable_fira_for_adafactor: bool = False,
+    fira_margin: float = 0.01,
 ):
     if eps1 is None:
         eps1 = torch.finfo(param.dtype).eps
@@ -516,6 +575,9 @@ def _update_param_8bit(
                     grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size
                 )
                 
+                if enable_fira_for_adafactor:
+                    alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                
                 _CUDA_MODULE.apply_update_1d(
                     param_work.view(-1), grad_fp32_flat,
                     variance_q_flat, variance_scale_flat,
@@ -528,13 +590,19 @@ def _update_param_8bit(
                 state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                 
                 update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
-                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+                if enable_fira_for_adafactor:
+                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                else:
+                    denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
                 param_work.add_(update, alpha=-alpha / denom)
         else:
             variance = state["variance"]
             variance.lerp_(grad_sq, beta_val)
             update = variance.clamp(min=eps_sq).rsqrt().mul_(grad_fp32)
-            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+            if enable_fira_for_adafactor:
+                update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+            else:
+                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
             param_work.add_(update, alpha=-alpha / denom)
 
     else:
@@ -569,6 +637,9 @@ def _update_param_8bit(
                     grad_flat, total_sum_sq, row_mean_val_flat, log_eps_sq, R, C, numel, curr_block_size
                 )
                 
+                if enable_fira_for_adafactor:
+                    alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                
                 param_flat = param_work.reshape(-1)
                 _CUDA_MODULE.apply_update_2d(
                     param_flat, grad_flat,
@@ -591,7 +662,10 @@ def _update_param_8bit(
                 var_estimate.div_(row_mean_val)
                 
                 update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
-                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+                if enable_fira_for_adafactor:
+                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                else:
+                    denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
                 param_work.add_(update, alpha=-alpha / denom)
         else:
             row_var = state["row_var"]
@@ -604,7 +678,10 @@ def _update_param_8bit(
             var_estimate.div_(row_mean_val)
             
             update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
-            denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
+            if enable_fira_for_adafactor:
+                update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+            else:
+                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
             param_work.add_(update, alpha=-alpha / denom)
 
     if needs_copy_back:
@@ -642,6 +719,7 @@ def _update_param_apollo_nomomentum(
     block_size: int, use_cuda_kernel: bool,
     apollo_scale_type: str, apollo_eps: float,
     apollo_factorize: bool,
+    fira_margin: float = 0.01,
 ):
     grad_work = grad.neg().float() if maximize else grad.float()
 
@@ -779,13 +857,14 @@ def _update_param_apollo_nomomentum(
     else:
         current_norm_t = torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32) * scaling_factor
 
+    fira_threshold = 1.0 + fira_margin
     if "scaled_grad_norm_prev" in state:
         prev_norm_t = state["scaled_grad_norm_prev"]
         if not isinstance(prev_norm_t, Tensor):
             prev_norm_t = torch.tensor(prev_norm_t, device=param_work.device, dtype=torch.float32)
             
         ratio = current_norm_t / (prev_norm_t + 1e-8)
-        limiter = torch.clamp_min(ratio, 1.01) / 1.01
+        limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
         final_scale = scaling_factor / limiter
         state["scaled_grad_norm_prev"] = current_norm_t / limiter
     else:

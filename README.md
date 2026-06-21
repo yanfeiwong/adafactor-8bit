@@ -19,7 +19,8 @@ An 8-bit Adafactor optimizer featuring fused CUDA kernels and log-space block-wi
 
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
-- **APOLLO Subspace Projection with Fira Limiter**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, prevent stale second-moment statistics, potentially improving convergence and generalization. Coupled with the Fira Norm-Growth Limiter to suppress destructive gradient spikes and improve training stability.
+- **APOLLO Subspace Projection**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, preventing stale second-moment statistics and potentially improving convergence and generalization.
+- **Fira Norm-Growth Limiter**: Suppresses destructive gradient spikes by regulating the relative increase of update norms. Originally used for APOLLO path, it is now available for the standard Adafactor path as well, it improves training stability and often allows the safe removal of external gradient clipping.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
 - **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
@@ -91,8 +92,49 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py).
+## Advanced Example: Hybrid Routing & Fira Limiter
 
+For complex architectures (e.g., Vision-Language Models, Diffusion UNets) containing a mixture of 2D weight matrices and high-dimensional tensors (e.g., convolutions), we recommend a **hybrid routing** strategy.  
+
+While APOLLO works exceptionally well for 2D matrices, applying it to >2D tensors requires reshaping, which might destroy inherent spatial structures and disrupt channel-wise scaling. Therefore, we route 2D weights to the APOLLO path, and >2D/1D parameters to the standard Adafactor path.
+
+Additionally, enabling the **Fira Limiter** for the Adafactor path helps suppress destructive gradient spikes, often allowing you to safely remove external gradient clipping (`torch.nn.utils.clip_grad_norm_`).
+
+```python
+def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
+    group_1d_sensitive, group_2d_weights, group_nd_weights = [], [], []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad: continue
+        
+        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name
+        if is_sensitive:
+            group_1d_sensitive.append(param)
+        elif param.ndim == 2:
+            group_2d_weights.append(param)
+        else:
+            group_nd_weights.append(param)
+
+    return [
+        # 1D / Sensitive: FP32, No WD, Adafactor
+        {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
+        # 2D Weights: 8-bit, WD, APOLLO
+        {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor (APOLLO disabled to preserve spatial structures)
+        {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
+    ]
+
+optimizer = Adafactor8Bit(
+    get_hybrid_param_groups(model, weight_decay=1e-2, apollo_rank=256),
+    lr=1e-3,
+    relative_step=False,
+    beta2=0.999,
+    enable_fira_for_adafactor=True, # Enable Fira Limiter for the Adafactor paths
+    fira_margin=0.01,               # Allow 1% norm growth before limiting
+)
+```
+
+For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py) and [advanced_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/advanced_usage.py).
 
 ## Advanced Configuration
 
@@ -107,6 +149,11 @@ For endless fine-tuning or lifelong learning, this often leads to overly small l
 By default, Adafactor's weight decay is coupled with the parameter's RMS scale. 
 - If you prefer the AdamW-style decoupled weight decay, set `scale_weight_decay=False`.
 
+### Fira Limiter (`enable_fira_for_adafactor` & `fira_margin`)
+The Norm-Growth Limiter (introduced in the Fira paper) smooths gradient updates by limiting the relative increase of update norms, effectively suppressing destructive loss spikes.
+- **`enable_fira_for_adafactor`**: Defaults to `False`. Set to `True` to enable the limiter for the standard Adafactor path. *(Note: It is inherently active in the APOLLO path)*. When enabled, external gradient clipping (e.g., `torch.nn.utils.clip_grad_norm_`) can generally be safely removed to simplify the training pipeline.
+- **`fira_margin`**: Defaults to `0.01`. The tolerance margin for norm growth. The limiter activates only when the current update norm grows by more than this margin (e.g., `0.01` means a 1% growth) compared to the previous step.
+
 ### No-Compiler Environments (`use_cuda_kernel=False`)
 If you are in an environment without a CUDA compiler and want to bypass JIT compilation entirely:
 - Set `use_cuda_kernel=False` to fall back to the pure PyTorch implementation.
@@ -119,6 +166,7 @@ Enable the APOLLO path to compute gradient scaling factors in a memory-efficient
 - **`apollo_scale_type`**: Determines how the scaling factor is applied. `'channel'` applies it per channel (Standard APOLLO), while `'tensor'` applies it globally (APOLLO-Mini).
 - **`apollo_update_proj_gap`**: Steps between projection matrix refreshes. Defaults to `200`. Setting this too small may cause frequent oscillations due to abrupt basis mutations, while setting it too large might cause the projection space to become stale and fail to track the drift of the gradient manifold.
 - **`apollo_factorize` (Experimental)**: Applies Adafactor's row/column factorization within the low-rank subspace. Mathematically, this leverages the norm-preserving property of random projections to approximate the variance of the primary dimension, while the secondary dimension's variance is estimated across random bases, introducing inherent noise. This dual-compression mechanism drastically reduces optimizer state overhead. Note that for smaller models, the actual VRAM savings might be marginal, and the introduced noise could impact convergence stability. Use with caution.
+- **Fira Limiter Integration**: The APOLLO path automatically applies the Fira Norm-Growth Limiter to the scaled gradients to prevent sudden gradient rises from causing loss spikes. You can adjust its sensitivity using the global `fira_margin` parameter.
 
 
 
