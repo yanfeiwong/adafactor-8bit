@@ -66,6 +66,9 @@ def get_param_groups(model, weight_decay=1e-2):
         if not param.requires_grad: continue
         # 保护 1D 张量、bias、norm 和 embedding
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
+            # 注意：将 embedding 归入此组，对于梯度呈稠密更新的层是安全的。
+            # 但如果您正在训练包含巨大词表且 batch size 较小（导致梯度极度稀疏）的 Token Embedding，
+            # 请参考 `advanced_usage.py` 将其分组至 APOLLO 路径，以避免 Adafactor 的冷启动爆炸问题。
             no_decay.append(param)
         else:
             decay.append(param)
@@ -91,35 +94,43 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-## 高级示例：混合路由与 Fira 限制器
+## 高级示例：混合分组与 Fira 限制器
 
-对于包含 2D 权重矩阵和高维张量（如卷积）混合的复杂架构（例如视觉语言模型、Diffusion UNets），我们推荐采用**混合路由**策略。
+对于包含 2D 权重矩阵与高维张量（如卷积）混合的复杂架构（例如视觉语言模型、Diffusion UNets），我们推荐采用**混合分组**策略。
 
-虽然 APOLLO 在 2D 矩阵上表现极其优异，但将其应用于 >2D 张量需要进行 reshape 操作，这可能会破坏固有的空间结构并扰乱按通道缩放。因此，我们将 2D 权重路由至 APOLLO 路径，而将 >2D/1D 参数路由至标准的 Adafactor 路径。
+虽然 APOLLO 在 2D 矩阵上表现极其优异，但将其应用于 >2D 张量需要进行 reshape 操作，这可能会破坏固有的空间结构并扰乱按通道（channel-wise）的缩放。因此，我们将 2D 权重分组至 APOLLO 路径，而将 >2D 和 1D 参数分组至标准的 Adafactor 路径。
+
+📌**Embedding 层**：Embedding 的梯度极度稀疏。Adafactor 逐行独立跟踪方差，这意味着未激活行的方差会保持在极小值，首次激活时容易导致缩放因子异常放大（即“冷启动”问题）。相比之下，APOLLO 的低秩投影将全体行的信息进行了混合，其缩放因子由全局统计信息兜底，因此对稀疏梯度具有内在的稳定性。因此，我们将 Embedding 分组至 APOLLO 路径。
 
 此外，为 Adafactor 路径启用 **Fira 限制器**有助于抑制破坏性的梯度尖峰，通常允许您安全地移除外部梯度裁剪（`torch.nn.utils.clip_grad_norm_`）。
 
 ```python
 def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
-    group_1d_sensitive, group_2d_weights, group_nd_weights = [], [], []
+    group_1d_sensitive, group_embed, group_2d_weights, group_nd_weights = [], [], [], []
     
     for name, param in model.named_parameters():
         if not param.requires_grad: continue
         
-        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name
+        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name
+        is_embedding = "embed" in name.lower()
+        
         if is_sensitive:
             group_1d_sensitive.append(param)
+        elif is_embedding:
+            group_embed.append(param)
         elif param.ndim == 2:
             group_2d_weights.append(param)
         else:
             group_nd_weights.append(param)
 
     return [
-        # 1D / 敏感层: FP32, 无 WD, Adafactor
+        # 1D / Sensitive: FP32, No WD, Adafactor
         {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
-        # 2D 权重: 8-bit, WD, APOLLO
+        # Embeddings: FP32, No WD, APOLLO
+        {"params": group_embed, "weight_decay": 0.0, "quantize": False, "apollo_rank": apollo_rank},
+        # 2D Weights: 8-bit, WD, APOLLO
         {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
-        # >2D 权重 (如 Conv2d): 8-bit, WD, Adafactor (禁用 APOLLO 以保留空间结构)
+        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor
         {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
     ]
 
@@ -128,8 +139,8 @@ optimizer = Adafactor8Bit(
     lr=1e-3,
     relative_step=False,
     beta2=0.999,
-    enable_fira_for_adafactor=True, # 为 Adafactor 路径启用 Fira 限制器
-    fira_margin=0.01,               # 允许 1% 的范数增长后触发限制
+    enable_fira_for_adafactor=True, # Enable Fira Limiter for the Adafactor paths
+    fira_margin=0.01,               # Allow 1% norm growth before limiting
 )
 ```
 

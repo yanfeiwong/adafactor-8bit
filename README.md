@@ -20,7 +20,7 @@ An 8-bit Adafactor optimizer featuring fused CUDA kernels and log-space block-wi
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
 - **APOLLO Subspace Projection**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, preventing stale second-moment statistics and potentially improving convergence and generalization.
-- **Fira Norm-Growth Limiter**: Suppresses destructive gradient spikes by regulating the relative increase of update norms. Originally used for APOLLO path, it is now available for the standard Adafactor path as well, it improves training stability and often allows the safe removal of external gradient clipping.
+- **Fira Norm-Growth Limiter**: Suppresses destructive gradient spikes by regulating the relative increase of update norms. Originally used for the APOLLO path, it is now available for the standard Adafactor path as well. It improves training stability and often allows the safe removal of external gradient clipping.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
 - **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
 
@@ -67,6 +67,10 @@ def get_param_groups(model, weight_decay=1e-2):
         if not param.requires_grad: continue
         # Protect 1D tensors, biases, norms, and embeddings
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
+            # Note: Grouping embeddings here works well for layers with dense gradient updates. 
+            # However, for massive token embeddings with highly sparse updates (e.g., large vocabularies combined with small batch sizes), 
+            # please refer to the Advanced Example below to route them to the APOLLO path
+            # to avoid Adafactor's cold-start variance explosion.
             no_decay.append(param)
         else:
             decay.append(param)
@@ -98,18 +102,24 @@ For complex architectures (e.g., Vision-Language Models, Diffusion UNets) contai
 
 While APOLLO works exceptionally well for 2D matrices, applying it to >2D tensors requires reshaping, which might destroy inherent spatial structures and disrupt channel-wise scaling. Therefore, we route 2D weights to the APOLLO path, and >2D/1D parameters to the standard Adafactor path.
 
+📌**Embedding Layers**: Gradients for embeddings are extremely sparse. Adafactor tracks variance locally per row, meaning unactivated rows retain near-zero variance and can cause extreme scaling factors upon first activation (the "cold-start" problem). APOLLO's low-rank projection, however, mixes information across all rows, providing globally backed scaling factors that are inherently stable for sparse gradients. Thus, we route Embeddings to the APOLLO path.
+
 Additionally, enabling the **Fira Limiter** for the Adafactor path helps suppress destructive gradient spikes, often allowing you to safely remove external gradient clipping (`torch.nn.utils.clip_grad_norm_`).
 
 ```python
 def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
-    group_1d_sensitive, group_2d_weights, group_nd_weights = [], [], []
+    group_1d_sensitive, group_embed, group_2d_weights, group_nd_weights = [], [], [], []
     
     for name, param in model.named_parameters():
         if not param.requires_grad: continue
         
-        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name
+        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name
+        is_embedding = "embed" in name.lower()
+        
         if is_sensitive:
             group_1d_sensitive.append(param)
+        elif is_embedding:
+            group_embed.append(param)
         elif param.ndim == 2:
             group_2d_weights.append(param)
         else:
@@ -118,9 +128,11 @@ def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
     return [
         # 1D / Sensitive: FP32, No WD, Adafactor
         {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
+        # Embeddings: FP32, No WD, APOLLO
+        {"params": group_embed, "weight_decay": 0.0, "quantize": False, "apollo_rank": apollo_rank},
         # 2D Weights: 8-bit, WD, APOLLO
         {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
-        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor (APOLLO disabled to preserve spatial structures)
+        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor
         {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
     ]
 
@@ -135,6 +147,7 @@ optimizer = Adafactor8Bit(
 ```
 
 For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py) and [advanced_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/advanced_usage.py).
+
 
 ## Advanced Configuration
 

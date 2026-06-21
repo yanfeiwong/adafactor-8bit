@@ -39,11 +39,13 @@ class DummyModel(nn.Module):
 def get_param_groups(model, weight_decay, apollo_rank=256):
     """
     Precision routing for different parameter dimensions:
-    - Group 1 (1D/Sensitive): Embeddings, Norms, Biases -> FP32, No WD, Adafactor.
-    - Group 2 (2D Weights): Linear layers -> 8-bit, WD, APOLLO.
-    - Group 3 (>2D Weights): Conv layers -> 8-bit, WD, Adafactor.
+    - Group 1 (1D/Sensitive): Norms, Biases -> FP32, No WD, Adafactor.
+    - Group 2 (Embeddings): 2D but sparse -> FP32, No WD, APOLLO (Avoids Adafactor's cold-start explosion).
+    - Group 3 (2D Weights): Linear layers -> 8-bit, WD, APOLLO.
+    - Group 4 (>2D Weights): Conv layers -> 8-bit, WD, Adafactor.
     """
     group_1d_sensitive = []
+    group_embed = []
     group_2d_weights = []
     group_nd_weights = []
 
@@ -51,12 +53,18 @@ def get_param_groups(model, weight_decay, apollo_rank=256):
         if not param.requires_grad:
             continue
         
-        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name
+        # 1. Intercept 1D sensitive layers (Norms, Biases)
+        is_sensitive_1d = param.ndim <= 1 or "bias" in name or "norm" in name
         
-        if is_sensitive:
+        if is_sensitive_1d:
             group_1d_sensitive.append(param)
+        # 2. Intercept Embeddings (2D and highly sparse)
+        elif "embed" in name.lower():
+            group_embed.append(param)
+        # 3. Standard 2D Weights (Linear)
         elif param.ndim == 2:
             group_2d_weights.append(param)
+        # 4. High-dimensional Weights (Conv)
         else:
             group_nd_weights.append(param)
 
@@ -66,6 +74,14 @@ def get_param_groups(model, weight_decay, apollo_rank=256):
             "weight_decay": 0.0,
             "quantize": False,
             "apollo_rank": 0,
+        },
+        {
+            "params": group_embed,
+            "weight_decay": 0.0,
+            "quantize": False,
+            # APOLLO handles sparse gradients gracefully 
+            # Apollo 的低秩方差不会逐行孤立，即使嵌入行稀疏，仍能利用全局统计稳定缩放
+            "apollo_rank": apollo_rank, 
         },
         {
             "params": group_2d_weights,

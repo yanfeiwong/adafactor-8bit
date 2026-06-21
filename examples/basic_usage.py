@@ -39,6 +39,10 @@ def get_param_groups(model, weight_decay=1e-2):
         
         # Heuristic: Protect 1D tensors, biases, norms, and embeddings
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
+            # Note: Grouping embeddings here works well for layers with dense gradient updates. 
+            # However, for massive token embeddings with highly sparse updates (e.g., large vocabularies combined with small batch sizes), 
+            # please refer to `advanced_usage.py` to route them to the APOLLO path 
+            # to avoid Adafactor's cold-start variance explosion.
             no_decay.append(param)
         else:
             decay.append(param)
