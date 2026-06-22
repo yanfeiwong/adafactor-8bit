@@ -3,7 +3,7 @@ Example of using a dual-optimizer setup with Adafactor8Bit.
 
 In large-scale pretraining or fine-tuning, token embeddings are highly sparse.
 This script demonstrates how to split `nn.Embedding` parameters from the rest 
-of the network, routing them to a standard FP32 AdamW optimizer while the main 
+of the network, routing them to a standard FP32 Adam optimizer while the main 
 network uses Adafactor8Bit. 
 
 This provides per-token adaptive learning for embeddings, while keeping 
@@ -40,27 +40,35 @@ class DummyModel(nn.Module):
 
 def split_embedding_params(model):
     """
-    Separates nn.Embedding weights from other parameters.
-    Uses `isinstance` rather than string matching to strictly avoid 
-    misclassifying Linear layers (e.g., in a `time_embedding` module).
+    Separates Token Embedding weights from other parameters.
+    
+    Note: Position Embeddings (also nn.Embedding) are explicitly excluded 
+    because they are densely updated (due to sequence padding) and should 
+    not share the lowered learning rate or sparse-update strategies 
+    applied to Token Embeddings.
     """
     emb_params, main_params, seen_ids = [], [], set()
     
-    # Match true Embedding layers
-    for module in model.modules():
+    # Match true Token Embedding layers, excluding Position Embeddings
+    for name, module in model.named_modules():
         if isinstance(module, nn.Embedding):
-            for p in module.parameters():
+            # Skip position embeddings (e.g., 'position_embeddings', 'pos_embed')
+            if "position" in name.lower() or "pos_embed" in name.lower():
+                continue
+                
+            for p in module.parameters(recurse=False):
                 if p.requires_grad and id(p) not in seen_ids:
                     emb_params.append(p)
                     seen_ids.add(id(p))
                     
-    # Collect remaining parameters
+    # Collect remaining parameters (includes the skipped position embeddings)
     for p in model.parameters():
         if p.requires_grad and id(p) not in seen_ids:
             main_params.append(p)
             seen_ids.add(id(p))
             
     return emb_params, main_params
+
 
 
 def get_adafactor_groups(params, weight_decay, apollo_rank=256):
@@ -88,10 +96,10 @@ def main():
     # 1. Split parameters
     emb_params, main_params = split_embedding_params(model)
     
-    # 2. Setup FP32 AdamW for Embeddings
+    # 2. Setup FP32 Adam for Embeddings
     # Maintains element-wise variance for fine-grained, per-token updates.
-    optimizer_emb = torch.optim.AdamW(
-        emb_params, lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+    optimizer_emb = torch.optim.Adam(
+        emb_params, lr=1e-4, betas=(0.9, 0.999), eps=1e-8
     )
     
     # 3. Setup Adafactor8Bit for the Main Network
