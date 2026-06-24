@@ -52,25 +52,29 @@ pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 
 **Note**: The first time you instantiate the optimizer (or run the example script), it will automatically trigger the JIT compilation of the CUDA source code in the background. This may take anywhere from a few seconds to a couple of minutes depending on your system, and the terminal might appear unresponsive. Once compiled, the binary will be cached, and all subsequent runs will be instantaneous.
 
-## Usage Example
+## Quick Start
 
-It is recommended to use `param_groups` to keep sensitive layers (Embedding, Norm, Bias) in FP32, enabling 8-bit quantization only for large weight matrices.
+Using it is as simple as using a standard PyTorch optimizer.
 
 ```python
-import torch
-import torch.nn as nn
+from adafactor8bit import Adafactor8Bit
+
+optimizer = Adafactor8Bit(model.parameters(), lr=1e-3)
+```
+
+**💡 Note**: Passing `model.parameters()` directly works for a quick test. In production, `param_groups` are recommended to protect sensitive layers (Norms, Biases) from quantization and weight decay. For **sparse token embeddings** (large vocabularies + small batch sizes), please refer to the [Advanced Example](#advanced-example) to avoid cold-start variance explosion.
+
+
+```python
 from adafactor8bit import Adafactor8Bit
 
 def get_param_groups(model, weight_decay=1e-2):
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad: continue
+        
         # Protect 1D tensors, biases, norms, and embeddings
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
-            # Note: Grouping embeddings here works well for layers with dense gradient updates. 
-            # However, for massive token embeddings with highly sparse updates (e.g., large vocabularies combined with small batch sizes), 
-            # please refer to the Advanced Example below to route them to the APOLLO path
-            # to avoid Adafactor's cold-start variance explosion.
             no_decay.append(param)
         else:
             decay.append(param)
@@ -84,69 +88,98 @@ model = MyModel().cuda()
 optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
-    # For continual learning with external scheduler
+    # For continual learning or when using an external LR scheduler
     relative_step=False,     # Disable internal LR scheduling
     beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
-
-    # --- 🚀 Uncomment to try the new APOLLO Subspace Projection ---
-    # Simulates full-rank adaptive scaling in a low-rank space, improving generalization and potentially accelerating convergence.
-    # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
 )
 
 # Training loop...
 ```
 
-## Advanced Example: Hybrid Routing & Fira Limiter
+## Advanced Example
 
-For complex architectures (e.g., Vision-Language Models, Diffusion UNets) containing a mixture of 2D weight matrices and high-dimensional tensors (e.g., convolutions), we recommend a **hybrid routing** strategy.  
+Here we demonstrate a **hybrid grouping** strategy for complex hybrid architectures (e.g., Vision-Language Models, Diffusion UNets) to achieve stable and efficient momentum-free training as much as possible.
 
-While APOLLO works exceptionally well for 2D matrices, applying it to >2D tensors requires reshaping, which might destroy inherent spatial structures and disrupt channel-wise scaling. Therefore, we route 2D weights to the APOLLO path, and >2D/1D parameters to the standard Adafactor path.
-
-📌**Embedding Layers**: Gradients for embeddings are extremely sparse. Adafactor tracks variance locally per row, meaning unactivated rows retain near-zero variance and can cause extreme scaling factors upon first activation (the "cold-start" problem). APOLLO's low-rank projection, however, mixes information across all rows, providing globally backed scaling factors that are inherently stable for sparse gradients. Thus, we route Embeddings to the APOLLO path.
-
-Additionally, enabling the **Fira Limiter** for the Adafactor path helps suppress destructive gradient spikes, often allowing you to safely remove external gradient clipping (`torch.nn.utils.clip_grad_norm_`).
+📌 **The following strategies are applied:**
+1. **1D / Sensitive Parameters (Norms, Biases)**: No quantization, no weight decay.
+2. **Embedding Layers**: Combines `factored=False`, `scale_parameter=False`, and `d=1e9` to make the optimization behavior equivalent to a **momentum-free Adam**. Paired with an Adam-style learning rate, this allows for fine-grained, per-token updates while avoiding cold-token interference (global clipping penalties).
+3. **2D Weights (Linear Layers)**: 8-bit quantization, weight decay, using the **APOLLO** path. The continuously switching random subspace projection helps capture comprehensive gradient information and acts as a regularizer.
+4. **>2D Weights (Conv2d, etc.)**: 8-bit quantization, weight decay, **Full-Rank** (`factored=False`). Trades a certain amount of VRAM to preserve complete spatial structures for better optimization outcomes. 
 
 ```python
-def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
-    group_1d_sensitive, group_embed, group_2d_weights, group_nd_weights = [], [], [], []
-    
+from adafactor8bit import Adafactor8Bit
+
+# Define learning rates
+lr = 1e-3
+lr_emb = 1e-4 # For Embedding layers, we use an Adam-style learning rate
+
+def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
+    group_1d, group_embed, group_2d, group_nd = [], [], [], []
+
     for name, param in model.named_parameters():
         if not param.requires_grad: continue
         
-        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name
-        is_embedding = "embed" in name.lower()
+        is_1d = param.ndim <= 1 or "bias" in name or "norm" in name
+        # Match true Token Embeddings, excluding Position and Time Embeddings
+        is_embedding = ("embed" in name.lower() 
+                        and "position" not in name.lower() 
+                        and "pos_embed" not in name.lower()
+                        and "time" not in name.lower())
         
-        if is_sensitive:
-            group_1d_sensitive.append(param)
+        if is_1d:
+            group_1d.append(param)
         elif is_embedding:
             group_embed.append(param)
         elif param.ndim == 2:
-            group_2d_weights.append(param)
+            group_2d.append(param)
         else:
-            group_nd_weights.append(param)
+            group_nd.append(param)
 
     return [
-        # 1D / Sensitive: FP32, No WD, Adafactor
-        {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
-        # Embeddings: FP32, No WD, APOLLO
-        {"params": group_embed, "weight_decay": 0.0, "quantize": False, "apollo_rank": apollo_rank},
-        # 2D Weights: 8-bit, WD, APOLLO
-        {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
-        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor
-        {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
+        # 1. 1D / Sensitive: FP32, No Weight Decay
+        {"params": group_1d, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
+        
+        # 2. Embeddings: Recreating a momentum-free Adam
+        {
+            "params": group_embed, 
+            "weight_decay": 0.0, 
+            "quantize": False,
+            "apollo_rank": 0,
+            "factored": False,         # Enable element-wise variance
+            "scale_parameter": False,  # Disable internal RMS scaling
+            "d": 1e9,                  # Disable global Trust-Region clipping
+            "lr": lr_emb               # Override global learning rate
+        },
+        
+        # 3. 2D Weights: 8-bit quantization, Weight Decay, APOLLO low-rank projection
+        {"params": group_2d, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        
+        # 4. >2D Weights: 8-bit quantization, Weight Decay, Full-Rank
+        {
+            "params": group_nd, 
+            "weight_decay": weight_decay, 
+            "quantize": True, 
+            "apollo_rank": 0,
+            "factored": False          # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
+                                       # Note: This increases state memory for >2D weights, depending on your model architecture.
+                                       # If VRAM is constrained, reverting to factored=True is a safe alternative.
+        },
     ]
 
+model = MyModel().cuda()
 optimizer = Adafactor8Bit(
-    get_hybrid_param_groups(model, weight_decay=1e-2, apollo_rank=256),
-    lr=1e-3,
-    relative_step=False,
-    beta2=0.999,
-    enable_fira_for_adafactor=True, # Enable Fira Limiter for the Adafactor paths
-    fira_margin=0.01,               # Allow 1% norm growth before limiting
+    get_param_groups(model, lr_emb = lr_emb, weight_decay=1e-2, apollo_rank=256), 
+    lr=lr, 
+    # For continual learning or when using an external LR scheduler
+    relative_step=False,              # Disable internal LR scheduling
+    beta2=0.999,                      # Lock EMA window to prevent "blunting" over steps
+    enable_fira_for_adafactor=True    # Enable Fira Limiter globally; external grad clipping can be safely removed
 )
+
+# Training loop...
 ```
 
-For a complete example, please refer to [basic_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/basic_usage.py) and [advanced_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/advanced_usage.py).
+For more complete examples, please refer to the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
 
 
 ## Advanced Configuration
@@ -166,6 +199,12 @@ By default, Adafactor's weight decay is coupled with the parameter's RMS scale.
 The Norm-Growth Limiter (introduced in the Fira paper) smooths gradient updates by limiting the relative increase of update norms, effectively suppressing destructive loss spikes.
 - **`enable_fira_for_adafactor`**: Defaults to `False`. Set to `True` to enable the limiter for the standard Adafactor path. *(Note: It is inherently active in the APOLLO path)*. When enabled, external gradient clipping (e.g., `torch.nn.utils.clip_grad_norm_`) can generally be safely removed to simplify the training pipeline.
 - **`fira_margin`**: Defaults to `0.01`. The tolerance margin for norm growth. The limiter activates only when the current update norm grows by more than this margin (e.g., `0.01` means a 1% growth) compared to the previous step.
+
+### Full-Rank and Factorized Variance (`factored`)
+
+By default, Adafactor factorizes the second moment of $\ge$ 2D tensors into row and column statistics (`factored=True`) to minimize state memory. Setting `factored=False` switches to full element-wise variance (similar to RMSProp), while still retaining Adafactor's global RMS clipping mechanism (controlled by the `d` parameter). This configuration can be useful in the following scenarios:
+- **Convolution Weights (>2D)**: Setting `factored=False` maintains independent variance for each spatial position in the convolution kernel, enabling finer per-element gradient scaling.
+- **Sparse Embeddings**: Combining `factored=False`, `scale_parameter=False`, `d=1e9` and a lower learning rate creates a momentum-free adaptive optimizer. This allows for fine-grained, per-token updates while avoiding cold-token interference or cold-start explosions.
 
 ### No-Compiler Environments (`use_cuda_kernel=False`)
 If you are in an environment without a CUDA compiler and want to bypass JIT compilation entirely:

@@ -149,14 +149,19 @@ class Adafactor8Bit(Optimizer):
               of the parameter's dtype (e.g., ~1.19e-7 for FP32), aligning with PyTorch official 
               behavior and preventing underflow.
             - `eps2`: Lower threshold for parameter RMS scaling. Defaults to (None, 1e-3).
-        d (float): Clipping threshold for the final gradient update RMS. Defaults to 1.0.
+        d (float): Clipping threshold for the final gradient update RMS. 
+            Setting to an extremely large value (e.g., ``1e9``) effectively disables the global 
+            clipping constraint, which can be useful for decoupling updates in highly sparse layers 
+            like Embeddings. Defaults to 1.0.
         weight_decay (float): Weight decay (L2 penalty). Defaults to 0.0.
         scale_weight_decay (bool): If `True` (default), weight decay is coupled with the 
             parameter's RMS scale. If `False`, weight decay is decoupled and only scaled by the 
             base learning rate (AdamW-style).
         maximize (bool): Maximize the params based on the objective. Defaults to False.
         relative_step (bool): If `True`, uses time-dependent learning rate. Defaults to True.
-        scale_parameter (bool): If `True`, scales learning rate by parameter RMS. Defaults to True.
+        scale_parameter (bool): If `True`, scales learning rate by parameter RMS. 
+            Setting to False decouples the step size from parameter magnitude, which can be useful 
+            for sparse layers like Embeddings to ensure sufficient update strength. Defaults to True.
         quantize (bool): Enable 8-bit log-space quantization for optimizer states. Defaults to True.
         block_size (int): Block size for quantization. Must be a multiple of 1024. Defaults to 2048.
         min_8bit_size (int): Minimum number of elements to apply 8-bit quantization. Defaults to 4096.
@@ -175,7 +180,13 @@ class Adafactor8Bit(Optimizer):
         enable_fira_for_adafactor (bool): If `True`, enables Fira Limiter for the standard Adafactor path 
             to prevent gradient explosion by smoothing update norms. Defaults to False.
         fira_margin (float): The tolerance margin for Fira Limiter. The limiter activates when the 
-            update norm grows by more than `fira_margin` (e.g., 0.01 for 1%). Shared with Apollo path. Defaults to 0.01.
+            update norm grows by more than `fira_margin` (e.g., 0.01 for 1%). Shared with Apollo path. 
+            Defaults to 0.01.
+        factored (bool): Whether to use row/col factorization for >=2D tensors. 
+            Setting to False uses element-wise variance (like RMSProp, but still applies Adafactor's 
+            global RMS clipping), which can be useful for preserving spatial structure in >2D tensors 
+            such as CNN convolutions, or enabling per-element updates in highly sparse layers like 
+            Embeddings. Defaults to True.
     """
     def __init__(
         self,
@@ -202,6 +213,7 @@ class Adafactor8Bit(Optimizer):
         apollo_factorize: bool = False,
         enable_fira_for_adafactor: bool = False,
         fira_margin: float = 0.01,
+        factored: bool = True,
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")
         if not 0.0 >= beta2_decay: raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
@@ -234,6 +246,7 @@ class Adafactor8Bit(Optimizer):
             apollo_factorize=apollo_factorize,
             enable_fira_for_adafactor=enable_fira_for_adafactor,
             fira_margin=fira_margin,
+            factored=factored,
         )
         super().__init__(params, defaults)
 
@@ -244,6 +257,7 @@ class Adafactor8Bit(Optimizer):
         block_size = group.get("block_size", 2048)
         min_8bit_size = group.get("min_8bit_size", 4096)
         apollo_rank = group.get("apollo_rank", 0)
+        factored = group.get("factored", True)
 
         for p in group["params"]:
             if p.grad is None: continue
@@ -256,6 +270,7 @@ class Adafactor8Bit(Optimizer):
             state = self.state[p]
 
             use_apollo = apollo_rank > 0 and p.grad.dim() >= 2
+            expected_is_factored = (p.grad.dim() >= 2) and factored
 
             needs_init = False
             if len(state) == 0:
@@ -276,12 +291,10 @@ class Adafactor8Bit(Optimizer):
                         state["step"] = step_backup
                         needs_init = True
                 else:
-                    is_nd = (p.grad.dim() >= 2)
-                    has_row_col = ("row_var" in state or "row_var_q" in state)
-                    has_var = ("variance" in state or "variance_q" in state)
+                    state_is_factored = ("row_var" in state or "row_var_q" in state)
                     
-                    if (is_nd and has_var) or (not is_nd and has_row_col):
-                        logger.warning(f"Adafactor8Bit: State structure mismatch for param shape {p.shape}. Re-initializing state.")
+                    if state_is_factored != expected_is_factored:
+                        logger.warning(f"Adafactor8Bit: factored mode mismatch for param shape {p.shape}. Re-initializing state.")
                         step_backup = state.get("step", 0)
                         state.clear()
                         state["step"] = step_backup
@@ -308,7 +321,7 @@ class Adafactor8Bit(Optimizer):
                     state["v_low"] = None
 
                 else:
-                    if p.grad.dim() >= 2:
+                    if expected_is_factored:
                         shape = p.grad.shape
                         R = shape[-2]
                         C = shape[-1]
@@ -352,9 +365,10 @@ class Adafactor8Bit(Optimizer):
                                 state[scale_key] = state[scale_key].to(torch.float32)
 
                 curr_block_size = state.get("block_size", block_size)
+                state_is_factored = ("row_var" in state or "row_var_q" in state)
 
                 if use_quant and not state.get("is_quantized", False):
-                    if p.grad.dim() >= 2:
+                    if state_is_factored:
                         if "row_var" in state and "row_var_q" not in state:
                             state["row_var"].clamp_(min=_FP32_TINY)
                             q, s, sh, pad = _log_quantize_nonneg(state["row_var"], curr_block_size)
@@ -374,7 +388,7 @@ class Adafactor8Bit(Optimizer):
                     state["is_quantized"] = True
                 
                 elif not use_quant and state.get("is_quantized", False):
-                    if p.grad.dim() >= 2:
+                    if state_is_factored:
                         if "row_var_q" in state:
                             state["row_var"] = _log_dequantize_nonneg(state.pop("row_var_q"), state.pop("row_var_scale"), state.pop("row_var_shape"), state.pop("row_var_pad"))
                         if "col_var_q" in state:
@@ -435,6 +449,7 @@ class Adafactor8Bit(Optimizer):
                         block_size=group.get("block_size", 2048), use_cuda_kernel=group.get("use_cuda_kernel", True),
                         enable_fira_for_adafactor=group.get("enable_fira_for_adafactor", False),
                         fira_margin=group.get("fira_margin", 0.01),
+                        factored=group.get("factored", True),
                     )
         return loss
 
@@ -502,6 +517,7 @@ def _update_param_8bit(
     use_cuda_kernel: bool,
     enable_fira_for_adafactor: bool = False,
     fira_margin: float = 0.01,
+    factored: bool = True,
 ):
     if eps1 is None:
         eps1 = torch.finfo(param.dtype).eps
@@ -553,15 +569,13 @@ def _update_param_8bit(
         wd_multiplier = alpha if scale_weight_decay else rho_t
         param_work.mul_(1.0 - (wd_multiplier * weight_decay))
 
-    is_1d = grad_fp32.dim() < 2 
+    is_full_rank = (grad_fp32.dim() < 2) or (not factored)
 
-    if is_1d:
-        grad_sq = grad_fp32.square() 
-        
+    if is_full_rank:
         if quantize:
             if _load_cuda_module(use_cuda_kernel):
-                grad_sq_padded = _pad_to_block_size(grad_sq, curr_block_size)
-                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_sq_padded, beta_val, curr_block_size)
+                grad_fp32_padded = _pad_to_block_size(grad_fp32, curr_block_size)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32_padded, beta_val, curr_block_size, True)
                 
                 numel = param_work.numel()
                 grad_fp32_flat = grad_fp32.view(-1)
@@ -584,6 +598,7 @@ def _update_param_8bit(
                     total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
                 )
             else:
+                grad_sq = grad_fp32.square() 
                 variance = _log_dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
                 variance.lerp_(grad_sq, beta_val)
                 q, s, sh, pad = _log_quantize_nonneg(variance, curr_block_size)
@@ -596,6 +611,7 @@ def _update_param_8bit(
                     denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
                 param_work.add_(update, alpha=-alpha / denom)
         else:
+            grad_sq = grad_fp32.square() 
             variance = state["variance"]
             variance.lerp_(grad_sq, beta_val)
             update = variance.clamp(min=eps_sq).rsqrt().mul_(grad_fp32)
@@ -619,8 +635,8 @@ def _update_param_8bit(
                 row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
                 col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
 
-                _CUDA_MODULE.fused_log_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size)
-                _CUDA_MODULE.fused_log_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size, False)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size, False)
 
                 row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
                 row_mean_val_flat = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1).flatten().contiguous()
@@ -677,7 +693,7 @@ def _update_param_8bit(
             row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
             var_estimate.div_(row_mean_val)
             
-            update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
+            update = var_estimate.clamp_(min=eps_sq).rsqrt().mul_(grad_fp32)
             if enable_fira_for_adafactor:
                 update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
             else:
@@ -819,20 +835,23 @@ def _update_param_apollo_nomomentum(
                 state["v_low"] = v_init
                 v_low_deq = v_init
         else:
-            grad_low_sq_flat = grad_low.flatten().square()
             quantize = state.get("is_quantized", True)
             if quantize:
                 if _load_cuda_module(use_cuda_kernel):
-                    sq_padded = _pad_to_block_size(grad_low_sq_flat, block_size)
+                    grad_low_flat = grad_low.flatten()
+                    sq_padded = _pad_to_block_size(grad_low_flat, block_size)
                     _CUDA_MODULE.fused_log_quantize_lerp(
-                        state["v_low_q"], state["v_low_scale"], sq_padded, beta_val, block_size
+                        state["v_low_q"], state["v_low_scale"], 
+                        sq_padded, beta_val, block_size, True
                     )
                 else:
+                    grad_low_sq_flat = grad_low.flatten().square()
                     v_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"])
                     v_deq.lerp_(grad_low_sq_flat, beta_val)
                     q, s, sh, pad = _log_quantize_nonneg(v_deq, block_size)
                     state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
             else:
+                grad_low_sq_flat = grad_low.flatten().square()
                 state["v_low"].lerp_(grad_low_sq_flat, beta_val)
 
             v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]

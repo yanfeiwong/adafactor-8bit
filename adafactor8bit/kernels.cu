@@ -16,7 +16,8 @@ __global__ void fused_log_quantize_lerp_kernel(
     float* __restrict__ scale,
     const float* __restrict__ new_val,
     const float beta,
-    int block_size)
+    int block_size,
+    bool square_input)
 {
     int block_id = blockIdx.x;
     int tid = threadIdx.x;
@@ -43,15 +44,22 @@ __global__ void fused_log_quantize_lerp_kernel(
         float4 nv = new_val_vec[idx];
         uchar4 q_val = q_vec[idx];
 
-        float v_old0 = exp2f((float)q_val.x * INV_255 * old_scale + MIN_LOG);
-        float v_old1 = exp2f((float)q_val.y * INV_255 * old_scale + MIN_LOG);
-        float v_old2 = exp2f((float)q_val.z * INV_255 * old_scale + MIN_LOG);
-        float v_old3 = exp2f((float)q_val.w * INV_255 * old_scale + MIN_LOG);
+        if (square_input) {
+            nv.x = nv.x * nv.x;
+            nv.y = nv.y * nv.y;
+            nv.z = nv.z * nv.z;
+            nv.w = nv.w * nv.w;
+        }
 
         float val_x = (isnan(nv.x) || isinf(nv.x)) ? 0.0f : nv.x;
         float val_y = (isnan(nv.y) || isinf(nv.y)) ? 0.0f : nv.y;
         float val_z = (isnan(nv.z) || isinf(nv.z)) ? 0.0f : nv.z;
         float val_w = (isnan(nv.w) || isinf(nv.w)) ? 0.0f : nv.w;
+
+        float v_old0 = exp2f((float)q_val.x * INV_255 * old_scale + MIN_LOG);
+        float v_old1 = exp2f((float)q_val.y * INV_255 * old_scale + MIN_LOG);
+        float v_old2 = exp2f((float)q_val.z * INV_255 * old_scale + MIN_LOG);
+        float v_old3 = exp2f((float)q_val.w * INV_255 * old_scale + MIN_LOG);
 
         float v_upd0 = fmaxf(v_old0 * one_minus_b + fmaxf(val_x, MIN_VAL) * beta, MIN_VAL);
         float v_upd1 = fmaxf(v_old1 * one_minus_b + fmaxf(val_y, MIN_VAL) * beta, MIN_VAL);
@@ -116,7 +124,8 @@ __global__ void fused_log_quantize_lerp_kernel(
 }
 
 torch::Tensor fused_log_quantize_lerp_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor new_val, float beta, int block_size)
+    torch::Tensor q, torch::Tensor scale, torch::Tensor new_val, 
+    float beta, int block_size, bool square_input)
 {
     TORCH_CHECK(q.scalar_type() == at::kByte && scale.scalar_type() == at::kFloat && new_val.scalar_type() == at::kFloat);
     TORCH_CHECK(q.is_cuda() && scale.is_cuda() && new_val.is_cuda());
@@ -134,7 +143,8 @@ torch::Tensor fused_log_quantize_lerp_cuda(
     TORCH_CHECK(shared_mem <= 49152, "block_size is too large, exceeding 48KB shared memory limit.");
     
     fused_log_quantize_lerp_kernel<<<num_blocks, threads, shared_mem>>>(
-        q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), beta, block_size
+        q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), 
+        beta, block_size, square_input
     );
     return q;
 }

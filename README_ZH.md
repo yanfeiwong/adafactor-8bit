@@ -51,13 +51,19 @@ pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 
 **注意**：首次实例化优化器（或运行示例代码）时，会自动触发 CUDA 源码的 JIT 编译。这可能需要几十秒到几分钟的时间（取决于您的硬件与编译器），期间终端可能无明显输出，请耐心等待。编译完成后结果会被自动缓存，后续无需等待。
 
-## 使用示例
+## 快速开始
 
-建议通过 `param_groups` 将敏感层（Embedding, Norm, Bias）保持在 FP32，仅对大型权重矩阵启用 8-bit 量化。
+就像使用标准优化器那样简单。
 
 ```python
-import torch
-import torch.nn as nn
+from adafactor8bit import Adafactor8Bit
+
+optimizer = Adafactor8Bit(model.parameters(), lr=1e-3)
+```
+
+**💡 提示**：直接传入 `model.parameters()` 可快速跑通。生产环境建议使用 `param_groups` 保护敏感层（Norms, Biases）。对于**稀疏 Token Embedding**（大词表 + 小 batch），请参阅[进阶示例](#进阶示例)以规避冷启动方差爆炸。
+
+```python
 from adafactor8bit import Adafactor8Bit
 
 def get_param_groups(model, weight_decay=1e-2):
@@ -66,9 +72,6 @@ def get_param_groups(model, weight_decay=1e-2):
         if not param.requires_grad: continue
         # 保护 1D 张量、bias、norm 和 embedding
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
-            # 注意：将 embedding 归入此组，对于梯度呈稠密更新的层是安全的。
-            # 但如果您正在训练包含巨大词表且 batch size 较小（导致梯度极度稀疏）的 Token Embedding，
-            # 请参考 `advanced_usage.py` 将其分组至 APOLLO 路径，以避免 Adafactor 的冷启动爆炸问题。
             no_decay.append(param)
         else:
             decay.append(param)
@@ -82,69 +85,98 @@ model = MyModel().cuda()
 optimizer = Adafactor8Bit(
     get_param_groups(model), 
     lr=1e-3, 
-    # 针对长期连续训练和搭配外部学习率调度的情况
-    relative_step=False,     # 禁用内部LR的调度
-    beta2=0.999,             # 锁定 EMA 窗口，防止随着训练步骤推进而“钝化”
-
-    # --- 🚀 解除注释尝试新的：APOLLO 低秩投影 ---
-    # 在低秩空间内模拟全秩自适应缩放，可能带来更好的泛化效果和加速收敛。
-    # apollo_rank=256,             # 0 为禁用。256 是 APOLLO 官方默认值。
+    # 如果希望长期连续训练或者搭配外部学习率调度
+    relative_step=False,     # 禁用内部 LR 调度，使用外部传入的固定 LR
+    beta2=0.999,             # 锁定 EMA 窗口，适合长期连续微调
 )
 
 # Training loop...
 ```
 
-## 高级示例：混合分组与 Fira 限制器
+## 进阶示例
 
-对于包含 2D 权重矩阵与高维张量（如卷积）混合的复杂架构（例如视觉语言模型、Diffusion UNets），我们推荐采用**混合分组**策略。
+这里我们展示针对复杂混合架构模型（例如 Vision-Language Models, Diffusion UNets 等），如何通过**混合分组**策略来尽可能实现无一阶动量的稳定高效训练。
 
-虽然 APOLLO 在 2D 矩阵上表现极其优异，但将其应用于 >2D 张量需要进行 reshape 操作，这可能会破坏固有的空间结构并扰乱按通道（channel-wise）的缩放。因此，我们将 2D 权重分组至 APOLLO 路径，而将 >2D 和 1D 参数分组至标准的 Adafactor 路径。
-
-📌**Embedding 层**：Embedding 的梯度极度稀疏。Adafactor 逐行独立跟踪方差，这意味着未激活行的方差会保持在极小值，首次激活时容易导致缩放因子异常放大（即“冷启动”问题）。相比之下，APOLLO 的低秩投影将全体行的信息进行了混合，其缩放因子由全局统计信息兜底，因此对稀疏梯度具有内在的稳定性。因此，我们将 Embedding 分组至 APOLLO 路径。
-
-此外，为 Adafactor 路径启用 **Fira 限制器**有助于抑制破坏性的梯度尖峰，通常允许您安全地移除外部梯度裁剪（`torch.nn.utils.clip_grad_norm_`）。
+📌 **我们主要采取以下策略：**
+1. **1D / 敏感小参数 (Norms, Biases)**: 不量化，不做权重衰减。
+2. **Embedding 层**: 组合使用(`factored=False`, `scale_parameter=False`, `d=1e9`) ，让对这些层的优化行为等效于**没有一阶动量的 Adam**，再配合 Adam 级别的学习率，这让我们可以获得 Token 级的精细的更新，且避免冷词连坐。
+3. **2D 权重 (线性层)**: 8-bit量化，权重衰减，使用 **APOLLO** 路径。不断切换的随机子空间投影可以帮助我们捕获更全面的梯度信息，并起到一定的正则化作用。
+4. **>2D Weights (Conv2d 等)**: 8-bit量化，权重衰减，**Full-Rank** (`factored=False`)。牺牲一定显存来保留完整空间结构，换取更精细的优化效果。
 
 ```python
-def get_hybrid_param_groups(model, weight_decay, apollo_rank=256):
-    group_1d_sensitive, group_embed, group_2d_weights, group_nd_weights = [], [], [], []
-    
+from adafactor8bit import Adafactor8Bit
+
+# 定义学习率
+lr = 1e-3
+lr_emb = 1e-4 # 对于 Embedding 层，我们使用 Adam 风格的学习率
+
+def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
+    group_1d, group_embed, group_2d, group_nd = [], [], [], []
+
     for name, param in model.named_parameters():
         if not param.requires_grad: continue
         
-        is_sensitive = param.ndim <= 1 or "bias" in name or "norm" in name
-        is_embedding = "embed" in name.lower()
+        is_1d = param.ndim <= 1 or "bias" in name or "norm" in name
+        is_embedding = ("embed" in name.lower() 
+                        and "position" not in name.lower() 
+                        and "pos_embed" not in name.lower()
+                        and "time" not in name.lower())
         
-        if is_sensitive:
-            group_1d_sensitive.append(param)
+        if is_1d:
+            group_1d.append(param)
         elif is_embedding:
             group_embed.append(param)
         elif param.ndim == 2:
-            group_2d_weights.append(param)
+            group_2d.append(param)
         else:
-            group_nd_weights.append(param)
+            group_nd.append(param)
 
     return [
-        # 1D / Sensitive: FP32, No WD, Adafactor
-        {"params": group_1d_sensitive, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
-        # Embeddings: FP32, No WD, APOLLO
-        {"params": group_embed, "weight_decay": 0.0, "quantize": False, "apollo_rank": apollo_rank},
-        # 2D Weights: 8-bit, WD, APOLLO
-        {"params": group_2d_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
-        # >2D Weights (e.g., Conv2d): 8-bit, WD, Adafactor
-        {"params": group_nd_weights, "weight_decay": weight_decay, "quantize": True, "apollo_rank": 0},
+        # 1. 1D / 敏感层：FP32，无权重衰减
+        {"params": group_1d, "weight_decay": 0.0, "quantize": False, "apollo_rank": 0},
+        
+        # 2. Embedding 层：让我们还原一个没有一阶动量的 Adam
+        {
+            "params": group_embed, 
+            "weight_decay": 0.0, 
+            "quantize": False,
+            "apollo_rank": 0,
+            "factored": False,         # 启用逐元素二阶动量
+            "scale_parameter": False,  # 解除内部自动缩放
+            "d": 1e9,                  # 关闭全局信赖域裁剪
+            "lr": lr_emb               # 覆盖全局学习率
+        },
+        
+        # 3. 2D 权重：8-bit 量化，权重衰减，APOLLO 低秩投影路径
+        {"params": group_2d, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        
+        # 4. >2D 权重：8-bit 量化，权重衰减，Full-Rank
+        {
+            "params": group_nd, 
+            "weight_decay": weight_decay, 
+            "quantize": True, 
+            "apollo_rank": 0,
+            "factored": False          # 禁用行列分解以保留空间结构，实现更精细的梯度缩放。
+                                       # 注：这会增加ND权重占用的状态显存，具体取决于你的模型结构。
+                                       # 如果显存受限，切回 factored=True 也是安全的。
+        },
     ]
 
+model = MyModel().cuda()
 optimizer = Adafactor8Bit(
-    get_hybrid_param_groups(model, weight_decay=1e-2, apollo_rank=256),
-    lr=1e-3,
-    relative_step=False,
-    beta2=0.999,
-    enable_fira_for_adafactor=True, # Enable Fira Limiter for the Adafactor paths
-    fira_margin=0.01,               # Allow 1% norm growth before limiting
+    get_param_groups(model, lr_emb = lr_emb, weight_decay=1e-2, apollo_rank=256),
+    lr=lr, 
+    # 针对长期连续训练或搭配外部学习率调度器的情况
+    relative_step=False,              # 禁用内部 LR 调度
+    beta2=0.999,                      # 锁定 EMA 窗口，防止随着训练步数推进而“钝化”
+    enable_fira_for_adafactor=True    # 对全局启用 Fira 限制器，可在训练循环中安全移除外部的梯度裁剪
 )
+
+# Training loop...
+
 ```
 
-更多完整示例请参考 [basic_usage.py](./examples/basic_usage.py) 和 [advanced_usage.py](https://github.com/yanfeiwong/adafactor-8bit/blob/main/examples/advanced_usage.py)。
+更多完整示例请查阅 [examples 文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
 
 
 
@@ -165,6 +197,12 @@ optimizer = Adafactor8Bit(
 范数增长限制器（在 Fira 论文中提出）通过限制更新范数的相对增长来平滑梯度更新，从而有效抑制破坏性的 Loss 尖峰。
 - **`enable_fira_for_adafactor`**：默认为 `False`。设置为 `True` 可为标准 Adafactor 路径启用该限制器。*（注：在 APOLLO 路径中默认处于激活状态）*。启用后，通常可以安全地移除外部梯度裁剪（如 `torch.nn.utils.clip_grad_norm_`），从而简化训练流水线。
 - **`fira_margin`**：默认为 `0.01`。范数增长的容忍裕度。仅当当前更新范数相较于上一步的增长超过此裕度（例如 `0.01` 代表 1% 的增长）时，限制器才会被激活。
+
+### 全秩与分解方差 (`factored`)
+
+默认情况下，Adafactor 会将 $\ge$ 2D 张量的二阶矩分解为行和列的统计量（`factored=True`），以最小化状态显存。将其设置为 `factored=False` 会切换为全元素级别的方差估计（类似于 RMSProp），同时依然保留 Adafactor 的全局 RMS 裁剪机制（由参数 `d` 控制）。这种配置在以下场景中可能非常有用：
+- **卷积权重 (>2D)**：设置 `factored=False` 会为卷积核的每个空间位置维护独立的方差，从而实现更精细的逐元素梯度缩放。
+- **稀疏 Embedding 层**：将 `factored=False`、`scale_parameter=False`、`d=1e9` 与较低的学习率结合使用，可以构建一个无一阶动量的自适应优化器。这使得模型能够进行细粒度的逐 Token 更新，同时避免冷词连坐或冷启动干扰。
 
 ### 无编译器环境 (`use_cuda_kernel=False`)
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：

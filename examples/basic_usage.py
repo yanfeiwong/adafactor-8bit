@@ -1,9 +1,9 @@
 """
 Basic Usage Example for Adafactor8Bit
 
-This script demonstrates the recommended best practices for using the optimizer,
-specifically how to use parameter groups to protect sensitive layers 
-(Embeddings, Norms, Biases) while aggressively quantizing large weight matrices.
+This script demonstrates a common practice for using the optimizer: 
+using parameter groups to protect sensitive layers (Embeddings, Norms, Biases) 
+while applying 8-bit quantization to large weight matrices.
 """
 import torch
 import torch.nn as nn
@@ -40,9 +40,9 @@ def get_param_groups(model, weight_decay=1e-2):
         # Heuristic: Protect 1D tensors, biases, norms, and embeddings
         if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
             # Note: Grouping embeddings here works well for layers with dense gradient updates. 
-            # However, for massive token embeddings with highly sparse updates (e.g., large vocabularies combined with small batch sizes), 
-            # please refer to `advanced_usage.py` to route them to the APOLLO path 
-            # to avoid Adafactor's cold-start variance explosion.
+            # For massive token embeddings with highly sparse updates, please refer to 
+            # `advanced_usage.py` for a more specialized routing strategy 
+            # (e.g., using `factored=False` and `scale_parameter=False`) to handle sparse gradients effectively.
             no_decay.append(param)
         else:
             decay.append(param)
@@ -54,42 +54,28 @@ def get_param_groups(model, weight_decay=1e-2):
 
 
 def main():
-    # Directly use CUDA. Users of this library are expected to have a GPU environment.
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DummyModel().to(device)
     
-    # Initialize optimizer with grouped parameters
     optimizer = Adafactor8Bit(
         get_param_groups(model), 
         lr=1e-3, 
-        # Uncomment for continual learning with external scheduler
-        # relative_step=False,     # Disable internal LR scheduling
-        # beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
-
-        # Uncomment to try the new APOLLO Subspace Projection
-        # Simulates full-rank adaptive scaling in a low-rank space, improving generalization and potentially accelerating convergence.
-        # apollo_rank=256,             # 0 to disable. 256 is the official APOLLO default.
+        relative_step=False,
+        beta2=0.999,
     )
     
-    print("Starting dummy training loop...")
     for step in range(10):
         optimizer.zero_grad()
         
-        # Generate dummy data
         dummy_input = torch.randint(0, 1000, (4, 16), device=device)
         dummy_target = torch.randn(4, 16, 10, device=device)
         
-        # Forward & Backward pass
         output = model(dummy_input)
         loss = nn.MSELoss()(output, dummy_target)
         loss.backward()
         
-        # Optimization step (triggers JIT compilation of CUDA kernels on the first run)
-        optimizer.step()
-        print(f"Step {step+1} | Loss: {loss.item():.4f}")
-        
-    print("Training completed!")
-
+        optimizer.step()  # First call triggers JIT compilation
+        print(f"Step {step + 1} | Loss: {loss.item():.4f}")
 
 if __name__ == "__main__":
     main()

@@ -9,7 +9,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="adafactor8bit",
-    version="0.1.9",
+    version="0.2.0",
     description="8-bit Adafactor Optimizer with Fused CUDA Kernels",
     author="WANG YAN",
     author_email="yanfeiwong1997@outlook.com",
