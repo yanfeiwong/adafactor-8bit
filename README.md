@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="assets/banner.png" alt="# Adafactor8Bit" width="80%">
+</p>
 <div align="center">
 
 # 8-bit Adafactor with Fused CUDA Kernels
@@ -15,7 +18,7 @@
 An enhanced 8-bit Adafactor optimizer featuring fused CUDA kernels, log-space block-wise quantization, optional APOLLO low-rank updates, and 4-bit packed first moments, delivering substantially lower optimizer memory while preserving the low-overhead and numerical stability that make Adafactor attractive for training LLMs and diffusion models.
 
 
-## 🔥 Key Features
+## ⚡ Key Features
 
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
@@ -275,12 +278,12 @@ Thanks to the **PyTorch team** for providing the foundational Optimizer implemen
 
 Thanks to the large language models **Qwen**, **ChatGLM** and **DeepSeek** for valuable technical discussions and code reviews on CUDA low-level optimization and memory safety mechanisms.
 
+## 🏛️ License
+
+[The project is released under the MIT License.](https://github.com/yanfeiwong/adafactor-8bit/blob/main/LICENSE)
+
 ## ⭐ Star the Project
 
 If this optimizer has been useful in your work, consider giving the repository a star. It helps others discover the project and supports future development.
 
 [![Star History Chart](https://api.star-history.com/svg?repos=yanfeiwong/adafactor-8bit&type=Date&theme=dark)](https://star-history.com/#yanfeiwong/adafactor-8bit&Date)
-
-## 📄 License
-
-[The project is released under the MIT License.](https://github.com/yanfeiwong/adafactor-8bit/blob/main/LICENSE)

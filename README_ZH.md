@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="assets/banner.png" alt="# Adafactor8Bit" width="80%">
+</p>
 <div align="center">
 
 # 8-bit Adafactor with Fused CUDA Kernels
@@ -14,7 +17,7 @@
 
 这是一个增强版的 8-bit Adafactor 优化器，结合了融合 CUDA Kernel、对数空间分块量化、可选的 APOLLO 低秩更新以及可选的 4-bit 打包一阶动量，在大幅降低优化器状态显存占用的同时，保持了低开销与数值稳定性，适用于 LLM 和扩散模型等大规模训练场景。
 
-## 🔥 核心特性
+## ⚡ 核心特性
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
@@ -264,12 +267,12 @@ optimizer = Adafactor8Bit(
 
 感谢来自 **Qwen**、**ChatGLM** 与 **DeepSeek** 的大语言模型在 CUDA 底层优化以及内存安全防御机制上提供的深度技术探讨与代码审查。
 
+## 🏛️ License
+
+[MIT License](./LICENSE)
+
 ## ⭐ 支持项目
 
 如果这个优化器对你的工作有所帮助，请考虑给本仓库点一个 Star。这将帮助更多人发现这个项目，并支持未来的持续开发。
 
 [![Star History Chart](https://api.star-history.com/svg?repos=yanfeiwong/adafactor-8bit&type=Date&theme=dark)](https://star-history.com/#yanfeiwong/adafactor-8bit&Date)
-
-## 📄 License
-
-[MIT License](./LICENSE)
