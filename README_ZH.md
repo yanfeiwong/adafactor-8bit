@@ -12,24 +12,25 @@
 
 </div>
 
-一个专为显存高效的大规模模型训练而设计的 8-bit Adafactor 优化器。结合了融合 CUDA 算子与对数空间分块量化技术，旨在进一步降低优化器状态显存占用的同时，保持极低的单步更新开销与训练稳定性，适合训练 LLMs 和 Diffusion 模型。
+这是一个增强版的 8-bit Adafactor 优化器，结合了融合 CUDA Kernel、对数空间分块量化、可选的 APOLLO 低秩更新以及可选的 4-bit 打包一阶动量，在大幅降低优化器状态显存占用的同时，保持了低开销与数值稳定性，适用于 LLM 和扩散模型等大规模训练场景。
 
-## 核心特性
+## 🔥 核心特性
 
-- **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升了训练稳定性。
+- **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
+- **可选的 4-bit 打包的一阶动量**：启用后以 4-bit 物理打包格式存储一阶动量（`beta1`），以极小的额外显存开销提供动量支持。
 - **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，防止二阶矩统计信息过时，可能带来更好的收敛与泛化效果。
-- **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升了训练稳定性，通常允许安全地移除外部梯度裁剪。
+- **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升训练稳定性，通常允许安全地移除外部梯度裁剪。
 - **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
 - **跨平台 JIT 编译**：使用即时编译（JIT），在 Windows 和 Linux 环境下均可便捷配置。
 
-## 性能表现
+## 📊 性能表现
 
-- **显存占用**：得益于 Adafactor 的分解二阶矩估计与 8-bit 量化，优化器状态的显存占用通常低于 `AdamW8Bit`，有助于缓解显存受限环境下的压力。
+- **显存占用**：得益于 Adafactor 的分解二阶矩估计、8-bit 量化以及可选的 4-bit 打包一阶动量，优化器状态的显存占用通常远低于 `AdamW8Bit`，有助于大幅缓解显存受限环境下的压力。
 - **训练速度**：融合算子设计与减少的同步开销，使其能够实现与主流 8-bit 优化器相当的单步（step）耗时。
 - **量化精度**：Adafactor 的二阶矩（方差）严格非负且跨越多个数量级。通过将其映射到 log2 空间的 `UINT8` 而非线性空间，优化器为极小方差保留了相对精度，缓解了标准 8-bit 量化中异常梯度引起的不稳定性。
 
-## 安装
+## 📦 安装
 
 这个项目采用 JIT (Just-In-Time) 编译，无预编译二进制文件。
 
@@ -49,9 +50,10 @@ pip install -U adafactor8bit
 pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 ```
 
-**注意**：首次实例化优化器（或运行示例代码）时，会自动触发 CUDA 源码的 JIT 编译。这可能需要几十秒到几分钟的时间（取决于您的硬件与编译器），期间终端可能无明显输出，请耐心等待。编译完成后结果会被自动缓存，后续无需等待。
+> [!IMPORTANT]
+> **首次编译**：首次实例化优化器（或运行示例代码）时，会自动触发 CUDA 源码的 JIT 编译。这可能需要几十秒到几分钟的时间（取决于您的硬件与编译器），期间终端可能无明显输出，请耐心等待。编译完成后结果会被自动缓存，后续无需等待。
 
-## 快速开始
+## 🚀 快速开始
 
 就像使用标准优化器那样简单。
 
@@ -61,7 +63,8 @@ from adafactor8bit import Adafactor8Bit
 optimizer = Adafactor8Bit(model.parameters(), lr=1e-3)
 ```
 
-**💡 提示**：直接传入 `model.parameters()` 可快速跑通。生产环境建议使用 `param_groups` 保护敏感层（Norms, Biases）。对于**稀疏 Token Embedding**（大词表 + 小 batch），请参阅[进阶示例](#进阶示例)以规避冷启动方差爆炸。
+> [!TIP]
+> 直接传入 `model.parameters()` 可快速跑通。生产环境建议使用 `param_groups` 保护敏感层（Norms、Biases）。对于**稀疏 Token Embedding**（大词表 + 小 batch），请参阅[进阶示例](#-进阶示例)以规避冷启动方差爆炸。
 
 ```python
 from adafactor8bit import Adafactor8Bit
@@ -93,15 +96,19 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-## 进阶示例
+## 🛠️ 进阶示例
 
-这里我们展示针对复杂混合架构模型（例如 Vision-Language Models, Diffusion UNets 等），如何通过**混合分组**策略来尽可能实现无一阶动量的稳定高效训练。
+这里我们展示针对复杂混合架构模型（例如 Vision-Language Models, Diffusion UNets 等），如何通过**混合分组**策略来尽可能实现稳定高效的训练。
 
-📌 **我们主要采取以下策略：**
-1. **1D / 敏感小参数 (Norms, Biases)**: 不量化，不做权重衰减。
-2. **Embedding 层**: 组合使用(`factored=False`, `scale_parameter=False`, `d=1e9`) ，让对这些层的优化行为等效于**没有一阶动量的 Adam**，再配合 Adam 级别的学习率，这让我们可以获得 Token 级的精细的更新，且避免冷词连坐。
-3. **2D 权重 (线性层)**: 8-bit量化，权重衰减，使用 **APOLLO** 路径。不断切换的随机子空间投影可以帮助我们捕获更全面的梯度信息，并起到一定的正则化作用。
-4. **>2D Weights (Conv2d 等)**: 8-bit量化，权重衰减，**Full-Rank** (`factored=False`)。牺牲一定显存来保留完整空间结构，换取更精细的优化效果。
+| 层类型 | 策略 |
+|--------|------|
+| **1D / 敏感小参数** (Norms, Biases) | 不量化，不做权重衰减。 |
+| **Embedding 层** | `factored=False`，`scale_parameter=False`，`d=1e9` → 等效于**没有一阶动量的 Adam**。配合 Adam 级别的学习率，实现 Token 级精细更新，避免冷词连坐。 |
+| **2D 权重** (线性层) | 8-bit量化，权重衰减，**APOLLO** 路径。不断切换的随机子空间投影捕获更全面的梯度信息，并起到正则化作用。 |
+| **>2D 权重** (Conv2d 等) | 8-bit量化，权重衰减，**Full-Rank**（`factored=False`）。牺牲一定显存保留完整空间结构，换取更精细的优化效果。 |
+| **一阶动量**（`beta1`） | 仅对密集权重矩阵启用。在这些层上，优化收益通常远大于 4-bit 打包一阶动量带来的显存开销。敏感参数（Norms/Biases）和稀疏 Embedding 层保持无一阶动量。 |
+
+**代码实现:**
 
 ```python
 from adafactor8bit import Adafactor8Bit
@@ -148,7 +155,13 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
         },
         
         # 3. 2D 权重：8-bit 量化，权重衰减，APOLLO 低秩投影路径
-        {"params": group_2d, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        {
+            "params": group_2d, 
+            "weight_decay": weight_decay, 
+            "quantize": True, 
+            "apollo_rank": apollo_rank,
+            "beta1": 0.9,              # 如果首要目标是极限压榨显存，可移除此行。
+        },
         
         # 4. >2D 权重：8-bit 量化，权重衰减，Full-Rank
         {
@@ -156,6 +169,7 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "weight_decay": weight_decay, 
             "quantize": True, 
             "apollo_rank": 0,
+            "beta1": 0.9,              # 如果首要目标是极限压榨显存，可移除此行。
             "factored": False          # 禁用行列分解以保留空间结构，实现更精细的梯度缩放。
                                        # 注：这会增加ND权重占用的状态显存，具体取决于你的模型结构。
                                        # 如果显存受限，切回 factored=True 也是安全的。
@@ -176,13 +190,13 @@ optimizer = Adafactor8Bit(
 
 ```
 
-更多完整示例请查阅 [examples 文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
+> [!NOTE]
+> 更多完整示例，请查阅[示例文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
 
 
+## ⚙️ 高级配置
 
-## 高级配置
-
-### 长期连续训练 (`beta2` 与 `relative_step`)
+### 持续学习 (`beta2` 与 `relative_step`)
 默认情况下，Adafactor 的二阶矩衰减率会随着训练步数动态衰减，内部学习率调度 (`relative_step`) 也会相应地缩放学习率。
 
 对于无休止的微调或持续学习场景，这通常会导致 `后期学习率过小` 和 `二阶矩估计“钝化”` 。为了避免这些问题并保持优化器对新梯度分布的自适应能力：
@@ -208,18 +222,22 @@ optimizer = Adafactor8Bit(
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
 - 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
 
-## APOLLO 低秩子空间投影
+## 🌌 APOLLO 低秩子空间投影
 启用 APOLLO 路径，在极低显存占用的低秩子空间内计算梯度缩放因子。与 Adafactor 标准的行列分解（假设空间独立）相比，APOLLO 利用随机子空间投影捕获跨维度的协方差信息，在保持极低显存开销的同时，往往能带来更好的泛化效果。
 
-- **`apollo_rank`**：投影子空间的目标秩。默认为 `0`（禁用）。对于大多数 1B 到 7B 的模型，可以尝试设置为 `256`（同标准 APOLLO）。  
-  *注意：设置为 `1`（APOLLO-Mini 风格）时，可以将显存节省推向极限（甚至比 Adafactor 路径更省）。但是，原版 APOLLO-Mini 依赖 Adam 的一阶动量（beta1）来平滑噪声。由于我们的实现采用纯二阶矩架构，rank=1 可能会导致缩放因子严重失真及训练不稳定。*
+- **`apollo_rank`**: 投影子空间的目标秩。默认为 `0`（禁用）。
+
+  - APOLLO 官方 GitHub 仓库建议 1B 和 7B 模型使用秩 `256`。
+  - [LLaMA-Factory](https://docs.llamafactory.com.cn/docs/documents/guide/Train/parameter#apollo) 里默认值为 `16`。
+  - 设置为 `1`（APOLLO-Mini 风格）时，可将显存节省推向极限（甚至比 Adafactor 路径更省）。原版 APOLLO-Mini 依赖一阶动量 (beta1) 来平滑投影噪声。为复现此行为，需同时设置 `beta1=0.9`。若不开启 `beta1`，`rank=1` 依然可用，但在小 batch size 下，缩放因子可能会表现出更多噪声。
+
 - **`apollo_scale_type`**：缩放因子的应用方式。`'channel'` 按通道应用（标准 APOLLO），而 `'tensor'` 全局应用（APOLLO-Mini）。
 - **`apollo_update_proj_gap`**：投影矩阵刷新的步数间隔。默认为 `200`。设置过小可能导致子空间频繁震荡，阻碍 EMA 积累稳定的方差估计；设置过大可能导致投影基底长时间不更新，无法捕获梯度流形在训练过程中的漂移，导致低秩空间逐渐“过时”（Stale），失去 APOLLO 捕获动态协方差的优势。
 - **`apollo_factorize` (实验性功能)**：在低秩子空间内应用 Adafactor 的行列分解。利用随机投影的保范性来近似主维度的方差，而副维度的方差则在随机基底上估计，从而引入固有噪声。双重压缩了优化器状态的开销。但是，对于较小的模型，实际节省的显存可能并不明显，但引入的噪声可能会影响收敛稳定性。请谨慎使用。
 - **Fira 限制器集成**：APOLLO 路径会自动将 Fira 范数增长限制器应用于缩放后的梯度，以防止梯度突然增大导致 Loss 尖峰。您可以通过全局的 `fira_margin` 参数来调整其灵敏度。
 
 
-## 新手学习率指南
+## 📈 学习率建议（从 AdamW 迁移）
 
 如果你是从 AdamW 等优化器迁移过来的，可能会发现 Adafactor 的学习率表现有些不同。这主要与 `scale_parameter` 选项有关。
 
@@ -232,7 +250,7 @@ optimizer = Adafactor8Bit(
 *以上仅为安全的初始配置参考；请务必在你自己的任务和 batch size 下进行验证。*
 
 
-## 致谢
+## 🎓 致谢
 
 感谢 **Noam Shazeer** 与 **Mitchell Stern** 在论文 [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235) 中提出了原版的 Adafactor 算法。
 
@@ -244,12 +262,14 @@ optimizer = Adafactor8Bit(
 
 感谢 **PyTorch 团队**提供的基础 Optimizer 实现与 C++ Extension 工具链。
 
-感谢来自 **Qwen** 与 **DeepSeek** 的大语言模型在 CUDA 底层优化、内存安全防御机制以及跨平台编译链路设计上提供的深度技术探讨与代码审查。
+感谢来自 **Qwen**、**ChatGLM** 与 **DeepSeek** 的大语言模型在 CUDA 底层优化以及内存安全防御机制上提供的深度技术探讨与代码审查。
 
-## Star History
+## ⭐ 支持项目
+
+如果这个优化器对你的工作有所帮助，请考虑给本仓库点一个 Star。这将帮助更多人发现这个项目，并支持未来的持续开发。
 
 [![Star History Chart](https://api.star-history.com/svg?repos=yanfeiwong/adafactor-8bit&type=Date&theme=dark)](https://star-history.com/#yanfeiwong/adafactor-8bit&Date)
 
-## License
+## 📄 License
 
 [MIT License](./LICENSE)

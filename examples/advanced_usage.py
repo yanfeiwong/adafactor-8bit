@@ -92,7 +92,13 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
         },
         
         # 3. 2D Weights: 8-bit quantization, Weight Decay, APOLLO low-rank projection
-        {"params": group_2d, "weight_decay": weight_decay, "quantize": True, "apollo_rank": apollo_rank},
+        {
+            "params": group_2d, 
+            "weight_decay": weight_decay, 
+            "quantize": True, 
+            "apollo_rank": apollo_rank,
+            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
+        },
         
         # 4. >2D Weights: 8-bit quantization, Weight Decay, Full-Rank
         {
@@ -100,6 +106,7 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "weight_decay": weight_decay, 
             "quantize": True, 
             "apollo_rank": 0,
+            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
             "factored": False          # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
                                        # Note: This increases state memory for >2D weights, depending on your model architecture.
                                        # If VRAM is constrained, reverting to factored=True is a safe alternative.

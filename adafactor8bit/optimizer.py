@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 _FP32_TINY = 1.17549435e-38 
 _FP32_MIN_LOG = -126.0
+_INV_255 = 1.0 / 255.0
+_INV_7 = 1.0 / 7.0
 
 # ==========================================
 # 1. CUDA Kernel JIT Loading
@@ -97,7 +99,7 @@ def next_seed(seed: int, adv: int = _ADV_DEFAULT) -> int:
 # 3. Log-Quantization Utilities
 # ==========================================
 def _log_quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor, Tensor, torch.Size, int]:
-    """将非负 FP32 张量映射到对数空间后分块量化为 UINT8 (0-255)"""
+    """Quantize a non-negative FP32 tensor to UINT8 (0-255) in log-space with block-wise scaling."""
     shape = tensor.shape
     flat = tensor.flatten()
     pad = (block_size - flat.numel() % block_size) % block_size
@@ -108,25 +110,51 @@ def _log_quantize_nonneg(tensor: Tensor, block_size: int = 2048) -> Tuple[Tensor
     log_blocks = torch.log2(blocks.clamp(min=_FP32_TINY))
     max_log = log_blocks.amax(dim=1, keepdim=True)
     
-    scale = ((max_log - _FP32_MIN_LOG) / 255.0).clamp(min=1e-12)
+    scale = (max_log - _FP32_MIN_LOG).clamp(min=1e-12)
     q = torch.round((log_blocks - _FP32_MIN_LOG) / scale * 255.0).clamp(0, 255).to(torch.uint8)
     return q, scale.squeeze(-1), shape, pad
 
 def _log_dequantize_nonneg(q: Tensor, scale: Tensor, shape: torch.Size, pad: int) -> Tensor:
-    """从对数空间反量化回线性空间"""
-    log_blocks = q.float() * scale.unsqueeze(-1) / 255.0 + _FP32_MIN_LOG
+    """Dequantize from log-space back to linear-space FP32."""
+    log_blocks = q.float() * scale.unsqueeze(-1) * _INV_255 + _FP32_MIN_LOG
     blocks = torch.pow(2.0, log_blocks)
     flat = blocks.flatten()
     if pad:
         flat = flat[:-pad]
     return flat.view(shape)
 
-def _pad_to_block_size(tensor: Tensor, block_size: int) -> Tensor:
-    flat = tensor.contiguous().flatten()
-    pad_len = (block_size - flat.numel() % block_size) % block_size
-    if pad_len > 0:
-        return torch.nn.functional.pad(flat, (0, pad_len))
-    return flat
+def _quantize_4bit_pytorch(m: Tensor, block_size: int) -> Tuple[Tensor, Tensor]:
+    """4-bit symmetric min-max quantization with physical packing into uint8."""
+    flat = m.flatten()
+    pad = (block_size - flat.numel() % block_size) % block_size
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+        
+    blocks = flat.view(-1, block_size)
+    abs_max = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    scale = abs_max * _INV_7  # _INV_7 = 1.0 / 7.0
+    
+    q = (torch.round(blocks / scale).clamp(-8, 7) + 8).to(torch.uint8)
+    
+    q_even = q[:, 0::2]
+    q_odd = q[:, 1::2]
+    packed = (q_even << 4) | q_odd
+    
+    return packed.view(-1), scale.squeeze(-1)
+
+def _dequantize_4bit(m_q: Tensor, m_scale: Tensor, numel: int, shape: torch.Size, block_size: int, device: torch.device) -> Tensor:
+    """Dequantize 4-bit physically packed tensor to FP32."""
+    if _CUDA_MODULE is not None and _CUDA_AVAILABLE:
+        output = torch.empty(numel, device=device, dtype=torch.float32)
+        _CUDA_MODULE.dequantize_4bit(output, m_q, m_scale, numel, block_size)
+        return output.view(shape)
+    else:
+        high = ((m_q >> 4) & 0x0F).to(torch.float32) - 8.0
+        low = (m_q & 0x0F).to(torch.float32) - 8.0
+        m_flat = torch.stack((high, low), dim=-1).view(-1)
+        m_blocks = m_flat.view(-1, block_size)
+        result = (m_blocks * m_scale.unsqueeze(-1)).view(-1)[:numel]
+        return result.view(shape)
 
 # ==========================================
 # 4. Optimizer Core
@@ -138,6 +166,8 @@ class Adafactor8Bit(Optimizer):
     Args:
         params (Iterable): Iterable of parameters to optimize or dictionaries defining parameter groups.
         lr (float, optional): External learning rate. Defaults to 1e-2.
+        beta1 (float, optional): Momentum coefficient for first moment (4-bit packed). 
+            If None, disables first moment (pure Adafactor/RMSProp). Defaults to None.
         beta2 (float, optional): Fixed second-moment decay rate (e.g., 0.999 like Adam). 
             Locks the EMA window size, preventing "blunting" in long-term continual learning. 
             Mutually exclusive with `beta2_decay`. Defaults to None.
@@ -163,13 +193,13 @@ class Adafactor8Bit(Optimizer):
             Setting to False decouples the step size from parameter magnitude, which can be useful 
             for sparse layers like Embeddings to ensure sufficient update strength. Defaults to True.
         quantize (bool): Enable 8-bit log-space quantization for optimizer states. Defaults to True.
-        block_size (int): Block size for quantization. Must be a multiple of 1024. Defaults to 2048.
+        block_size (int): Block size for variance quantization. Must be a multiple of 1024. Defaults to 2048.
+        m_block_size (int): Block size for 4-bit momentum quantization. 
+            Balance outlier robustness and memory overhead. Must be a multiple of 4 and >= 32. Defaults to 128.
         min_8bit_size (int): Minimum number of elements to apply 8-bit quantization. Defaults to 4096.
         use_cuda_kernel (bool): Whether to use custom CUDA kernels. Defaults to True.
         apollo_rank (int): If > 0, enables APOLLO-style random projection to low-rank space
-            before applying Adafactor (no momentum). Defaults to 0 (disabled).
-        apollo_beta1 (float): Momentum coefficient for first moment in low-rank space.
-            Currently unused in momentum-free variant. Reserved for future extension.
+            before applying Adafactor. Defaults to 0 (disabled).
         apollo_update_proj_gap (int): Steps between projection matrix updates. Defaults to 200.
         apollo_scale_type (str): How to compute the gradient scaling factor: 'channel' or 'tensor'.
             Defaults to 'channel'.
@@ -192,6 +222,7 @@ class Adafactor8Bit(Optimizer):
         self,
         params: Iterable[Union[Tensor, Dict[str, Any]]],
         lr: float = 1e-2,
+        beta1: Optional[float] = None,
         beta2: Optional[float] = None,
         beta2_decay: float = -0.8,
         eps: Tuple[Optional[float], float] = (None, 1e-3),
@@ -203,10 +234,10 @@ class Adafactor8Bit(Optimizer):
         scale_weight_decay: bool = True,
         quantize: bool = True,
         block_size: int = 2048,
+        m_block_size: int = 128,
         min_8bit_size: int = 4096,
         use_cuda_kernel: bool = True,
         apollo_rank: int = 0,
-        apollo_beta1: float = 0.9,
         apollo_update_proj_gap: int = 200,
         apollo_scale_type: str = 'channel',
         apollo_eps: float = 1e-8,
@@ -216,6 +247,8 @@ class Adafactor8Bit(Optimizer):
         factored: bool = True,
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")
+        if beta1 is not None and not (0.0 <= beta1 < 1.0):
+            raise ValueError(f"Invalid beta1: {beta1}, must be in [0.0, 1.0)")
         if not 0.0 >= beta2_decay: raise ValueError(f"Invalid beta2_decay: {beta2_decay}")
         eps1, eps2 = eps
         if eps1 is not None and not 0.0 <= eps1: raise ValueError(f"Invalid eps1: {eps1}")
@@ -228,6 +261,9 @@ class Adafactor8Bit(Optimizer):
         
         if quantize and block_size % 1024 != 0:
             raise ValueError(f"block_size must be a multiple of 1024, but got {block_size}.")
+            
+        if m_block_size < 32 or m_block_size % 4 != 0:
+            raise ValueError(f"m_block_size must be a multiple of 4 and >= 32, but got {m_block_size}.")
 
         if apollo_rank > 0 and apollo_scale_type not in ('channel', 'tensor'):
             raise ValueError(f"apollo_scale_type must be 'channel' or 'tensor', got {apollo_scale_type}.")
@@ -235,12 +271,12 @@ class Adafactor8Bit(Optimizer):
         if not 0.0 <= fira_margin: raise ValueError(f"Invalid fira_margin: {fira_margin}")
 
         defaults = dict(
-            lr=lr, beta2_decay=beta2_decay, beta2=beta2, eps=eps, d=d, weight_decay=weight_decay,
+            lr=lr, beta1=beta1, beta2_decay=beta2_decay, beta2=beta2, eps=eps, d=d, weight_decay=weight_decay,
             maximize=maximize, relative_step=relative_step, scale_parameter=scale_parameter,
             scale_weight_decay=scale_weight_decay,
-            quantize=quantize, block_size=block_size, min_8bit_size=min_8bit_size,
+            quantize=quantize, block_size=block_size, m_block_size=m_block_size, min_8bit_size=min_8bit_size,
             use_cuda_kernel=use_cuda_kernel,
-            apollo_rank=apollo_rank, apollo_beta1=apollo_beta1,
+            apollo_rank=apollo_rank,
             apollo_update_proj_gap=apollo_update_proj_gap,
             apollo_scale_type=apollo_scale_type, apollo_eps=apollo_eps,
             apollo_factorize=apollo_factorize,
@@ -252,12 +288,50 @@ class Adafactor8Bit(Optimizer):
 
         self._apollo_seed_counter = 0
 
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self._compact_state()
+
+    def _compact_state(self):
+        """
+        Compact the optimizer state tensors in GPU memory.
+        Moves all CUDA tensors to CPU, clears the GPU cache to eliminate external fragmentation,
+        and then reallocates them contiguously on the GPU. This prevents OOM errors caused by
+        fragmented memory layouts after loading a checkpoint.
+        """
+        saved = []
+        for p, state in self.state.items():
+            for k in list(state.keys()):
+                v = state[k]
+                if isinstance(v, torch.Tensor) and v.is_cuda:
+                    saved.append((p, k, v.cpu()))
+                    state[k] = None
+        
+        if not saved:
+            return
+        
+        torch.cuda.empty_cache()
+        
+        for p, k, cpu_tensor in saved:
+            if k.endswith("_q"):
+                target_dtype = torch.uint8
+            elif k.endswith("_scale"):
+                target_dtype = torch.float32
+            else:
+                target_dtype = cpu_tensor.dtype
+            self.state[p][k] = cpu_tensor.to(
+                device=p.device, dtype=target_dtype
+            ).contiguous()
+
     def _init_group(self, group, params_with_grad, grads, states, state_steps):
+
         group_quantize = group.get("quantize", True)
         block_size = group.get("block_size", 2048)
+        m_block_size = group.get("m_block_size", 128)
         min_8bit_size = group.get("min_8bit_size", 4096)
         apollo_rank = group.get("apollo_rank", 0)
         factored = group.get("factored", True)
+        beta1 = group.get("beta1")
 
         for p in group["params"]:
             if p.grad is None: continue
@@ -331,23 +405,48 @@ class Adafactor8Bit(Optimizer):
                         c_shape = list(batch_shape) + [1, C]
                         
                         if use_quant:
-                            r_tmp = torch.full(r_shape, _FP32_TINY, device=p.device)
-                            q, s, sh, pad = _log_quantize_nonneg(r_tmp, block_size)
-                            state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
+                            r_numel = math.prod(r_shape)
+                            r_pad = (block_size - r_numel % block_size) % block_size
+                            state["row_var_q"] = torch.zeros(r_numel + r_pad, dtype=torch.uint8, device=p.device)
+                            state["row_var_scale"] = torch.ones((r_numel + r_pad) // block_size, dtype=torch.float32, device=p.device)
+                            state["row_var_shape"] = r_shape
+                            state["row_var_pad"] = r_pad
                             
-                            c_tmp = torch.full(c_shape, _FP32_TINY, device=p.device)
-                            q, s, sh, pad = _log_quantize_nonneg(c_tmp, block_size)
-                            state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
+                            c_numel = math.prod(c_shape)
+                            c_pad = (block_size - c_numel % block_size) % block_size
+                            state["col_var_q"] = torch.zeros(c_numel + c_pad, dtype=torch.uint8, device=p.device)
+                            state["col_var_scale"] = torch.ones((c_numel + c_pad) // block_size, dtype=torch.float32, device=p.device)
+                            state["col_var_shape"] = c_shape
+                            state["col_var_pad"] = c_pad
+                            
+                            if beta1 is not None:
+                                m_padded_numel = ((p.numel() + m_block_size - 1) // m_block_size) * m_block_size
+                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                                state["m_scale"] = torch.ones(m_padded_numel // m_block_size, dtype=torch.float32, device=p.device)
+                                state["m_block_size"] = m_block_size
                         else:
                             state["row_var"] = torch.zeros(r_shape, device=p.device)
                             state["col_var"] = torch.zeros(c_shape, device=p.device)
+                            if beta1 is not None:
+                                state["m"] = torch.zeros_like(p.grad, device=p.device, memory_format=torch.preserve_format)
                     else:
                         if use_quant:
-                            v_tmp = torch.full_like(p.grad, _FP32_TINY, memory_format=torch.preserve_format)
-                            q, s, sh, pad = _log_quantize_nonneg(v_tmp, block_size)
-                            state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
+                            v_numel = p.grad.numel()
+                            v_pad = (block_size - v_numel % block_size) % block_size
+                            state["variance_q"] = torch.zeros(v_numel + v_pad, dtype=torch.uint8, device=p.device)
+                            state["variance_scale"] = torch.ones((v_numel + v_pad) // block_size, dtype=torch.float32, device=p.device)
+                            state["variance_shape"] = p.grad.shape
+                            state["variance_pad"] = v_pad
+                            
+                            if beta1 is not None:
+                                m_padded_numel = ((p.numel() + m_block_size - 1) // m_block_size) * m_block_size
+                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                                state["m_scale"] = torch.ones(m_padded_numel // m_block_size, dtype=torch.float32, device=p.device)
+                                state["m_block_size"] = m_block_size
                         else:
                             state["variance"] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
+                            if beta1 is not None:
+                                state["m"] = torch.zeros_like(p.grad, device=p.device, memory_format=torch.preserve_format)
             else:
                 if torch.is_tensor(state["step"]):
                     state["step"] = int(state["step"].cpu().item())
@@ -360,9 +459,8 @@ class Adafactor8Bit(Optimizer):
                             state[k] = state[k].to(p.device)
                         if k.endswith("_q") and state[k].dtype != torch.uint8:
                             state[k] = state[k].to(torch.uint8)
-                            scale_key = k.replace("_q", "_scale")
-                            if scale_key in state and state[scale_key].dtype != torch.float32:
-                                state[scale_key] = state[scale_key].to(torch.float32)
+                        if k.endswith("_scale") and state[k].dtype != torch.float32:
+                            state[k] = state[k].to(torch.float32)
 
                 curr_block_size = state.get("block_size", block_size)
                 state_is_factored = ("row_var" in state or "row_var_q" in state)
@@ -385,6 +483,18 @@ class Adafactor8Bit(Optimizer):
                             q, s, sh, pad = _log_quantize_nonneg(state["variance"], curr_block_size)
                             state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                             del state["variance"]
+                            
+                    if beta1 is not None and "m_q" not in state:
+                        m_curr_block_size = state.get("m_block_size", m_block_size)
+                        m_padded_numel = ((p.numel() + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                        if "m" in state:
+                            state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(state["m"], m_curr_block_size)
+                            state.pop("m")
+                        else:
+                            state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                            state["m_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=p.device)
+                        state["m_block_size"] = m_curr_block_size
+                        
                     state["is_quantized"] = True
                 
                 elif not use_quant and state.get("is_quantized", False):
@@ -396,7 +506,32 @@ class Adafactor8Bit(Optimizer):
                     else:
                         if "variance_q" in state:
                             state["variance"] = _log_dequantize_nonneg(state.pop("variance_q"), state.pop("variance_scale"), state.pop("variance_shape"), state.pop("variance_pad"))
+                    
+                    # Dequantize 4-bit M_t back to FP32, preserving historical momentum
+                    if "m_q" in state:
+                        m_curr_block_size = state.get("m_block_size", m_block_size)
+                        state["m"] = _dequantize_4bit(
+                            state["m_q"], state["m_scale"], 
+                            p.numel(), p.shape, m_curr_block_size, p.device
+                        )
+
+                        state.pop("m_q", None)
+                        state.pop("m_scale", None)
+                        state.pop("m_block_size", None)
+                        
                     state["is_quantized"] = False
+
+
+                if beta1 is not None and "m_q" not in state and use_quant:
+                    m_curr_block_size = state.get("m_block_size", m_block_size)
+                    m_padded_numel = ((p.numel() + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                    if "m" in state:
+                        state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(state["m"], m_curr_block_size)
+                        state.pop("m")
+                    else:
+                        state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                        state["m_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=p.device)
+                    state["m_block_size"] = m_curr_block_size
 
                 if "is_quantized" not in state:
                     if use_apollo:
@@ -405,6 +540,11 @@ class Adafactor8Bit(Optimizer):
                         state["is_quantized"] = ("row_var_q" in state or "col_var_q" in state or "variance_q" in state)
                 if "block_size" not in state:
                     state["block_size"] = block_size
+                if beta1 is None:
+                    state.pop("m_q", None)
+                    state.pop("m_scale", None)
+                    state.pop("m_block_size", None)
+                    state.pop("m", None)
 
             states.append(state)
             state_steps.append(state["step"])
@@ -424,15 +564,18 @@ class Adafactor8Bit(Optimizer):
 
             for i in range(len(params_with_grad)):
                 if apollo_rank > 0 and 'apollo_seed' in states[i]:
-                    _update_param_apollo_nomomentum(
+                    _update_param_apollo(
                         params_with_grad[i], grads[i], states[i],
-                        d=group["d"], lr=group["lr"], beta2=group["beta2"],
+                        d=group["d"], lr=group["lr"], 
+                        beta1=group.get("beta1"),
+                        beta2=group["beta2"],
                         beta2_decay=group["beta2_decay"],
                         weight_decay=group["weight_decay"], eps1=eps1, eps2=eps2,
                         maximize=group["maximize"], relative_step=group["relative_step"],
                         scale_parameter=group["scale_parameter"],
                         scale_weight_decay=group.get("scale_weight_decay", True),
                         block_size=group.get("block_size", 2048),
+                        m_block_size=group.get("m_block_size", 128),
                         use_cuda_kernel=group.get("use_cuda_kernel", True),
                         apollo_scale_type=group.get("apollo_scale_type", "channel"),
                         apollo_eps=group.get("apollo_eps", 1e-8),
@@ -442,11 +585,15 @@ class Adafactor8Bit(Optimizer):
                 else:
                     _update_param_8bit(
                         params_with_grad[i], grads[i], states[i],
-                        d=group["d"], lr=group["lr"], beta2=group["beta2"], beta2_decay=group["beta2_decay"],
+                        d=group["d"], lr=group["lr"], 
+                        beta1=group.get("beta1"),
+                        beta2=group["beta2"], beta2_decay=group["beta2_decay"],
                         weight_decay=group["weight_decay"], eps1=eps1, eps2=eps2,
                         maximize=group["maximize"], relative_step=group["relative_step"],
                         scale_parameter=group["scale_parameter"], scale_weight_decay=group.get("scale_weight_decay", True),
-                        block_size=group.get("block_size", 2048), use_cuda_kernel=group.get("use_cuda_kernel", True),
+                        block_size=group.get("block_size", 2048), 
+                        m_block_size=group.get("m_block_size", 128),
+                        use_cuda_kernel=group.get("use_cuda_kernel", True),
                         enable_fira_for_adafactor=group.get("enable_fira_for_adafactor", False),
                         fira_margin=group.get("fira_margin", 0.01),
                         factored=group.get("factored", True),
@@ -479,7 +626,7 @@ def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor,
     return alpha_scaled, total_sum_sq
 
 def _apply_fira_pytorch(state: Dict[str, Any], update: Tensor, fira_margin: float, numel: int, d: float) -> Tuple[Tensor, Tensor]:
-    current_norm = update.norm(2)
+    current_norm = torch.linalg.vector_norm(update)
     fira_threshold = 1.0 + fira_margin
     
     prev_norm = state.get("fira_prev_norm", None)
@@ -504,6 +651,7 @@ def _update_param_8bit(
     param: Tensor, grad: Tensor, 
     state: Dict[str, Any],
     d: float, lr: Union[float, Tensor], 
+    beta1: Optional[float],
     beta2: Optional[float],
     beta2_decay: float, 
     weight_decay: float,
@@ -514,6 +662,7 @@ def _update_param_8bit(
     scale_parameter: bool, 
     scale_weight_decay: bool,
     block_size: int,
+    m_block_size: int,
     use_cuda_kernel: bool,
     enable_fira_for_adafactor: bool = False,
     fira_margin: float = 0.01,
@@ -525,11 +674,16 @@ def _update_param_8bit(
     eps_sq = max(eps1 * eps1, torch.finfo(torch.float32).tiny)
     log_eps_sq = math.log2(eps_sq)
 
-    grad_fp32 = grad.float()
-    if not grad_fp32.is_contiguous():
-        grad_fp32 = grad_fp32.contiguous()
+    grad_contig = grad.contiguous()
     if maximize:
-        grad_fp32 = grad_fp32.neg()
+        grad_contig = grad_contig.neg()
+    
+    quantize = state.get("is_quantized", False)
+    curr_block_size = state.get("block_size", block_size)
+    m_curr_block_size = state.get("m_block_size", m_block_size) if beta1 is not None else 0
+    
+    grad_fp32 = grad_contig.float()
+    N = grad_fp32.numel()
 
     if not param.is_contiguous():
         param_work = param.contiguous()
@@ -537,9 +691,6 @@ def _update_param_8bit(
     else:
         param_work = param
         needs_copy_back = False
-
-    quantize = state.get("is_quantized", False)
-    curr_block_size = state.get("block_size", block_size)
 
     step = state["step"] + 1
     state["step"] = step 
@@ -560,10 +711,18 @@ def _update_param_8bit(
             rho_t = lr
 
     if scale_parameter:
-        param_rms = param_work.float().norm(2) / math.sqrt(param_work.numel())
+        param_rms = torch.linalg.vector_norm(param_work, ord=2, dtype=torch.float32) / math.sqrt(param_work.numel())
         alpha = torch.clamp(param_rms, min=eps2) * rho_t
     else:
         alpha = rho_t
+
+    if beta1 is not None and not relative_step:
+        bc1 = 1.0 - beta1 ** step
+        if beta2 is not None:
+            bc2 = 1.0 - beta2 ** step
+            alpha = alpha * (math.sqrt(bc2) / bc1)
+        else:
+            alpha = alpha / bc1
 
     if weight_decay != 0:
         wd_multiplier = alpha if scale_weight_decay else rho_t
@@ -574,8 +733,7 @@ def _update_param_8bit(
     if is_full_rank:
         if quantize:
             if _load_cuda_module(use_cuda_kernel):
-                grad_fp32_padded = _pad_to_block_size(grad_fp32, curr_block_size)
-                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32_padded, beta_val, curr_block_size, True)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32.view(-1), beta_val, curr_block_size, True, N)
                 
                 numel = param_work.numel()
                 grad_fp32_flat = grad_fp32.view(-1)
@@ -584,42 +742,150 @@ def _update_param_8bit(
                 
                 total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
                 
-                _CUDA_MODULE.compute_update_norm_1d(
-                    variance_q_flat, variance_scale_flat,
-                    grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size
-                )
-                
-                if enable_fira_for_adafactor:
-                    alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
-                
-                _CUDA_MODULE.apply_update_1d(
-                    param_work.view(-1), grad_fp32_flat,
-                    variance_q_flat, variance_scale_flat,
-                    total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
-                )
+                if beta1 is not None:
+                    _CUDA_MODULE.fused_4bit_quantize_lerp(
+                        state["m_q"], state["m_scale"], grad_fp32.view(-1), beta1, m_curr_block_size, N
+                    )
+                    del grad_fp32
+
+                    m_q_flat = state["m_q"].view(-1)
+                    m_scale_flat = state["m_scale"].view(-1)
+                    
+                    _CUDA_MODULE.compute_update_norm_m_1d(
+                        m_q_flat, m_scale_flat,
+                        variance_q_flat, variance_scale_flat,
+                        total_sum_sq, log_eps_sq, numel, m_curr_block_size, curr_block_size
+                    )
+                    
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                    
+                    _CUDA_MODULE.apply_update_m_1d(
+                        param_work.view(-1),
+                        m_q_flat, m_scale_flat,
+                        variance_q_flat, variance_scale_flat,
+                        total_sum_sq, alpha, d, log_eps_sq, numel, m_curr_block_size, curr_block_size
+                    )
+                else:
+                    _CUDA_MODULE.compute_update_norm_1d(
+                        variance_q_flat, variance_scale_flat,
+                        grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size
+                    )
+                    
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                    
+                    _CUDA_MODULE.apply_update_1d(
+                        param_work.view(-1), grad_fp32_flat,
+                        variance_q_flat, variance_scale_flat,
+                        total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
+                    )
             else:
                 grad_sq = grad_fp32.square() 
                 variance = _log_dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
                 variance.lerp_(grad_sq, beta_val)
+                del grad_sq
+                
                 q, s, sh, pad = _log_quantize_nonneg(variance, curr_block_size)
                 state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"] = q, s, sh, pad
                 
-                update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
-                if enable_fira_for_adafactor:
-                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                if beta1 is not None:
+                    if "m_q" in state:
+                        m_temp = _dequantize_4bit(state["m_q"], state["m_scale"], grad_fp32.numel(), grad_fp32.shape, m_curr_block_size, grad_fp32.device)
+                    else:
+                        m_temp = torch.zeros_like(grad_fp32)
+                    m_temp.lerp_(grad_fp32, 1.0 - beta1)
+                    del grad_fp32 
+                    
+                    update = m_temp * variance.clamp_(min=eps_sq).rsqrt_()
+                    state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                    del m_temp, variance
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
                 else:
-                    denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-                param_work.add_(update, alpha=-alpha / denom)
+                    update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
+                    del variance
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
         else:
-            grad_sq = grad_fp32.square() 
-            variance = state["variance"]
-            variance.lerp_(grad_sq, beta_val)
-            update = variance.clamp(min=eps_sq).rsqrt().mul_(grad_fp32)
-            if enable_fira_for_adafactor:
-                update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+            if _load_cuda_module(use_cuda_kernel):
+                total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
+                
+                var_flat = state["variance"]
+                if not var_flat.is_contiguous():
+                    var_flat = var_flat.contiguous()
+                    state["variance"] = var_flat
+                    
+                if beta1 is not None:
+                    if "m" not in state:
+                        state["m"] = torch.zeros_like(grad_fp32)
+                    m_flat = state["m"]
+                    if not m_flat.is_contiguous():
+                        m_flat = m_flat.contiguous()
+                        state["m"] = m_flat
+                        
+                    _CUDA_MODULE.compute_update_norm_1d_full_m(
+                        var_flat.view(-1), m_flat.view(-1), grad_fp32.view(-1), total_sum_sq,
+                        beta1, beta_val, eps_sq, N
+                    )
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                        
+                    _CUDA_MODULE.apply_update_1d_full_m(
+                        param_work.view(-1), var_flat.view(-1), m_flat.view(-1),
+                        total_sum_sq, alpha, d, eps_sq, N
+                    )
+                else:
+                    _CUDA_MODULE.compute_update_norm_1d_full(
+                        var_flat.view(-1), grad_fp32.view(-1), total_sum_sq,
+                        beta_val, eps_sq, N
+                    )
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                        
+                    _CUDA_MODULE.apply_update_1d_full(
+                        param_work.view(-1), var_flat.view(-1), grad_fp32.view(-1),
+                        total_sum_sq, alpha, d, eps_sq, N
+                    )
             else:
-                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-            param_work.add_(update, alpha=-alpha / denom)
+                variance = state["variance"]
+                variance.mul_(1.0 - beta_val).addcmul_(grad_fp32, grad_fp32, value=beta_val)
+                
+                if beta1 is not None:
+                    if "m" not in state:
+                        state["m"] = torch.zeros_like(grad_fp32)
+                    state["m"].lerp_(grad_fp32, 1.0 - beta1)
+                    del grad_fp32 
+                    
+                    update = torch.empty_like(variance)
+                    torch.clamp(variance, min=eps_sq, out=update)
+                    torch.rsqrt(update, out=update)
+                    update.mul_(state["m"])
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
+                else:
+                    update = torch.empty_like(variance)
+                    torch.clamp(variance, min=eps_sq, out=update)
+                    torch.rsqrt(update, out=update)
+                    update.mul_(grad_fp32)
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
 
     else:
         shape = grad_fp32.shape
@@ -627,19 +893,17 @@ def _update_param_8bit(
         C = shape[-1]
         numel = grad_fp32.numel()
         
-        row_mean = torch.norm(grad_fp32, dim=-1, keepdim=True).square_().div_(C)
-        col_mean = torch.norm(grad_fp32, dim=-2, keepdim=True).square_().div_(R)
+        row_mean = grad_fp32.square().mean(dim=-1, keepdim=True)
+        col_mean = grad_fp32.square().mean(dim=-2, keepdim=True)
 
         if quantize:
             if _load_cuda_module(use_cuda_kernel):
-                row_mean_padded = _pad_to_block_size(row_mean, curr_block_size)
-                col_mean_padded = _pad_to_block_size(col_mean, curr_block_size)
-
-                _CUDA_MODULE.fused_log_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean_padded, beta_val, curr_block_size, False)
-                _CUDA_MODULE.fused_log_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean_padded, beta_val, curr_block_size, False)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["row_var_q"], state["row_var_scale"], row_mean.reshape(-1), beta_val, curr_block_size, False, row_mean.numel())
+                _CUDA_MODULE.fused_log_quantize_lerp(state["col_var_q"], state["col_var_scale"], col_mean.reshape(-1), beta_val, curr_block_size, False, col_mean.numel())
 
                 row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
                 row_mean_val_flat = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1).flatten().contiguous()
+                del row_var 
                 
                 grad_flat = grad_fp32.reshape(-1)
                 row_var_q_flat = state["row_var_q"].reshape(-1)
@@ -647,58 +911,125 @@ def _update_param_8bit(
                 
                 total_sum_sq = torch.zeros(1, device=param_work.device, dtype=torch.float32)
                 
-                _CUDA_MODULE.compute_update_norm_2d(
-                    row_var_q_flat, state["row_var_scale"],
-                    col_var_q_flat, state["col_var_scale"],
-                    grad_flat, total_sum_sq, row_mean_val_flat, log_eps_sq, R, C, numel, curr_block_size
-                )
-                
-                if enable_fira_for_adafactor:
-                    alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
-                
-                param_flat = param_work.reshape(-1)
-                _CUDA_MODULE.apply_update_2d(
-                    param_flat, grad_flat,
-                    row_var_q_flat, state["row_var_scale"],
-                    col_var_q_flat, state["col_var_scale"],
-                    total_sum_sq, alpha, row_mean_val_flat, d, log_eps_sq, R, C, numel, curr_block_size
-                )
+                if beta1 is not None:
+                    _CUDA_MODULE.fused_4bit_quantize_lerp(
+                        state["m_q"], state["m_scale"], grad_fp32.view(-1), beta1, m_curr_block_size, N
+                    )
+                    del grad_fp32
+
+                    m_q_flat = state["m_q"].view(-1)
+                    m_scale_flat = state["m_scale"].view(-1)
+                    
+                    _CUDA_MODULE.compute_update_norm_m_2d(
+                        m_q_flat, m_scale_flat,
+                        row_var_q_flat, state["row_var_scale"],
+                        col_var_q_flat, state["col_var_scale"],
+                        total_sum_sq, row_mean_val_flat, log_eps_sq, R, C, numel, m_curr_block_size, curr_block_size
+                    )
+                    
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                    
+                    param_flat = param_work.reshape(-1)
+                    _CUDA_MODULE.apply_update_m_2d(
+                        param_flat,
+                        m_q_flat, m_scale_flat,
+                        row_var_q_flat, state["row_var_scale"],
+                        col_var_q_flat, state["col_var_scale"],
+                        total_sum_sq, alpha, row_mean_val_flat, d, log_eps_sq, R, C, numel, m_curr_block_size, curr_block_size
+                    )
+                else:
+                    _CUDA_MODULE.compute_update_norm_2d(
+                        row_var_q_flat, state["row_var_scale"],
+                        col_var_q_flat, state["col_var_scale"],
+                        grad_flat, total_sum_sq, row_mean_val_flat, log_eps_sq, R, C, numel, curr_block_size
+                    )
+                    
+                    if enable_fira_for_adafactor:
+                        alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
+                    
+                    param_flat = param_work.reshape(-1)
+                    _CUDA_MODULE.apply_update_2d(
+                        param_flat, grad_flat,
+                        row_var_q_flat, state["row_var_scale"],
+                        col_var_q_flat, state["col_var_scale"],
+                        total_sum_sq, alpha, row_mean_val_flat, d, log_eps_sq, R, C, numel, curr_block_size
+                    )
             else:
                 row_var = _log_dequantize_nonneg(state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"])
                 col_var = _log_dequantize_nonneg(state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"])
                 row_var.lerp_(row_mean, beta_val)
                 col_var.lerp_(col_mean, beta_val)
+                
                 q, s, sh, pad = _log_quantize_nonneg(row_var, curr_block_size)
                 state["row_var_q"], state["row_var_scale"], state["row_var_shape"], state["row_var_pad"] = q, s, sh, pad
                 q, s, sh, pad = _log_quantize_nonneg(col_var, curr_block_size)
                 state["col_var_q"], state["col_var_scale"], state["col_var_shape"], state["col_var_pad"] = q, s, sh, pad
                 
-                var_estimate = row_var * col_var 
-                row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
-                var_estimate.div_(row_mean_val)
+                row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp(min=eps1)
+                inv_row = row_var.clamp(min=eps_sq).rsqrt() * row_mean_val.sqrt()
+                inv_col = col_var.clamp(min=eps_sq).rsqrt()
                 
-                update = var_estimate.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
-                if enable_fira_for_adafactor:
-                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                if beta1 is not None:
+                    if "m_q" in state:
+                        m_temp = _dequantize_4bit(state["m_q"], state["m_scale"], grad_fp32.numel(), grad_fp32.shape, m_curr_block_size, grad_fp32.device)
+                    else:
+                        m_temp = torch.zeros_like(grad_fp32)
+                    m_temp.lerp_(grad_fp32, 1.0 - beta1)
+                    del grad_fp32 
+                    
+                    update = m_temp * inv_row
+                    update.mul_(inv_col)
+                    state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                    del m_temp
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
                 else:
-                    denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-                param_work.add_(update, alpha=-alpha / denom)
+                    update = grad_fp32 * inv_row
+                    update.mul_(inv_col)
+                    
+                    if enable_fira_for_adafactor:
+                        update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                    else:
+                        denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                    param_work.add_(update, alpha=-alpha / denom)
         else:
             row_var = state["row_var"]
             col_var = state["col_var"]
             row_var.lerp_(row_mean, beta_val)
             col_var.lerp_(col_mean, beta_val)
             
-            var_estimate = row_var * col_var
-            row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp_(min=eps1)
-            var_estimate.div_(row_mean_val)
+            row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp(min=eps1)
+            inv_row = row_var.clamp(min=eps_sq).rsqrt() * row_mean_val.sqrt()
+            inv_col = col_var.clamp(min=eps_sq).rsqrt()
             
-            update = var_estimate.clamp_(min=eps_sq).rsqrt().mul_(grad_fp32)
-            if enable_fira_for_adafactor:
-                update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+            if beta1 is not None:
+                if "m" not in state:
+                    state["m"] = torch.zeros_like(grad_fp32)
+                state["m"].lerp_(grad_fp32, 1.0 - beta1)
+                del grad_fp32
+                
+                update = state["m"] * inv_row
+                update.mul_(inv_col)
+                
+                if enable_fira_for_adafactor:
+                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                else:
+                    denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                param_work.add_(update, alpha=-alpha / denom)
             else:
-                denom = torch.clamp(update.norm(2) / (math.sqrt(update.numel()) * d), min=1.0)
-            param_work.add_(update, alpha=-alpha / denom)
+                update = grad_fp32 * inv_row
+                update.mul_(inv_col)
+                
+                if enable_fira_for_adafactor:
+                    update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+                else:
+                    denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+                param_work.add_(update, alpha=-alpha / denom)
 
     if needs_copy_back:
         param.copy_(param_work)
@@ -726,18 +1057,20 @@ def _get_apollo_proj_matrix(state: Dict[str, Any], shape: torch.Size, step: int,
     return proj, needs_refresh 
 
 
-def _update_param_apollo_nomomentum(
+def _update_param_apollo(
     param: Tensor, grad: Tensor, state: Dict[str, Any],
     d: float, lr: Union[float, Tensor],
+    beta1: Optional[float],
     beta2: Optional[float], beta2_decay: float, weight_decay: float,
     eps1: Optional[float], eps2: float, maximize: bool, relative_step: bool,
     scale_parameter: bool, scale_weight_decay: bool,
-    block_size: int, use_cuda_kernel: bool,
+    block_size: int, m_block_size: int, use_cuda_kernel: bool,
     apollo_scale_type: str, apollo_eps: float,
     apollo_factorize: bool,
     fira_margin: float = 0.01,
 ):
     grad_work = grad.neg().float() if maximize else grad.float()
+    update_low = None 
 
     if apollo_factorize:
         state.pop("v_low_q", None)
@@ -745,9 +1078,15 @@ def _update_param_apollo_nomomentum(
         state.pop("v_low_shape", None)
         state.pop("v_low_pad", None)
         state.pop("v_low", None)
+        state.pop("m_low", None)
+        state.pop("m_low_q", None)
+        state.pop("m_low_scale", None)
     else:
         state.pop("row_var_low", None)
         state.pop("col_var_low", None)
+        state.pop("m_low", None)
+        state.pop("m_low_q", None)
+        state.pop("m_low_scale", None)
 
     if not param.is_contiguous():
         param_work = param.contiguous()
@@ -794,6 +1133,9 @@ def _update_param_apollo_nomomentum(
         state["v_low"] = None
         state.pop("row_var_low", None)
         state.pop("col_var_low", None)
+        state.pop("m_low", None)
+        state.pop("m_low_q", None)
+        state.pop("m_low_scale", None)
 
     R, C = shape[-2], shape[-1]
     side = "right" if R >= C else "left"
@@ -804,7 +1146,12 @@ def _update_param_apollo_nomomentum(
     else:
         grad_low = torch.matmul(proj_matrix_T, grad_work).float()
 
+    norm_G = None
+    norm_G_sq = None
+    scaling_factor_computed = False
+
     if apollo_factorize:
+        quantize = state.get("is_quantized", True)
         row_mean_low = grad_low.square().mean(dim=-1, keepdim=True)
         col_mean_low = grad_low.square().mean(dim=-2, keepdim=True)
         
@@ -820,29 +1167,71 @@ def _update_param_apollo_nomomentum(
         
         eps1_val = eps1 if eps1 is not None else apollo_eps
         v_low_est = row_var * col_var / row_var.mean(dim=-2, keepdim=True).clamp(min=eps1_val)
-        update_low = grad_low / torch.sqrt(v_low_est + apollo_eps)
+        
+        if beta1 is not None:
+            if quantize:
+                grad_low_flat = grad_low.flatten()
+                grad_low_numel = grad_low_flat.numel()
+                m_curr_block_size = state.get("m_block_size", m_block_size)
+                
+                if state.get("m_low_q") is None:
+                    m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                    state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                    state["m_block_size"] = m_curr_block_size
+
+                if _load_cuda_module(use_cuda_kernel):
+                    _CUDA_MODULE.fused_4bit_quantize_lerp(
+                        state["m_low_q"], state["m_low_scale"], grad_low_flat, beta1, m_curr_block_size, grad_low_numel
+                    )
+
+
+                    m_low_deq = _dequantize_4bit(
+                        state["m_low_q"], state["m_low_scale"],
+                        grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
+                    )
+                else:
+                    if "m_low_q" in state:
+                        m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                    else:
+                        m_temp = torch.zeros_like(grad_low)
+                    m_temp.lerp_(grad_low, 1.0 - beta1)
+                    state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                    m_low_deq = m_temp
+                    del m_temp
+            else:
+                if "m_low" not in state:
+                    state["m_low"] = torch.zeros_like(grad_low)
+                state["m_low"].lerp_(grad_low, 1.0 - beta1)
+                m_low_deq = state["m_low"]
+            update_low = m_low_deq / (torch.sqrt(v_low_est) + apollo_eps)
+        else:
+            update_low = grad_low / (torch.sqrt(v_low_est) + apollo_eps)
         
     else:
         is_first_step = (state.get("v_low_q") is None and state.get("v_low") is None)
-        
+        quantize = state.get("is_quantized", True)
+
         if is_first_step:
             v_init = grad_low.flatten().square().clamp(min=_FP32_TINY)
-            if state.get("is_quantized", True):
+            if quantize:
                 q, s, sh, pad = _log_quantize_nonneg(v_init, block_size)
                 state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
-                v_low_deq = v_init
+                if beta1 is not None and _load_cuda_module(use_cuda_kernel) and apollo_scale_type == "channel":
+                    v_low_deq = None
+                    del v_init
+                else:
+                    v_low_deq = v_init
             else:
                 state["v_low"] = v_init
                 v_low_deq = v_init
+
         else:
-            quantize = state.get("is_quantized", True)
             if quantize:
                 if _load_cuda_module(use_cuda_kernel):
-                    grad_low_flat = grad_low.flatten()
-                    sq_padded = _pad_to_block_size(grad_low_flat, block_size)
                     _CUDA_MODULE.fused_log_quantize_lerp(
                         state["v_low_q"], state["v_low_scale"], 
-                        sq_padded, beta_val, block_size, True
+                        grad_low.flatten(), beta_val, block_size, True, grad_low.numel()
                     )
                 else:
                     grad_low_sq_flat = grad_low.flatten().square()
@@ -854,16 +1243,100 @@ def _update_param_apollo_nomomentum(
                 grad_low_sq_flat = grad_low.flatten().square()
                 state["v_low"].lerp_(grad_low_sq_flat, beta_val)
 
-            v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+            if beta1 is not None and quantize and _load_cuda_module(use_cuda_kernel) and apollo_scale_type == "channel":
+                v_low_deq = None
+            else:
+                v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
             
-        update_low = grad_low.flatten() / torch.sqrt(v_low_deq + apollo_eps)
-        update_low = update_low.view_as(grad_low)
+        if beta1 is not None:
+            if quantize:
+                grad_low_flat = grad_low.flatten()
+                grad_low_numel = grad_low_flat.numel()
+                m_curr_block_size = state.get("m_block_size", m_block_size)
+                
+                if state.get("m_low_q") is None:
+                    m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                    state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                    state["m_block_size"] = m_curr_block_size
 
-    if apollo_scale_type == "channel":
-        norm_dim = -1 if side == "right" else -2
-        scaling_factor = update_low.norm(dim=norm_dim, keepdim=True) / (grad_low.norm(dim=norm_dim, keepdim=True) + 1e-8)
-    else:
-        scaling_factor = update_low.norm() / (grad_low.norm() + 1e-8)
+                if _load_cuda_module(use_cuda_kernel):
+                    _CUDA_MODULE.fused_4bit_quantize_lerp(
+                        state["m_low_q"], state["m_low_scale"], grad_low.flatten(), beta1, m_curr_block_size, grad_low.numel()
+                    )
+                    
+                    if apollo_scale_type == "channel":
+                        R_low, C_low = grad_low.shape[-2], grad_low.shape[-1]
+                        if side == "right":
+                            N, D = R_low, C_low
+                            stride_N, stride_D = C_low, 1
+                        else:
+                            # N corresponds to output channels (C), D corresponds to rank
+                            # stride maps to column-major traversal of (rank, C) matrix
+                            N, D = C_low, R_low
+                            stride_N, stride_D = 1, C_low  
+                            
+                        norm_update = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                        norm_grad = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                        
+                        _CUDA_MODULE.compute_apollo_norms(
+                            state["m_low_q"].view(-1), state["m_low_scale"],
+                            state["v_low_q"].view(-1), state["v_low_scale"],
+                            grad_low.contiguous(),
+                            norm_update, norm_grad,
+                            N, D, stride_N, stride_D,
+                            m_curr_block_size, block_size, apollo_eps
+                        )
+                        
+                        scaling_factor = norm_update / (norm_grad + 1e-8)
+                            
+                        if side == "right":
+                            scaling_factor = scaling_factor.unsqueeze(1)
+                        else:
+                            scaling_factor = scaling_factor.unsqueeze(0)
+                            
+                        scaling_factor_computed = True
+                    else:
+                        m_low_deq = _dequantize_4bit(
+                            state["m_low_q"], state["m_low_scale"],
+                            grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
+                        )
+                        v_low_reshaped = v_low_deq.view_as(grad_low)
+                        update_low = m_low_deq / (torch.sqrt(v_low_reshaped) + apollo_eps)
+                else:
+                    if "m_low_q" in state:
+                        m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                    else:
+                        m_temp = torch.zeros_like(grad_low)
+                    m_temp.lerp_(grad_low, 1.0 - beta1)
+                    state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                    v_low_reshaped = v_low_deq.view_as(grad_low)
+                    update_low = m_temp / (torch.sqrt(v_low_reshaped) + apollo_eps)
+                    del m_temp
+            else:
+                if "m_low" not in state:
+                    state["m_low"] = torch.zeros_like(grad_low)
+                state["m_low"].lerp_(grad_low, 1.0 - beta1)
+                v_low_reshaped = v_low_deq.view_as(grad_low)
+                update_low = state["m_low"] / (torch.sqrt(v_low_reshaped) + apollo_eps)
+        else:
+            update_low = grad_low.flatten() / (torch.sqrt(v_low_deq) + apollo_eps)
+            update_low = update_low.view_as(grad_low)
+
+    if not scaling_factor_computed:
+        if apollo_scale_type == "channel":
+            norm_dim = -1 if side == "right" else -2
+            scaling_factor = update_low.norm(dim=norm_dim, keepdim=True) / (grad_low.norm(dim=norm_dim, keepdim=True) + 1e-8)
+        else:
+            scaling_factor = update_low.norm() / (grad_low.norm() + 1e-8)
+            
+    if beta1 is not None and not relative_step:
+        bc1 = 1.0 - beta1 ** step
+        if beta2 is not None:
+            bc2 = 1.0 - beta2 ** step
+            scaling_factor = scaling_factor * (math.sqrt(bc2) / bc1)
+        else:
+            scaling_factor = scaling_factor / bc1
 
     if apollo_scale_type == "channel":
         if side == "right":
@@ -873,6 +1346,7 @@ def _update_param_apollo_nomomentum(
             norm_G = torch.linalg.vector_norm(grad_work, ord=2, dim=-2, keepdim=True, dtype=torch.float32)
             norm_G_sq = norm_G.square()
         current_norm_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
+
     else:
         current_norm_t = torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32) * scaling_factor
 
@@ -913,7 +1387,9 @@ def _update_param_apollo_nomomentum(
 
     if apollo_scale_type == "channel":
         del norm_G_sq, norm_G
-    del update_low, grad_low, scaling_factor, final_scale, proj_matrix_T, proj_matrix
+        
+    del grad_low, scaling_factor, final_scale, proj_matrix_T, proj_matrix
+    del update_low
     
     if needs_copy_back:
         param.copy_(param_work.view(original_shape))
