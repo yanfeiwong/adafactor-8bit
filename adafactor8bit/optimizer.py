@@ -466,15 +466,16 @@ class Adafactor8Bit(Optimizer):
                                 state["m_block_size"] = m_block_size
                                 
                             if beta3 is not None:
-                                state["conf_row_q"] = torch.zeros_like(state["row_var_q"])
-                                state["conf_row_scale"] = torch.ones_like(state["row_var_scale"])
+                                state["conf_row_q"] = torch.full_like(state["row_var_q"], 255)
+                                state["conf_row_scale"] = torch.full_like(state["row_var_scale"], 126.0)
                                 state["conf_row_shape"] = state["row_var_shape"]
                                 state["conf_row_pad"] = state["row_var_pad"]
                                 
-                                state["conf_col_q"] = torch.zeros_like(state["col_var_q"])
-                                state["conf_col_scale"] = torch.ones_like(state["col_var_scale"])
+                                state["conf_col_q"] = torch.full_like(state["col_var_q"], 255)
+                                state["conf_col_scale"] = torch.full_like(state["col_var_scale"], 126.0)
                                 state["conf_col_shape"] = state["col_var_shape"]
                                 state["conf_col_pad"] = state["col_var_pad"]
+
                         else:
                             state["row_var"] = torch.zeros(r_shape, dtype=torch.float32, device=p.device)
                             state["col_var"] = torch.zeros(c_shape, dtype=torch.float32, device=p.device)
