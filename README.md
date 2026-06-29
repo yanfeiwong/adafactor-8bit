@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/banner.png" alt="# Adafactor8Bit" width="80%">
+  <a href="https://github.com/yanfeiwong/adafactor-8bit">
+    <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/banner.png"
+         alt="Adafactor8Bit"
+         width="80%">
+  </a>
 </p>
 <div align="center">
 
@@ -15,7 +19,7 @@
 
 </div>
 
-An enhanced 8-bit Adafactor optimizer featuring fused CUDA kernels, log-space block-wise quantization, optional APOLLO low-rank updates, and 4-bit packed first moments, delivering substantially lower optimizer memory while preserving the low-overhead and numerical stability that make Adafactor attractive for training LLMs and diffusion models.
+An enhanced 8-bit Adafactor optimizer featuring fused CUDA kernels, log-space block-wise quantization, and optional add-ons including 4-bit packed first moments, APOLLO low-rank updates, and CAME confidence-guided optimization. It delivers substantially lower optimizer memory while preserving the low-overhead and numerical stability that make Adafactor attractive for training LLMs and diffusion models.
 
 
 ## ⚡ Key Features
@@ -23,6 +27,7 @@ An enhanced 8-bit Adafactor optimizer featuring fused CUDA kernels, log-space bl
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
 - **Optional 4-bit Packed First Moment**: Stores the first moment (`beta1`) in a physically packed 4-bit format when enabled, providing momentum with minimal additional memory overhead.
+- **CAME Confidence Guidance**: Optional Confidence-guided Adaptive Memory Efficient Optimization (CAME) that estimates update confidence from historical momentum and adaptively suppresses unstable update directions, improving training stability and reducing loss spikes.
 - **APOLLO Subspace Projection**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, preventing stale second-moment statistics and potentially improving convergence and generalization.
 - **Fira Norm-Growth Limiter**: Suppresses destructive gradient spikes by regulating the relative increase of update norms. Originally used for the APOLLO path, it is now available for the standard Adafactor path as well. It improves training stability and often allows the safe removal of external gradient clipping.
 - **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
@@ -170,16 +175,16 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "weight_decay": weight_decay, 
             "quantize": True, 
             "apollo_rank": apollo_rank,
-            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
+            "beta1": 0.9,              # Remove if minimizing optimizer memory is the priority.
         },
-        
+
         # 4. >2D Weights: 8-bit quantization, Weight Decay, Full-Rank
         {
             "params": group_nd, 
             "weight_decay": weight_decay, 
             "quantize": True, 
             "apollo_rank": 0,
-            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
+            "beta1": 0.9,              # Remove if minimizing optimizer memory is the priority.
             "factored": False          # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
                                        # Note: This increases state memory for >2D weights, depending on your model architecture.
                                        # If VRAM is constrained, reverting to factored=True is a safe alternative.
@@ -246,7 +251,40 @@ Enable the APOLLO path to compute gradient scaling factors in a memory-efficient
 - **`apollo_factorize` (Experimental)**: Applies Adafactor's row/column factorization within the low-rank subspace. Mathematically, this leverages the norm-preserving property of random projections to approximate the variance of the primary dimension, while the secondary dimension's variance is estimated across random bases, introducing inherent noise. This dual-compression mechanism drastically reduces optimizer state overhead. Note that for smaller models, the actual VRAM savings might be marginal, and the introduced noise could impact convergence stability. Use with caution.
 - **Fira Limiter Integration**: The APOLLO path automatically applies the Fira Norm-Growth Limiter to the scaled gradients to prevent sudden gradient rises from causing loss spikes. You can adjust its sensitivity using the global `fira_margin` parameter.
 
+## 🛡️ CAME Confidence-Guided Updates
 
+Enable the CAME (Confidence-guided Adaptive Memory Efficient Optimization) path to add a confidence estimation stage after momentum accumulation:
+
+**Adaptive Scaling ($V$) → Momentum Accumulation ($M$) → Confidence Weighting ($C$)**
+
+### Key Parameters & Tuning
+
+The confidence stage measures the consistency between the current update direction and historical momentum, adaptively suppressing highly oscillatory updates.
+
+- **`beta3`**: EMA decay coefficient for the confidence matrix. Requires `beta1` (momentum) and `factored=True`. Mutually exclusive with `apollo_rank`. Defaults to `None` (disabled).
+- **Learning Rate**: The official CAME implementation recommends **0.5–0.9×** the AdamW learning rate (see [official tuning guide](https://github.com/yangluo7/CAME/tree/master#hyper-parameter-tuning)). To use this learning rate in this library, you need to disable Adafactor's scaling and clipping (`scale_parameter=False`, `d=1e9`) to align with the original CAME behavior.
+- **Warmup**: Since the confidence matrix is zero-initialized without bias correction, a learning rate warmup is recommended to safely establish the confidence baseline.
+- **Choosing `beta3`**: `beta3` should generally be larger than `beta2` so the confidence estimate evolves more slowly than the variance estimate. A practical starting range is **0.9995–0.99995** when `beta2=0.999`.
+
+
+### Configuration Example
+
+To replicate "vanilla" CAME (stripping Adafactor's native modifications), replace the standard 2D APOLLO group in your `param_groups` with the following configuration:
+
+```python
+{
+    "params": param_group,
+    "lr": lr,                           # Original CAME recommends 0.5-0.9x AdamW LR
+    "weight_decay": weight_decay,
+    "quantize": True,
+    "beta1": 0.9,
+    "beta3": 0.9999,                    # Enable CAME confidence guidance
+    "apollo_rank": 0,                   # Mutually exclusive with CAME
+    "scale_parameter": False,           # Disable Adafactor RMS scaling to align with vanilla CAME
+    "d": 1e9,                           # Disable Adafactor global RMS clipping
+    "enable_fira_for_adafactor": False, # Disable Fira Limiter to prevent interference with CAME's scaling
+},
+```
 
 ## 📈 Learning Rate Guide for Beginners
 
@@ -273,6 +311,8 @@ Thanks to **Tim Dettmers** for the inspiration from the paper [8-BIT OPTIMIZERS 
 Thanks to **Hanqing Zhu**, **Zhenyu Zhang**, and the team for proposing the approximated gradient scaling method in the paper [APOLLO: SGD-Like Memory, AdamW-level Performance](https://arxiv.org/abs/2412.05270).
 
 Thanks to **Xi Chen**, **Kaituo Feng**, and the team for the Norm-Growth Limiter mechanism introduced in [Fira: Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint?](https://arxiv.org/abs/2410.01623).
+
+Thanks to **Yang Luo** and the team for proposing the confidence-guided strategy in the paper [CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047).
 
 Thanks to the **PyTorch team** for providing the foundational Optimizer implementation and the C++ Extension toolchain.
 

@@ -1112,6 +1112,84 @@ void apply_update_1d_full_m_cuda(
 }
 
 
+// ==========================================
+// 15. CAME: Compute Residual Variance (Row & Col)
+// ==========================================
+__global__ void came_compute_residual_2d_kernel(
+    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
+    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
+    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
+    const float* __restrict__ grad, 
+    const float* __restrict__ row_mean_val_ptr,
+    float* __restrict__ res_row_sum, float* __restrict__ res_col_sum,
+    float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
+{
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
+        int b = idx / (R * C);
+        int r = (idx / C) % R;
+        int c = idx % C;
+        
+        unsigned char packed = m_q[idx / 2];
+        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
+        float m_val = (float)(q_int - 8) * m_scale[idx / m_block_size];
+        
+        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
+        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
+        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
+        
+        float log_v_ij = log_r + log_c - log_row_mean; 
+        float max_log = fmaxf(log_v_ij, log_eps_sq);
+        max_log = fmaxf(max_log, -53.0f); 
+        float inv_std = exp2f(-0.5f * max_log); 
+        
+        float diff = (grad[idx] - m_val) * inv_std;
+        float res = diff * diff;
+        
+        atomicAdd(&res_col_sum[b * C + c], res);
+        
+        int row_idx = b * R + r;
+        int lane = threadIdx.x % 32;
+        
+        for (int offset = 16; offset > 0; offset /= 2) {
+            int other_row_idx = __shfl_down_sync(0xffffffff, row_idx, offset);
+            float other_res = __shfl_down_sync(0xffffffff, res, offset);
+            if (lane + offset < 32 && row_idx == other_row_idx) {
+                res += other_res;
+            }
+        }
+        
+        int prev_row_idx = __shfl_up_sync(0xffffffff, row_idx, 1);
+        bool is_first_in_row = (lane == 0) || (row_idx != prev_row_idx);
+        
+        if (is_first_in_row) {
+            atomicAdd(&res_row_sum[row_idx], res);
+        }
+    }
+}
+
+void came_compute_residual_2d_cuda(
+    torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_var_q, torch::Tensor row_var_scale,
+    torch::Tensor col_var_q, torch::Tensor col_var_scale,
+    torch::Tensor grad, torch::Tensor row_mean_val,
+    torch::Tensor res_row_sum, torch::Tensor res_col_sum,
+    float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
+{
+    int threads = 256;
+    int blocks = min(1024, (numel + threads - 1) / threads);
+    came_compute_residual_2d_kernel<<<blocks, threads>>>(
+        m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
+        row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
+        col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
+        grad.data_ptr<float>(), row_mean_val.data_ptr<float>(),
+        res_row_sum.data_ptr<float>(), res_col_sum.data_ptr<float>(),
+        log_eps_sq, R, C, numel, m_block_size, v_block_size
+    );
+}
+
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_log_quantize_lerp", &fused_log_quantize_lerp_cuda, "Fused log quantize lerp (CUDA)");
     m.def("fused_4bit_quantize_lerp", &fused_4bit_quantize_lerp_cuda, "Fused 4-bit packed quantize lerp for m_t (CUDA)");
@@ -1134,4 +1212,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("compute_update_norm_1d_full_m", &compute_update_norm_1d_full_m_cuda, "Compute update norm 1D full precision with momentum (CUDA)");
     m.def("apply_update_1d_full_m", &apply_update_1d_full_m_cuda, "Apply update 1D full precision with momentum (CUDA)");
+
+    m.def("came_compute_residual_2d", &came_compute_residual_2d_cuda, "Compute CAME residual row/col sums (CUDA)");
 }

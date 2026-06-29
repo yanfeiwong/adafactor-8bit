@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/banner.png" alt="# Adafactor8Bit" width="80%">
+  <a href="https://github.com/yanfeiwong/adafactor-8bit">
+    <img src="assets/banner.png"
+         alt="Adafactor8Bit"
+         width="80%">
+  </a>
 </p>
 <div align="center">
 
@@ -15,13 +19,14 @@
 
 </div>
 
-这是一个增强版的 8-bit Adafactor 优化器，结合了融合 CUDA Kernel、对数空间分块量化、可选的 APOLLO 低秩更新以及可选的 4-bit 打包一阶动量，在大幅降低优化器状态显存占用的同时，保持了低开销与数值稳定性，适用于 LLM 和扩散模型等大规模训练场景。
+这是一个增强版的 8-bit Adafactor 优化器，具备融合 CUDA Kernel 与对数空间分块量化，并支持 4-bit 打包一阶动量、APOLLO 低秩更新和 CAME 置信度引导优化等可选功能，在大幅降低优化器状态显存占用的同时，保持了低开销与数值稳定性，适用于 LLM 和扩散模型等大规模训练场景。
 
 ## ⚡ 核心特性
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
 - **可选的 4-bit 打包的一阶动量**：启用后以 4-bit 物理打包格式存储一阶动量（`beta1`），以极小的额外显存开销提供动量支持。
+- **CAME 置信度引导**：可选的置信度引导自适应内存高效优化（CAME），通过历史动量估计更新置信度，并自适应地抑制不稳定的更新方向，从而提升训练稳定性并减少 Loss 尖峰。
 - **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，防止二阶矩统计信息过时，可能带来更好的收敛与泛化效果。
 - **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升训练稳定性，通常允许安全地移除外部梯度裁剪。
 - **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
@@ -239,6 +244,39 @@ optimizer = Adafactor8Bit(
 - **`apollo_factorize` (实验性功能)**：在低秩子空间内应用 Adafactor 的行列分解。利用随机投影的保范性来近似主维度的方差，而副维度的方差则在随机基底上估计，从而引入固有噪声。双重压缩了优化器状态的开销。但是，对于较小的模型，实际节省的显存可能并不明显，但引入的噪声可能会影响收敛稳定性。请谨慎使用。
 - **Fira 限制器集成**：APOLLO 路径会自动将 Fira 范数增长限制器应用于缩放后的梯度，以防止梯度突然增大导致 Loss 尖峰。您可以通过全局的 `fira_margin` 参数来调整其灵敏度。
 
+## 🛡️ CAME 置信度引导更新
+
+启用 CAME（置信度引导的自适应内存高效优化）路径，在动量累积后增加置信度估计阶段：
+
+**自适应缩放 ($V$)→ 动量累积 ($M$)→ 置信度加权  ($C$)**
+
+### 关键参数与调参
+
+置信度阶段会衡量当前更新方向与历史动量之间的一致性，并自适应地抑制高震荡的更新。
+
+- **`beta3`**：置信度矩阵的 EMA 衰减系数。需要配合 `beta1`（动量）且 `factored=True` 使用。与 `apollo_rank` 互斥。默认值为 `None`（禁用）。
+- **学习率**：原版 CAME 官方建议使用 AdamW 学习率的 **0.5–0.9 倍**（见[调参指南](https://github.com/yangluo7/CAME/tree/master#hyper-parameter-tuning)）。若要在本库中使用此学习率，需同时禁用 Adafactor 的缩放与裁剪（`scale_parameter=False`, `d=1e9`）以对齐原版行为。
+- **预热**：置信度矩阵采用零初始化且没有偏差校正，因此建议使用学习率预热，以安全地建立置信度基线。
+- **`beta3` 的选择**：`beta3` 一般应大于 `beta2`，使置信度估计比方差估计演化得更慢。当 `beta2=0.999` 时，实用的起始范围是 **0.9995–0.99995**。
+
+### 配置示例
+
+要复现“原版”CAME（剥离 Adafactor 的原生修改），请将标准 2D APOLLO 组替换为以下配置：
+
+```python
+{
+    "params": param_group,
+    "lr": lr,                           # 原版 CAME 建议 0.5-0.9 倍 AdamW 学习率
+    "weight_decay": weight_decay,
+    "quantize": True,
+    "beta1": 0.9,
+    "beta3": 0.9999,                    # 启用 CAME 置信度引导
+    "apollo_rank": 0,                   # 与 CAME 互斥
+    "scale_parameter": False,           # 禁用 Adafactor RMS 缩放以对齐原版 CAME
+    "d": 1e9,                           # 禁用 Adafactor 全局 RMS 裁剪
+    "enable_fira_for_adafactor": False, # 禁用 Fira 限制器，防止干扰 CAME 的缩放
+},
+```
 
 ## 📈 学习率建议（从 AdamW 迁移）
 
@@ -262,6 +300,8 @@ optimizer = Adafactor8Bit(
 感谢 **Hanqing Zhu**、**Zhenyu Zhang** 及其团队在论文 [APOLLO: SGD-Like Memory, AdamW-level Performance](https://arxiv.org/abs/2412.05270) 中提出的近似梯度缩放方法。
 
 感谢 **Xi Chen**、**Kaituo Feng** 及其团队在论文 [Fira: Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint?](https://arxiv.org/abs/2410.01623) 中引入的范数增长限制器（Norm-Growth Limiter）机制。
+
+感谢 **Yang Luo** 及其团队在论文 [CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047) 中提出的置信度引导策略。
 
 感谢 **PyTorch 团队**提供的基础 Optimizer 实现与 C++ Extension 工具链。
 
