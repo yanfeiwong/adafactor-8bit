@@ -25,7 +25,7 @@
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
-- **可选的 4-bit 打包的一阶动量**：启用后以 4-bit 物理打包格式存储一阶动量（`beta1`），以极小的额外显存开销提供动量支持。
+- **可选的 NF4 一阶动量**：采用 Normal Float 4-bit (NF4) 非均匀量化存储可选的一阶动量（`beta1`），在保持极低显存开销的同时，有效保留微小的动量更新。
 - **CAME 置信度引导**：可选的置信度引导自适应内存高效优化（CAME），通过历史动量估计更新置信度，并自适应地抑制不稳定的更新方向，从而提升训练稳定性并减少 Loss 尖峰。
 - **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，防止二阶矩统计信息过时，可能带来更好的收敛与泛化效果。
 - **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升训练稳定性，通常允许安全地移除外部梯度裁剪。
@@ -293,19 +293,22 @@ optimizer = Adafactor8Bit(
 
 ## 🎓 致谢
 
-感谢 **Noam Shazeer** 与 **Mitchell Stern** 在论文 [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235) 中提出了原版的 Adafactor 算法。
+本项目的诞生离不开众多研究人员与开源社区的工作。在此向以下贡献者致以诚挚的感谢：
 
-感谢 **Tim Dettmers** 的 [8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/abs/2110.02861) 论文及 [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 库带来的启发。
+### 核心算法与优化器设计
+- **Noam Shazeer** 与 **Mitchell Stern** 提出了原版的 **Adafactor** 算法 ([Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235))。
+- **Tim Dettmers** 的 **8-bit 分块量化** 论文 ([8-BIT OPTIMIZERS VIA BLOCK-WISE QUANTIZATION](https://arxiv.org/abs/2110.02861)) 及 [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 库带来的启发。
+- **Hanqing Zhu**、**Zhenyu Zhang** 及其团队提出的 **APOLLO** 算法 ([APOLLO: SGD-Like Memory, AdamW-level Performance](https://arxiv.org/abs/2412.05270))。
+- **Xi Chen**、**Kaituo Feng** 及其团队在 **Fira** 中引入的 **范数增长限制器** 机制 ([Fira: Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint?](https://arxiv.org/abs/2410.01623))。
+- **Yang Luo** 及其团队在 **CAME** 中提出的 **置信度引导策略** ([CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047))。
 
-感谢 **Hanqing Zhu**、**Zhenyu Zhang** 及其团队在论文 [APOLLO: SGD-Like Memory, AdamW-level Performance](https://arxiv.org/abs/2412.05270) 中提出的近似梯度缩放方法。
+### 量化技术与工程实现
+- **QLoRA 团队** 开创了 **4-bit NormalFloat (NF4)** 量化格式 ([QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314))，为我们的第一动量量化提供了数学灵感。
+- **PyTorch AO 团队** 在 [4-bit 优化器状态](https://github.com/pytorch/ao/tree/main/torchao/optim) 上的工作，验证了分布感知量化在优化器矩估计中的有效性。
+- **PyTorch 团队** 提供的基础 Optimizer 实现与 C++ Extension 工具链。
 
-感谢 **Xi Chen**、**Kaituo Feng** 及其团队在论文 [Fira: Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint?](https://arxiv.org/abs/2410.01623) 中引入的范数增长限制器（Norm-Growth Limiter）机制。
-
-感谢 **Yang Luo** 及其团队在论文 [CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047) 中提出的置信度引导策略。
-
-感谢 **PyTorch 团队**提供的基础 Optimizer 实现与 C++ Extension 工具链。
-
-感谢来自 **Qwen**、**ChatGLM** 与 **DeepSeek** 的大语言模型在 CUDA 底层优化以及内存安全防御机制上提供的深度技术探讨与代码审查。
+### 技术审查与探讨
+- 大语言模型 **Qwen**、**ChatGLM** 与 **DeepSeek** 在 CUDA 底层优化、内存安全防御机制以及跨平台编译链路设计上提供的深度技术探讨与代码审查。
 
 ## 🏛️ License
 

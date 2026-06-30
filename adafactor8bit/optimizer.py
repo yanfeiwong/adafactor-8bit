@@ -21,6 +21,14 @@ _FP32_MIN_LOG = -126.0
 _INV_255 = 1.0 / 255.0
 _INV_7 = 1.0 / 7.0
 
+_NF4_TABLE = torch.tensor([
+    -1.0, -0.6961928, -0.52507306, -0.3895074,
+    -0.27408478, -0.17286907, -0.07958022, 0.0,
+    0.07958022, 0.17286907, 0.27408478, 0.3895074,
+    0.52507306, 0.6961928, 0.8641379, 1.0
+], dtype=torch.float32)
+
+
 # ==========================================
 # 1. CUDA Kernel JIT Loading
 # ==========================================
@@ -127,7 +135,7 @@ def _log_dequantize_nonneg(q: Tensor, scale: Tensor, shape: torch.Size, pad: int
     return flat.view(shape)
 
 def _quantize_4bit_pytorch(m: Tensor, block_size: int) -> Tuple[Tensor, Tensor]:
-    """4-bit symmetric min-max quantization with physical packing into uint8."""
+    """4-bit NF4 non-uniform quantization with physical packing into uint8."""
     flat = m.flatten()
     pad = (block_size - flat.numel() % block_size) % block_size
     if pad:
@@ -135,12 +143,15 @@ def _quantize_4bit_pytorch(m: Tensor, block_size: int) -> Tuple[Tensor, Tensor]:
         
     blocks = flat.view(-1, block_size)
     abs_max = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-    scale = abs_max * _INV_7  # _INV_7 = 1.0 / 7.0
+    scale = abs_max
     
-    q = (torch.round(blocks / scale).clamp(-8, 7) + 8).to(torch.uint8)
+    normalized = blocks / scale
+    table = _NF4_TABLE.to(normalized.device)
+    diff = (normalized.unsqueeze(-1) - table).abs()
+    codes = diff.argmin(dim=-1).to(torch.uint8)
     
-    q_even = q[:, 0::2]
-    q_odd = q[:, 1::2]
+    q_even = codes[:, 0::2]
+    q_odd = codes[:, 1::2]
     packed = (q_even << 4) | q_odd
     
     return packed.view(-1), scale.squeeze(-1)
@@ -152,11 +163,12 @@ def _dequantize_4bit(m_q: Tensor, m_scale: Tensor, numel: int, shape: torch.Size
         _CUDA_MODULE.dequantize_4bit(output, m_q, m_scale, numel, block_size)
         return output.view(shape)
     else:
-        high = ((m_q >> 4) & 0x0F).to(torch.float32) - 8.0
-        low = (m_q & 0x0F).to(torch.float32) - 8.0
-        m_flat = torch.stack((high, low), dim=-1).view(-1)
-        m_blocks = m_flat.view(-1, block_size)
-        result = (m_blocks * m_scale.unsqueeze(-1)).view(-1)[:numel]
+        high = (m_q >> 4)
+        low = (m_q & 0x0F)
+        codes = torch.stack((high, low), dim=-1).view(-1)
+        m_blocks = codes.view(-1, block_size)
+        table = _NF4_TABLE.to(m_q.device)
+        result = (table[m_blocks.long()] * m_scale.unsqueeze(-1)).view(-1)[:numel]
         return result.view(shape)
 
 # ==========================================
@@ -461,7 +473,7 @@ class Adafactor8Bit(Optimizer):
                             
                             if beta1 is not None:
                                 m_padded_numel = ((p.numel() + m_block_size - 1) // m_block_size) * m_block_size
-                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=p.device)
                                 state["m_scale"] = torch.ones(m_padded_numel // m_block_size, dtype=torch.float32, device=p.device)
                                 state["m_block_size"] = m_block_size
                                 
@@ -495,7 +507,7 @@ class Adafactor8Bit(Optimizer):
                             
                             if beta1 is not None:
                                 m_padded_numel = ((p.numel() + m_block_size - 1) // m_block_size) * m_block_size
-                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                                state["m_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=p.device)
                                 state["m_scale"] = torch.ones(m_padded_numel // m_block_size, dtype=torch.float32, device=p.device)
                                 state["m_block_size"] = m_block_size
                         else:
@@ -567,7 +579,7 @@ class Adafactor8Bit(Optimizer):
                             state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(state["m"], m_curr_block_size)
                             state.pop("m")
                         else:
-                            state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                            state["m_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=p.device)
                             state["m_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=p.device)
                         state["m_block_size"] = m_curr_block_size
                         
@@ -621,7 +633,7 @@ class Adafactor8Bit(Optimizer):
                         state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(state["m"], m_curr_block_size)
                         state.pop("m")
                     else:
-                        state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                        state["m_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=p.device)
                         state["m_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=p.device)
                     state["m_block_size"] = m_curr_block_size
 
@@ -1402,7 +1414,7 @@ def _update_param_apollo(
                 
                 if state.get("m_low_q") is None:
                     m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
-                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=grad_low.device)
                     state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
                     state["m_block_size"] = m_curr_block_size
 
@@ -1482,7 +1494,7 @@ def _update_param_apollo(
                 
                 if state.get("m_low_q") is None:
                     m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
-                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x77, dtype=torch.uint8, device=grad_low.device)
                     state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
                     state["m_block_size"] = m_curr_block_size
 
