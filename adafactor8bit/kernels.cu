@@ -139,7 +139,7 @@ __global__ void fused_log_quantize_lerp_kernel(
     }
     __syncthreads(); 
 
-    float max_log = fminf(fmaxf(s_max[0], MIN_LOG + 1e-12f), 50.0f);
+    float max_log = fminf(fmaxf(s_max[0], MIN_LOG + 1e-12f), 126.0f);
     float new_scale = max_log - MIN_LOG; 
     float inv_scale = 255.0f / (max_log - MIN_LOG);
 
@@ -365,7 +365,8 @@ __global__ void compute_update_norm_2d_kernel(
         max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
-        float u_ij = grad[idx] * inv_std;
+        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
+        float u_ij = g_val * inv_std;
         
         sq += u_ij * u_ij;
     }
@@ -434,7 +435,8 @@ __global__ void apply_update_2d_kernel(
         max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
-        float u_ij = grad[idx] * inv_std;
+        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
+        float u_ij = g_val * inv_std;
         
         float p_val = static_cast<float>(param[idx]);
         p_val -= step_size * u_ij;
@@ -480,7 +482,8 @@ __global__ void compute_update_norm_1d_kernel(
         max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
-        float u_val = grad[idx] * inv_std;
+        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
+        float u_val = g_val * inv_std;
         
         sq += u_val * u_val;
     }
@@ -532,7 +535,8 @@ __global__ void apply_update_1d_kernel(
         max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
-        float u_val = grad[idx] * inv_std;
+        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
+        float u_val = g_val * inv_std;
 
         float p_val = static_cast<float>(param[idx]);
         p_val -= step_size * u_val;
@@ -938,7 +942,7 @@ __global__ void compute_update_norm_1d_full_kernel(
     float one_minus_b = 1.0f - beta;
     
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = grad[idx];
+        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float g2 = g * g;
         float v = one_minus_b * variance[idx] + beta * g2;
         variance[idx] = v;
@@ -995,7 +999,7 @@ __global__ void apply_update_1d_full_kernel(
 
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = grad[idx];
+        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float v = variance[idx];
         float inv_std = rsqrtf(fmaxf(v, eps_sq));
         float u = g * inv_std;
@@ -1039,7 +1043,7 @@ __global__ void compute_update_norm_1d_full_m_kernel(
     float one_minus_bv = 1.0f - beta_val;
     
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = grad[idx];
+        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float g2 = g * g;
 
         float v = one_minus_bv * variance[idx] + beta_val * g2;
@@ -1159,7 +1163,8 @@ __global__ void came_compute_residual_2d_kernel(
         max_log = fmaxf(max_log, -53.0f); 
         float inv_std = exp2f(-0.5f * max_log); 
         
-        float diff = (grad[idx] - m_val) * inv_std;
+        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
+        float diff = (g_val - m_val) * inv_std;
         float res = diff * diff;
         
         atomicAdd(&res_col_sum[b * C + c], res);

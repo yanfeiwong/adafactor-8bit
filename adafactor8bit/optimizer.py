@@ -710,6 +710,11 @@ class Adafactor8Bit(Optimizer):
 # ==========================================
 def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor, fira_margin: float) -> Tuple[Tensor, Tensor]:
     current_norm = total_sum_sq.sqrt().view([]) 
+    
+    is_finite = torch.isfinite(current_norm)
+    current_norm = torch.where(is_finite, current_norm, torch.zeros_like(current_norm))
+    total_sum_sq = torch.where(is_finite, total_sum_sq, torch.zeros_like(total_sum_sq))
+    
     fira_threshold = 1.0 + fira_margin
     
     prev_norm = state.get("fira_prev_norm", None)
@@ -717,13 +722,14 @@ def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor,
         if not isinstance(prev_norm, Tensor):
             prev_norm = torch.tensor(prev_norm, device=total_sum_sq.device, dtype=torch.float32)
         
+        is_reset = prev_norm < 1e-6
         ratio = current_norm / (prev_norm + 1e-8)
         limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
-        final_scale = 1.0 / limiter
+        final_scale = torch.where(is_reset, torch.ones_like(current_norm), 1.0 / limiter)
+        state["fira_prev_norm"] = torch.where(is_reset, current_norm, current_norm * final_scale)
     else:
         final_scale = torch.tensor(1.0, device=total_sum_sq.device, dtype=torch.float32)
-        
-    state["fira_prev_norm"] = current_norm * final_scale
+        state["fira_prev_norm"] = current_norm
     
     alpha_scaled = alpha * final_scale
     total_sum_sq.mul_(final_scale.square()) 
@@ -732,19 +738,26 @@ def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor,
 
 def _apply_fira_pytorch(state: Dict[str, Any], update: Tensor, fira_margin: float, numel: int, d: float) -> Tuple[Tensor, Tensor]:
     current_norm = torch.linalg.vector_norm(update)
+    
+    is_finite = torch.isfinite(current_norm)
+    current_norm = torch.where(is_finite, current_norm, torch.zeros_like(current_norm))
+    update = torch.where(is_finite, update, torch.zeros_like(update))
+    
     fira_threshold = 1.0 + fira_margin
     
     prev_norm = state.get("fira_prev_norm", None)
     if prev_norm is not None:
         if not isinstance(prev_norm, Tensor):
             prev_norm = torch.tensor(prev_norm, device=update.device, dtype=torch.float32)
+        
+        is_reset = prev_norm < 1e-6
         ratio = current_norm / (prev_norm + 1e-8)
         limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
-        final_scale = 1.0 / limiter
+        final_scale = torch.where(is_reset, torch.ones_like(current_norm), 1.0 / limiter)
+        state["fira_prev_norm"] = torch.where(is_reset, current_norm, current_norm * final_scale)
     else:
         final_scale = torch.tensor(1.0, device=update.device, dtype=torch.float32)
-        
-    state["fira_prev_norm"] = current_norm * final_scale
+        state["fira_prev_norm"] = current_norm
     
     update_scaled = update * final_scale
     norm_final = current_norm * final_scale
@@ -1308,6 +1321,7 @@ def _update_param_apollo(
     fira_margin: float = 0.01,
 ):
     grad_work = grad.neg().float() if maximize else grad.float()
+    grad_work = torch.where(torch.isfinite(grad_work), grad_work, torch.zeros_like(grad_work))
     update_low = None 
 
     if apollo_factorize:
@@ -1588,16 +1602,20 @@ def _update_param_apollo(
     else:
         current_norm_t = torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32) * scaling_factor
 
+    is_finite = torch.isfinite(current_norm_t)
+    current_norm_t = torch.where(is_finite, current_norm_t, torch.zeros_like(current_norm_t))
+
     fira_threshold = 1.0 + fira_margin
     if "scaled_grad_norm_prev" in state:
         prev_norm_t = state["scaled_grad_norm_prev"]
         if not isinstance(prev_norm_t, Tensor):
             prev_norm_t = torch.tensor(prev_norm_t, device=param_work.device, dtype=torch.float32)
             
+        is_reset = prev_norm_t < 1e-6
         ratio = current_norm_t / (prev_norm_t + 1e-8)
         limiter = torch.clamp_min(ratio, fira_threshold) / fira_threshold
-        final_scale = scaling_factor / limiter
-        state["scaled_grad_norm_prev"] = current_norm_t / limiter
+        final_scale = torch.where(is_reset, scaling_factor, scaling_factor / limiter)
+        state["scaled_grad_norm_prev"] = torch.where(is_reset, current_norm_t, current_norm_t / limiter)
     else:
         final_scale = scaling_factor
         state["scaled_grad_norm_prev"] = current_norm_t
