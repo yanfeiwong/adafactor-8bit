@@ -269,7 +269,7 @@ The confidence stage measures the consistency between the current update directi
 
 ### Configuration Example
 
-To replicate "vanilla" CAME (stripping Adafactor's native modifications), replace the standard 2D APOLLO group in your `param_groups` with the following configuration:
+To replicate "vanilla" CAME (stripping Adafactor's native modifications), you can use the following configuration:
 
 ```python
 {

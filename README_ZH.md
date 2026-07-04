@@ -261,7 +261,7 @@ optimizer = Adafactor8Bit(
 
 ### 配置示例
 
-要复现“原版”CAME（剥离 Adafactor 的原生修改），请将标准 2D APOLLO 组替换为以下配置：
+要复现“原版”CAME（剥离 Adafactor 的原生修改），可以使用以下配置：
 
 ```python
 {
