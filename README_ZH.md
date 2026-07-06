@@ -113,7 +113,7 @@ optimizer = Adafactor8Bit(
 | **1D / 敏感小参数** (Norms, Biases) | 不量化，不做权重衰减。 |
 | **Embedding 层** | `factored=False`，`scale_parameter=False`，`d=1e9` → 等效于**没有一阶动量的 Adam**。配合 Adam 级别的学习率，实现 Token 级精细更新，避免冷词连坐。 |
 | **2D 权重** (线性层) | 8-bit量化，权重衰减，**APOLLO** 路径。不断切换的随机子空间投影捕获更全面的梯度信息，并起到正则化作用。 |
-| **>2D 权重** (Conv2d 等) | 8-bit量化，权重衰减，**Full-Rank**（`factored=False`）。牺牲一定显存保留完整空间结构，换取更精细的优化效果。 |
+| **>2D 权重** (Conv2d 等) | 8-bit量化，权重衰减，**全秩且禁用RMS缩放**（`factored=False`, `scale_parameter=False`）。牺牲一定显存保留空间结构，换取更精细的优化效果。 |
 | **一阶动量**（`beta1`） | 仅对密集权重矩阵启用。在这些层上，优化收益通常远大于 4-bit 打包一阶动量带来的显存开销。敏感参数（Norms/Biases）和稀疏 Embedding 层保持无一阶动量。 |
 
 **代码实现:**
@@ -123,9 +123,9 @@ from adafactor8bit import Adafactor8Bit
 
 # 定义学习率
 lr = 1e-3
-lr_emb = 1e-4 # 对于 Embedding 层，我们使用 Adam 风格的学习率
+lr_adam = 1e-4 # 对于 Embedding 和 N-D 层，我们使用 Adam 风格的学习率
 
-def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
+def get_param_groups(model, lr_adam, weight_decay, apollo_rank=256):
     group_1d, group_embed, group_2d, group_nd = [], [], [], []
 
     for name, param in model.named_parameters():
@@ -159,7 +159,7 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "factored": False,         # 启用逐元素二阶动量
             "scale_parameter": False,  # 解除内部自动缩放
             "d": 1e9,                  # 关闭全局信赖域裁剪
-            "lr": lr_emb               # 覆盖全局学习率
+            "lr": lr_adam              # 覆盖全局学习率
         },
         
         # 3. 2D 权重：8-bit 量化，权重衰减，APOLLO 低秩投影路径
@@ -178,15 +178,18 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "quantize": True, 
             "apollo_rank": 0,
             "beta1": 0.9,              # 如果首要目标是极限压榨显存，可移除此行。
-            "factored": False          # 禁用行列分解以保留空间结构，实现更精细的梯度缩放。
+            "factored": False,         # 禁用行列分解以保留空间结构，实现更精细的梯度缩放。
                                        # 注：这会增加ND权重占用的状态显存，具体取决于你的模型结构。
                                        # 如果显存受限，切回 factored=True 也是安全的。
+            "scale_parameter": False,  # 解除内部自动缩放
+            "d": 1e9,
+            "lr": lr_adam              # 覆盖全局学习率（因为禁用了内部缩放）
         },
     ]
 
 model = MyModel().cuda()
 optimizer = Adafactor8Bit(
-    get_param_groups(model, lr_emb = lr_emb, weight_decay=1e-2, apollo_rank=256),
+    get_param_groups(model, lr_adam = lr_adam, weight_decay=1e-2, apollo_rank=256),
     lr=lr, 
     # 针对长期连续训练或搭配外部学习率调度器的情况
     relative_step=False,              # 禁用内部 LR 调度

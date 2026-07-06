@@ -16,7 +16,7 @@ from adafactor8bit import Adafactor8Bit
 
 # Define learning rates
 lr = 1e-3
-lr_emb = 1e-4 # For Embedding layers, we use an Adam-style learning rate
+lr_adam = 1e-4 # For Embedding layers, we use an Adam-style learning rate
 
 
 class DummyModel(nn.Module):
@@ -49,7 +49,7 @@ class DummyModel(nn.Module):
         return text_out + img_out
 
 
-def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
+def get_param_groups(model, lr_adam, weight_decay, apollo_rank=256):
     """
     Precision routing for different parameter dimensions.
     """
@@ -88,7 +88,7 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "factored": False,         # Enable element-wise variance
             "scale_parameter": False,  # Disable internal RMS scaling
             "d": 1e9,                  # Disable global Trust-Region clipping
-            "lr": lr_emb               # Override global learning rate
+            "lr": lr_adam              # Override global learning rate
         },
         
         # 3. 2D Weights: 8-bit quantization, Weight Decay, APOLLO low-rank projection
@@ -107,9 +107,12 @@ def get_param_groups(model, lr_emb, weight_decay, apollo_rank=256):
             "quantize": True, 
             "apollo_rank": 0,
             "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
-            "factored": False          # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
+            "factored": False,         # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
                                        # Note: This increases state memory for >2D weights, depending on your model architecture.
                                        # If VRAM is constrained, reverting to factored=True is a safe alternative.
+            "scale_parameter": False,  # Disable internal RMS scaling
+            "d": 1e9,
+            "lr": lr_adam              # Override global learning rate (because internal RMS scaling is disabled). 
         },
     ]
 
@@ -119,7 +122,7 @@ def main():
     model = DummyModel().to(device)
     
     optimizer = Adafactor8Bit(
-        get_param_groups(model, lr_emb=lr_emb, weight_decay=1e-2, apollo_rank=256),
+        get_param_groups(model, lr_adam=lr_adam, weight_decay=1e-2, apollo_rank=256),
         lr=lr,
         # For continual learning or when using an external LR scheduler
         relative_step=False,
