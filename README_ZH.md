@@ -25,7 +25,7 @@
 
 - **对数空间量化**：在 8-bit 量化前，将二阶矩（方差）映射到 log2 空间。这种方式适应了方差的长尾分布，降低了极小的二阶矩估计值被截断为零的风险，提升训练稳定性。
 - **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
-- **可选的 NF4 一阶动量**：采用 Normal Float 4-bit (NF4) 非均匀量化存储可选的一阶动量（`beta1`），在保持极低显存开销的同时，有效保留微小的动量更新。
+- **可选的 4-bit 一阶动量**：采用 4-bit 均匀量化存储可选的一阶动量（`beta1`），在保持极低显存开销的同时，有效保留动量更新。
 - **CAME 置信度引导**：可选的置信度引导自适应内存高效优化（CAME），通过历史动量估计更新置信度，并自适应地抑制不稳定的更新方向，从而提升训练稳定性并减少 Loss 尖峰。
 - **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，防止二阶矩统计信息过时，可能带来更好的收敛与泛化效果。
 - **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰。该机制最初用于 APOLLO 路径，现已同样支持标准的 Adafactor 路径，显著提升训练稳定性，通常允许安全地移除外部梯度裁剪。
@@ -194,7 +194,7 @@ optimizer = Adafactor8Bit(
     # 针对长期连续训练或搭配外部学习率调度器的情况
     relative_step=False,              # 禁用内部 LR 调度
     beta2=0.999,                      # 锁定 EMA 窗口，防止随着训练步数推进而“钝化”
-    enable_fira_for_adafactor=True    # 对全局启用 Fira 限制器，可在训练循环中安全移除外部的梯度裁剪
+    enable_fira_for_adafactor=True    # 对全局启用 Fira 限制器
 )
 
 # Training loop...
@@ -270,16 +270,16 @@ optimizer = Adafactor8Bit(
 {
     "params": param_group,
     "lr": lr,                           # 原版 CAME 建议 0.5-0.9 倍 AdamW 学习率
-    "weight_decay": weight_decay,
-    "quantize": True,
     "beta1": 0.9,
+    "beta1": 0.999,
     "beta3": 0.9999,                    # 启用 CAME 置信度引导
     "apollo_rank": 0,                   # 与 CAME 互斥
+    "weight_decay": weight_decay,
+    "scale_weight_decay": False,
     "scale_parameter": False,           # 禁用 Adafactor RMS 缩放以对齐原版 CAME
-    "d": 1e9,                           # 禁用 Adafactor 全局 RMS 裁剪
-    "enable_fira_for_adafactor": False, # 禁用 Fira 限制器，防止干扰 CAME 的缩放
+    "d": 1.0,
+    "relative_step": False,
 },
-```
 
 ## 📈 学习率建议（从 AdamW 迁移）
 
@@ -306,7 +306,7 @@ optimizer = Adafactor8Bit(
 - **Yang Luo** 及其团队在 **CAME** 中提出的 **置信度引导策略** ([CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047))。
 
 ### 量化技术与工程实现
-- **QLoRA 团队** 开创了 **4-bit NormalFloat (NF4)** 量化格式 ([QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314))，为我们的第一动量量化提供了数学灵感。
+- **QLoRA 团队** 开创了 **4-bit** 优化器状态量化 ([QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314))，为我们的第一动量量化提供了数学灵感。
 - **PyTorch AO 团队** 在 [4-bit 优化器状态](https://github.com/pytorch/ao/tree/main/torchao/optim) 上的工作，验证了分布感知量化在优化器矩估计中的有效性。
 - **PyTorch 团队** 提供的基础 Optimizer 实现与 C++ Extension 工具链。
 

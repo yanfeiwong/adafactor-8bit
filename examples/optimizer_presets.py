@@ -100,7 +100,28 @@ optimizer_apollo = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 7. CAME
+# 7. APOLLO-Mini
+# Extreme memory savings with rank=1 projection. 
+# Relies on momentum (beta1) to smooth projection noise and a heuristic scale factor.
+# ==============================================================================
+optimizer_apollo_mini = Adafactor8Bit(
+    model.parameters(),
+    lr=ADAM_STYLE_LR,
+    beta1=0.9,                 # Crucial for smoothing rank=1 projection noise
+    beta2=0.999,
+    weight_decay=1e-2,
+    scale_weight_decay=False,
+    scale_parameter=False,
+    d=1e9,
+    relative_step=False,
+    apollo_rank=1,               # Extreme low-rank projection
+    apollo_scale_type='tensor',  # Global norm matching recommended for Mini
+    apollo_scale=128.0,          # Heuristic multiplier to compensate for rank=1 attenuation
+    apollo_update_proj_gap=200,
+)
+
+# ==============================================================================
+# 8. CAME
 # Confidence-guided adaptive optimization with momentum and decoupled weight decay.
 # Requires beta1. Mutually exclusive with apollo_rank.
 # ==============================================================================
@@ -113,6 +134,6 @@ optimizer_came = Adafactor8Bit(
     weight_decay=1e-2,
     scale_weight_decay=False,
     scale_parameter=False,
-    d=1e9,
+    d=1.0,                     # Restore official CAME global RMS clipping (clip_threshold=1.0)
     relative_step=False,
 )

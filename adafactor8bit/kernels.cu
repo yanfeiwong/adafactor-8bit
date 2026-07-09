@@ -8,24 +8,14 @@ __device__ constexpr float INV_255 = 1.0f / 255.0f;
 __device__ constexpr float MIN_LOG = -126.0f; 
 __device__ constexpr float MIN_VAL = 1.17549435e-38f; 
 
-__constant__ float NF4_QMAP[16] = {
-    -1.0f, -0.6961928f, -0.52507306f, -0.3895074f,
-    -0.27408478f, -0.17286907f, -0.07958022f, 0.0f,
-    0.07958022f, 0.17286907f, 0.27408478f, 0.3895074f,
-    0.52507306f, 0.6961928f, 0.8641379f, 1.0f
-};
+__device__ __forceinline__ float dequant_uniform_4bit(int q_int, float scale) {
+    return ((float)q_int - 8.0f) * (scale * 0.125f);
+}
 
-__device__ __forceinline__ int find_nearest_nf4(float x) {
-    float x_abs = fabsf(x);
-    if (x_abs < 0.0397901f) return 7;
-    if (x_abs < 0.1262246f) return (x >= 0.0f) ? 8 : 6;
-    if (x_abs < 0.2234769f) return (x >= 0.0f) ? 9 : 5;
-    if (x_abs < 0.3317961f) return (x >= 0.0f) ? 10 : 4;
-    if (x_abs < 0.4572902f) return (x >= 0.0f) ? 11 : 3;
-    if (x_abs < 0.6106329f) return (x >= 0.0f) ? 12 : 2;
-    if (x_abs < 0.7801653f) return (x >= 0.0f) ? 13 : 1;
-    if (x_abs < 0.9320689f) return (x >= 0.0f) ? 14 : 0;
-    return (x >= 0.0f) ? 15 : 0;
+__device__ __forceinline__ int quant_uniform_4bit(float x, float inv_scale) {
+    int q = __float2int_rn(x * inv_scale);
+    q = max(-8, min(7, q));
+    return q + 8;
 }
 
 // ==========================================
@@ -38,6 +28,7 @@ __global__ void fused_log_quantize_lerp_kernel(
     const float beta,
     int block_size,
     bool square_input,
+    float eps1,
     int N)
 {
     int block_id = blockIdx.x;
@@ -69,10 +60,10 @@ __global__ void fused_log_quantize_lerp_kernel(
             // Vectorized read for aligned elements
             float4 nv = new_val_vec[idx];
             if (square_input) {
-                nv.x = nv.x * nv.x;
-                nv.y = nv.y * nv.y;
-                nv.z = nv.z * nv.z;
-                nv.w = nv.w * nv.w;
+                nv.x = nv.x * nv.x + eps1;
+                nv.y = nv.y * nv.y + eps1;
+                nv.z = nv.z * nv.z + eps1;
+                nv.w = nv.w * nv.w + eps1;
             }
             val_x = (isnan(nv.x) || isinf(nv.x)) ? 0.0f : nv.x;
             val_y = (isnan(nv.y) || isinf(nv.y)) ? 0.0f : nv.y;
@@ -85,7 +76,7 @@ __global__ void fused_log_quantize_lerp_kernel(
             float v2 = (base_idx + 2 < N) ? new_val[base_idx + 2] : 0.0f;
             float v3 = (base_idx + 3 < N) ? new_val[base_idx + 3] : 0.0f;
             if (square_input) {
-                v0 *= v0; v1 *= v1; v2 *= v2; v3 *= v3;
+                v0 = v0 * v0 + eps1; v1 = v1 * v1 + eps1; v2 = v2 * v2 + eps1; v3 = v3 * v3 + eps1;
             }
             val_x = (isnan(v0) || isinf(v0)) ? 0.0f : v0;
             val_y = (isnan(v1) || isinf(v1)) ? 0.0f : v1;
@@ -165,7 +156,7 @@ __global__ void fused_log_quantize_lerp_kernel(
 
 torch::Tensor fused_log_quantize_lerp_cuda(
     torch::Tensor q, torch::Tensor scale, torch::Tensor new_val, 
-    float beta, int block_size, bool square_input, int N)
+    float beta, int block_size, bool square_input, float eps1, int N)
 {
     TORCH_CHECK(q.scalar_type() == at::kByte && scale.scalar_type() == at::kFloat && new_val.scalar_type() == at::kFloat);
     TORCH_CHECK(q.is_cuda() && scale.is_cuda() && new_val.is_cuda());
@@ -183,7 +174,7 @@ torch::Tensor fused_log_quantize_lerp_cuda(
     
     fused_log_quantize_lerp_kernel<<<num_blocks, threads, shared_mem>>>(
         q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), 
-        beta, block_size, square_input, N
+        beta, block_size, square_input, eps1, N
     );
     return q;
 }
@@ -245,10 +236,10 @@ __global__ void fused_4bit_quantize_lerp_kernel(
 
         uchar2 old_q = q_vec[idx];
 
-        float m_old0 = NF4_QMAP[(old_q.x >> 4)] * old_scale;
-        float m_old1 = NF4_QMAP[(old_q.x & 0x0F)] * old_scale;
-        float m_old2 = NF4_QMAP[(old_q.y >> 4)] * old_scale;
-        float m_old3 = NF4_QMAP[(old_q.y & 0x0F)] * old_scale;
+        float m_old0 = dequant_uniform_4bit(old_q.x >> 4, old_scale);
+        float m_old1 = dequant_uniform_4bit(old_q.x & 0x0F, old_scale);
+        float m_old2 = dequant_uniform_4bit(old_q.y >> 4, old_scale);
+        float m_old3 = dequant_uniform_4bit(old_q.y & 0x0F, old_scale);
 
         float m_new0 = beta * m_old0 + one_minus_b * val_x;
         float m_new1 = beta * m_old1 + one_minus_b * val_y;
@@ -286,7 +277,7 @@ __global__ void fused_4bit_quantize_lerp_kernel(
 
     float abs_max = fmaxf(s_max[0], 1e-12f);
     float new_scale = abs_max;
-    float inv_scale = 1.0f / new_scale;
+    float inv_scale = 8.0f / new_scale;
 
     for (int i = 0; i < vec_iters; i++) {
         int idx = tid + i * stride;
@@ -297,10 +288,10 @@ __global__ void fused_4bit_quantize_lerp_kernel(
         float m2 = local_m[idx * 4 + 2];
         float m3 = local_m[idx * 4 + 3];
 
-        int q0 = find_nearest_nf4(m0 * inv_scale);
-        int q1 = find_nearest_nf4(m1 * inv_scale);
-        int q2 = find_nearest_nf4(m2 * inv_scale);
-        int q3 = find_nearest_nf4(m3 * inv_scale);
+        int q0 = quant_uniform_4bit(m0, inv_scale);
+        int q1 = quant_uniform_4bit(m1, inv_scale);
+        int q2 = quant_uniform_4bit(m2, inv_scale);
+        int q3 = quant_uniform_4bit(m3, inv_scale);
 
         uchar2 out_q;
         out_q.x = (unsigned char)((q0 << 4) | q1);
@@ -581,7 +572,7 @@ __global__ void compute_update_norm_m_2d_kernel(
         // Unpack 4-bit m_t
         unsigned char packed = m_q[idx / 2];
         int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = NF4_QMAP[q_int] * m_scale[idx / m_block_size];
+        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
         
         float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
         float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
@@ -656,7 +647,7 @@ __global__ void apply_update_m_2d_kernel(
         // Unpack 4-bit m_t
         unsigned char packed = m_q[idx / 2];
         int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = NF4_QMAP[q_int] * m_scale[idx / m_block_size];
+        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
         
         float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
         float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
@@ -712,7 +703,7 @@ __global__ void compute_update_norm_m_1d_kernel(
         // Unpack 4-bit m_t
         unsigned char packed = m_q[idx / 2];
         int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = NF4_QMAP[q_int] * m_scale[idx / m_block_size];
+        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
         
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
         
@@ -771,7 +762,7 @@ __global__ void apply_update_m_1d_kernel(
         // Unpack 4-bit m_t
         unsigned char packed = m_q[idx / 2];
         int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = NF4_QMAP[q_int] * m_scale[idx / m_block_size];
+        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
         
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
         
@@ -828,7 +819,7 @@ __global__ void compute_apollo_norms_kernel(
         // 4-bit m 解包
         unsigned char m_byte = m_q[global_idx / 2];
         int m_int = (global_idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
-        float m_val = NF4_QMAP[m_int] * m_scale[global_idx / m_block_size];
+        float m_val = dequant_uniform_4bit(m_int, m_scale[global_idx / m_block_size]);
         // 8-bit log v 解包
         unsigned char v_byte = v_q[global_idx];
         float log_v = (float)v_byte * INV_255 * v_scale[global_idx / v_block_size] + MIN_LOG;
@@ -912,7 +903,7 @@ __global__ void dequantize_4bit_kernel(
     if (idx >= numel) return;
     unsigned char packed = q[idx / 2];
     int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-    output[idx] = NF4_QMAP[q_int] * scale[idx / block_size];
+    output[idx] = dequant_uniform_4bit(q_int, scale[idx / block_size]);
 }
 
 void dequantize_4bit_cuda(
@@ -1137,12 +1128,9 @@ void apply_update_1d_full_m_cuda(
 // ==========================================
 __global__ void came_compute_residual_2d_kernel(
     const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
-    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
-    const float* __restrict__ grad, 
-    const float* __restrict__ row_mean_val_ptr,
+    const float* __restrict__ u_t,                             
     float* __restrict__ res_row_sum, float* __restrict__ res_col_sum,
-    float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
+    float eps_came, int R, int C, int numel, int m_block_size)   
 {
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
@@ -1152,20 +1140,11 @@ __global__ void came_compute_residual_2d_kernel(
         
         unsigned char packed = m_q[idx / 2];
         int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = NF4_QMAP[q_int] * m_scale[idx / m_block_size];
+        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
         
-        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
-        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
-        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
-        
-        float log_v_ij = log_r + log_c - log_row_mean; 
-        float max_log = fmaxf(log_v_ij, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
-        
-        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float diff = (g_val - m_val) * inv_std;
-        float res = diff * diff;
+        float u_val = u_t[idx];
+        float diff = u_val - m_val;
+        float res = diff * diff + eps_came;
         
         atomicAdd(&res_col_sum[b * C + c], res);
         
@@ -1191,21 +1170,17 @@ __global__ void came_compute_residual_2d_kernel(
 
 void came_compute_residual_2d_cuda(
     torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor row_var_q, torch::Tensor row_var_scale,
-    torch::Tensor col_var_q, torch::Tensor col_var_scale,
-    torch::Tensor grad, torch::Tensor row_mean_val,
+    torch::Tensor u_t, 
     torch::Tensor res_row_sum, torch::Tensor res_col_sum,
-    float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
+    float eps_came, int R, int C, int numel, int m_block_size)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
     came_compute_residual_2d_kernel<<<blocks, threads>>>(
         m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-        row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
-        col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
-        grad.data_ptr<float>(), row_mean_val.data_ptr<float>(),
+        u_t.data_ptr<float>(),
         res_row_sum.data_ptr<float>(), res_col_sum.data_ptr<float>(),
-        log_eps_sq, R, C, numel, m_block_size, v_block_size
+        eps_came, R, C, numel, m_block_size
     );
 }
 

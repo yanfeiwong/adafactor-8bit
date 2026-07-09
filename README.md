@@ -26,7 +26,7 @@ An enhanced 8-bit Adafactor optimizer featuring fused CUDA kernels, log-space bl
 
 - **Log-Space Quantization**: Maps the second moment (variance) to the log2 space before 8-bit quantization. This approach accommodates the long-tail distribution of variances, reducing the risk of small second-moment estimates being truncated to zero and improving overall training stability.
 - **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
-- **Optional NF4 First Moment**: Stores the optional first moment (`beta1`) using Normal Float 4-bit (NF4) non-uniform quantization, preserving small momentum updates while keeping memory overhead minimal.
+- **Optional 4-bit First Moment**: Stores the optional first moment (`beta1`) using symmetric Uniform 4-bit quantization, preserving momentum updates while keeping memory overhead minimal.
 - **CAME Confidence Guidance**: Optional Confidence-guided Adaptive Memory Efficient Optimization (CAME) that estimates update confidence from historical momentum and adaptively suppresses unstable update directions, improving training stability and reducing loss spikes.
 - **APOLLO Subspace Projection**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, preventing stale second-moment statistics and potentially improving convergence and generalization.
 - **Fira Norm-Growth Limiter**: Suppresses destructive gradient spikes by regulating the relative increase of update norms. Originally used for the APOLLO path, it is now available for the standard Adafactor path as well. It improves training stability and often allows the safe removal of external gradient clipping.
@@ -201,7 +201,7 @@ optimizer = Adafactor8Bit(
     # For continual learning or when using an external LR scheduler
     relative_step=False,              # Disable internal LR scheduling
     beta2=0.999,                      # Lock EMA window to prevent "blunting" over steps
-    enable_fira_for_adafactor=True    # Enable Fira Limiter globally; external grad clipping can be safely removed
+    enable_fira_for_adafactor=True    # Enable Fira Limiter globally;
 )
 
 # Training loop...
@@ -278,14 +278,15 @@ To replicate "vanilla" CAME (stripping Adafactor's native modifications), you ca
 {
     "params": param_group,
     "lr": lr,                           # Original CAME recommends 0.5-0.9x AdamW LR
-    "weight_decay": weight_decay,
-    "quantize": True,
     "beta1": 0.9,
+    "beta1": 0.999,
     "beta3": 0.9999,                    # Enable CAME confidence guidance
     "apollo_rank": 0,                   # Mutually exclusive with CAME
+    "weight_decay": weight_decay,
+    "scale_weight_decay": False,
     "scale_parameter": False,           # Disable Adafactor RMS scaling to align with vanilla CAME
-    "d": 1e9,                           # Disable Adafactor global RMS clipping
-    "enable_fira_for_adafactor": False, # Disable Fira Limiter to prevent interference with CAME's scaling
+    "d": 1.0,
+    "relative_step": False,
 },
 ```
 
@@ -314,7 +315,7 @@ This project builds upon the foundational work of several researchers and open-s
 - **Yang Luo, et al.** for the **confidence-guided strategy** in **CAME** ([CAME: Confidence-guided Adaptive Memory Efficient Optimization](https://arxiv.org/abs/2307.02047)).
 
 ### Quantization & Implementation
-- **The QLoRA Team** for pioneering the **4-bit NormalFloat (NF4)** quantization format ([QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314)) that inspired our first moment quantization.
+- **The QLoRA Team** for pioneering **4-bit optimizer state quantization** ([QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314)) that inspired our 4-bit first moment compression.
 - **The PyTorch AO Team** for their work on [4-bit optimizer states](https://github.com/pytorch/ao/tree/main/torchao/optim), validating distribution-aware quantization for optimizer moments.
 - **The PyTorch Team** for providing the foundational optimizer implementation and the C++ Extension toolchain.
 
