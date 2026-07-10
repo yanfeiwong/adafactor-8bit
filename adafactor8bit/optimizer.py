@@ -179,7 +179,7 @@ class Adafactor8Bit(Optimizer):
         beta3 (float, optional): Confidence-guided decay coefficient for CAME 
             (Confidence-guided Adaptive Memory Efficient Optimization). 
             Computes the instability of the update direction and scales the update accordingly. 
-            Strictly requires `beta1` and `factored=True`. Mutually exclusive with `apollo_rank`. 
+            Strictly requires `beta1` and `factored=True`. 
             Defaults to None (disabled).
         eps (Tuple[Optional[float], float]): Regularization constants (eps1, eps2).
             - `eps1`: Added to the squared gradient. If `None`, defaults to the machine epsilon 
@@ -219,7 +219,7 @@ class Adafactor8Bit(Optimizer):
         --- APOLLO Low-Rank Projection ---
         apollo_rank (int): Rank for APOLLO (An Optimizer for Memory-Efficient Large-Scale Training) 
             style random projection to low-rank space. If > 0, enables APOLLO. 
-            Mutually exclusive with `beta3` (CAME). Defaults to 0 (disabled).
+            Defaults to 0 (disabled).
         apollo_update_proj_gap (int): Steps between random projection matrix refreshes. 
             Defaults to 200.
         apollo_scale_type (str): Strategy to map low-rank updates back to full-rank: 
@@ -314,9 +314,7 @@ class Adafactor8Bit(Optimizer):
                 raise ValueError(f"Invalid beta3: {beta3}, must be in [0.0, 1.0)")
             if beta1 is None:
                 raise ValueError("CAME (beta3) strictly requires momentum (beta1) to compute update instability.")
-            if apollo_rank > 0:
-                raise ValueError("CAME (beta3) and APOLLO (apollo_rank > 0) are mutually exclusive optimization strategies.")
-            if not factored:
+            if apollo_rank == 0 and not factored:
                 raise ValueError("CAME (beta3) requires factored=True (2D row/col factorization). It is not supported for 1D full-rank paths.")
 
         defaults = dict(
@@ -423,8 +421,10 @@ class Adafactor8Bit(Optimizer):
                     state["step"] = step_backup
                     needs_init = True
                 elif use_apollo and is_apollo_state:
-                    if state.get("apollo_rank") != apollo_rank or state.get("apollo_factorize", False) != apollo_factorize:
-                        logger.warning(f"Adafactor8Bit: Apollo config changed for param shape {p.shape}. Re-initializing state.")
+                    if (state.get("apollo_rank") != apollo_rank or 
+                        state.get("apollo_factorize", False) != apollo_factorize or
+                        state.get("beta3") != beta3):
+                        logger.warning(f"Adafactor8Bit: Apollo/CAME config changed for param shape {p.shape}. Re-initializing state.")
                         step_backup = state.get("step", 0)
                         if torch.is_tensor(step_backup):
                             step_backup = int(step_backup.cpu().item())
@@ -461,6 +461,7 @@ class Adafactor8Bit(Optimizer):
                     state["apollo_seed"] = seed
                     state["apollo_rank"] = apollo_rank
                     state["apollo_factorize"] = apollo_factorize
+                    state["beta3"] = beta3
                     state["apollo_update_proj_gap"] = update_proj_gap
                     state["last_proj_step"] = -update_proj_gap
                     state["v_low_q"] = None
@@ -468,6 +469,25 @@ class Adafactor8Bit(Optimizer):
                     state["v_low_shape"] = None
                     state["v_low_pad"] = None
                     state["v_low"] = None
+                    
+                    if beta3 is not None:
+                        if apollo_factorize:
+                            state["conf_row_low_q"] = None
+                            state["conf_row_low_scale"] = None
+                            state["conf_row_low_shape"] = None
+                            state["conf_row_low_pad"] = None
+                            state["conf_col_low_q"] = None
+                            state["conf_col_low_scale"] = None
+                            state["conf_col_low_shape"] = None
+                            state["conf_col_low_pad"] = None
+                            state["conf_row_low"] = None
+                            state["conf_col_low"] = None
+                        else:
+                            state["res_low_q"] = None
+                            state["res_low_scale"] = None
+                            state["res_low_shape"] = None
+                            state["res_low_pad"] = None
+                            state["res_low"] = None
 
                 else:
                     if expected_is_factored:
@@ -713,6 +733,8 @@ class Adafactor8Bit(Optimizer):
                         apollo_eps=group.get("apollo_eps", 1e-8),
                         apollo_factorize=group.get("apollo_factorize", False),
                         fira_margin=group.get("fira_margin", 0.01),
+                        eps_came=group.get("eps_came", 1e-8),
+                        beta3=group.get("beta3"),
                     )
                 else:
                     _update_param_8bit(
@@ -1421,6 +1443,8 @@ def _update_param_apollo(
     apollo_scale_type: str, apollo_scale: float, apollo_scale_front: bool, apollo_eps: float,
     apollo_factorize: bool,
     fira_margin: float = 0.01,
+    eps_came: float = 1e-8,
+    beta3: Optional[float] = None,
 ):
     grad_work = grad.neg().float() if maximize else grad.float()
     grad_work = torch.where(torch.isfinite(grad_work), grad_work, torch.zeros_like(grad_work))
@@ -1496,27 +1520,273 @@ def _update_param_apollo(
         v_low_est = row_var * col_var / row_var.mean(dim=-2, keepdim=True).clamp(min=eps1_val)
         
         if beta1 is not None:
+            if beta3 is not None:
+                eps_sq = max(eps1_val * eps1_val, torch.finfo(torch.float32).tiny)
+                row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp(min=eps1_val)
+                inv_row = row_var.clamp(min=eps_sq).rsqrt() * row_mean_val.sqrt()
+                inv_col = col_var.clamp(min=eps_sq).rsqrt()
+                
+                U_t = grad_low * inv_row
+                U_t.mul_(inv_col)
+                rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
+                U_t.div_(torch.clamp(rms_u / d, min=1.0))
+
+                if quantize:
+                    grad_low_numel = grad_low.numel()
+                    m_curr_block_size = state.get("m_block_size", m_block_size)
+                    if state.get("m_low_q") is None:
+                        m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                        state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                        state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                        state["m_block_size"] = m_curr_block_size
+
+                    if _load_cuda_module(use_cuda_kernel):
+                        _CUDA_MODULE.fused_4bit_quantize_lerp(
+                            state["m_low_q"], state["m_low_scale"], U_t.flatten(), beta1, m_curr_block_size, grad_low_numel
+                        )
+                        m_low_deq = _dequantize_4bit(
+                            state["m_low_q"], state["m_low_scale"],
+                            grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
+                        )
+                    else:
+                        if "m_low_q" in state:
+                            m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                        else:
+                            m_temp = torch.zeros_like(grad_low)
+                        m_temp.lerp_(U_t, 1.0 - beta1)
+                        state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                        m_low_deq = m_temp
+                        del m_temp
+                else:
+                    if "m_low" not in state:
+                        state["m_low"] = torch.zeros_like(grad_low)
+                    state["m_low"].lerp_(U_t, 1.0 - beta1)
+                    m_low_deq = state["m_low"]
+                
+                res = (U_t - m_low_deq).square() + eps_came
+                del U_t
+                res_row = res.mean(dim=-1, keepdim=True)
+                res_col = res.mean(dim=-2, keepdim=True)
+                
+                curr_block_size = state.get("block_size", block_size)
+                if quantize:
+                    if state.get("conf_row_low_q") is None:
+                        r_numel = res_row.numel()
+                        r_pad = (curr_block_size - r_numel % curr_block_size) % curr_block_size
+                        state["conf_row_low_q"] = torch.zeros(r_numel + r_pad, dtype=torch.uint8, device=grad_low.device)
+                        state["conf_row_low_scale"] = torch.ones((r_numel + r_pad) // curr_block_size, dtype=torch.float32, device=grad_low.device)
+                        state["conf_row_low_shape"] = res_row.shape
+                        state["conf_row_low_pad"] = r_pad
+                        c_numel = res_col.numel()
+                        c_pad = (curr_block_size - c_numel % curr_block_size) % curr_block_size
+                        state["conf_col_low_q"] = torch.zeros(c_numel + c_pad, dtype=torch.uint8, device=grad_low.device)
+                        state["conf_col_low_scale"] = torch.ones((c_numel + c_pad) // curr_block_size, dtype=torch.float32, device=grad_low.device)
+                        state["conf_col_low_shape"] = res_col.shape
+                        state["conf_col_low_pad"] = c_pad
+                    c_row = _log_dequantize_nonneg(state["conf_row_low_q"], state["conf_row_low_scale"], state["conf_row_low_shape"], state["conf_row_low_pad"])
+                    c_col = _log_dequantize_nonneg(state["conf_col_low_q"], state["conf_col_low_scale"], state["conf_col_low_shape"], state["conf_col_low_pad"])
+                    c_row.lerp_(res_row, 1.0 - beta3)
+                    c_col.lerp_(res_col, 1.0 - beta3)
+                    q_cr, s_cr, sh_cr, pad_cr = _log_quantize_nonneg(c_row, curr_block_size)
+                    state["conf_row_low_q"], state["conf_row_low_scale"], state["conf_row_low_shape"], state["conf_row_low_pad"] = q_cr, s_cr, sh_cr, pad_cr
+                    q_cc, s_cc, sh_cc, pad_cc = _log_quantize_nonneg(c_col, curr_block_size)
+                    state["conf_col_low_q"], state["conf_col_low_scale"], state["conf_col_low_shape"], state["conf_col_low_pad"] = q_cc, s_cc, sh_cc, pad_cc
+                else:
+                    if "conf_row_low" not in state:
+                        state["conf_row_low"] = torch.zeros_like(res_row)
+                        state["conf_col_low"] = torch.zeros_like(res_col)
+                    state["conf_row_low"].lerp_(res_row, 1.0 - beta3)
+                    state["conf_col_low"].lerp_(res_col, 1.0 - beta3)
+                    c_row = state["conf_row_low"]
+                    c_col = state["conf_col_low"]
+                
+                conf_row_mean = c_row.mean(dim=-2, keepdim=True).clamp(min=eps1_val)
+                inv_row_conf = c_row.clamp(min=eps_sq).rsqrt() * conf_row_mean.sqrt()
+                inv_col_conf = c_col.clamp(min=eps_sq).rsqrt()
+                
+                update_low = m_low_deq * inv_row_conf
+                update_low.mul_(inv_col_conf)
+                
+            else:
+                if quantize:
+                    grad_low_flat = grad_low.flatten()
+                    grad_low_numel = grad_low_flat.numel()
+                    m_curr_block_size = state.get("m_block_size", m_block_size)
+                    
+                    if state.get("m_low_q") is None:
+                        m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                        state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                        state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                        state["m_block_size"] = m_curr_block_size
+
+                    if _load_cuda_module(use_cuda_kernel):
+                        _CUDA_MODULE.fused_4bit_quantize_lerp(
+                            state["m_low_q"], state["m_low_scale"], grad_low_flat, beta1, m_curr_block_size, grad_low_numel
+                        )
+                        m_low_deq = _dequantize_4bit(
+                            state["m_low_q"], state["m_low_scale"],
+                            grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
+                        )
+                    else:
+                        if "m_low_q" in state:
+                            m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                        else:
+                            m_temp = torch.zeros_like(grad_low)
+                        m_temp.lerp_(grad_low, 1.0 - beta1)
+                        state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                        m_low_deq = m_temp
+                        del m_temp
+                else:
+                    if "m_low" not in state:
+                        state["m_low"] = torch.zeros_like(grad_low)
+                    state["m_low"].lerp_(grad_low, 1.0 - beta1)
+                    m_low_deq = state["m_low"]
+                update_low = m_low_deq / (torch.sqrt(v_low_est) + apollo_eps)
+        else:
+            update_low = grad_low / (torch.sqrt(v_low_est) + apollo_eps)
+        
+    else:
+        is_first_step = (state.get("v_low_q") is None and state.get("v_low") is None)
+        quantize = state.get("is_quantized", True)
+        curr_block_size = state.get("block_size", block_size)
+        eps1_val = eps1 if eps1 is not None else apollo_eps
+        eps_sq = max(eps1_val * eps1_val, torch.finfo(torch.float32).tiny)
+
+        if is_first_step:
+            v_init = (grad_low.flatten().square() * beta_val).clamp(min=_FP32_TINY)
             if quantize:
+                q, s, sh, pad = _log_quantize_nonneg(v_init, curr_block_size)
+                state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
+            else:
+                state["v_low"] = v_init
+        else:
+            if quantize:
+                if _load_cuda_module(use_cuda_kernel):
+                    _CUDA_MODULE.fused_log_quantize_lerp(
+                        state["v_low_q"], state["v_low_scale"], grad_low.flatten(), beta_val, curr_block_size, True, eps1_val, grad_low.numel()
+                    )
+                else:
+                    grad_low_sq_flat = grad_low.flatten().square().add_(eps1_val)
+                    v_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"])
+                    v_deq.lerp_(grad_low_sq_flat, beta_val)
+                    q, s, sh, pad = _log_quantize_nonneg(v_deq, curr_block_size)
+                    state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
+            else:
+                grad_low_sq_flat = grad_low.flatten().square().add_(eps1_val)
+                state["v_low"].lerp_(grad_low_sq_flat, beta_val)
+
+        if beta3 is not None:
+            v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+            v_low_reshaped = v_low_deq.view_as(grad_low)
+            
+            U_t = grad_low * v_low_reshaped.clamp(min=eps_sq).rsqrt()
+            rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
+            U_t.div_(torch.clamp(rms_u / d, min=1.0))
+            
+            if beta1 is not None:
+                if quantize:
+                    grad_low_numel = grad_low.numel()
+                    m_curr_block_size = state.get("m_block_size", m_block_size)
+                    if state.get("m_low_q") is None:
+                        m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                        state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                        state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                        state["m_block_size"] = m_curr_block_size
+                    
+                    if _load_cuda_module(use_cuda_kernel):
+                        _CUDA_MODULE.fused_4bit_quantize_lerp(state["m_low_q"], state["m_low_scale"], U_t.flatten(), beta1, m_curr_block_size, grad_low_numel)
+                        m_low_deq = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device)
+                    else:
+                        if "m_low_q" in state:
+                            m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                        else:
+                            m_temp = torch.zeros_like(grad_low)
+                        m_temp.lerp_(U_t, 1.0 - beta1)
+                        state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                        m_low_deq = m_temp
+                        del m_temp
+                else:
+                    if "m_low" not in state:
+                        state["m_low"] = torch.zeros_like(grad_low)
+                    state["m_low"].lerp_(U_t, 1.0 - beta1)
+                    m_low_deq = state["m_low"]
+                
+                res = (U_t - m_low_deq).square() + eps_came
+                del U_t
+                
+                if state.get("res_low_q") is None and quantize:
+                    res_init = (res.flatten() * (1.0 - beta3)).clamp(min=_FP32_TINY)
+                    q, s, sh, pad = _log_quantize_nonneg(res_init, curr_block_size)
+                    state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"] = q, s, sh, pad
+                elif state.get("res_low") is None and not quantize:
+                    state["res_low"] = (res.flatten() * (1.0 - beta3)).clamp(min=_FP32_TINY)
+                else:
+                    if quantize:
+                        if _load_cuda_module(use_cuda_kernel):
+                            _CUDA_MODULE.fused_log_quantize_lerp(
+                                state["res_low_q"], state["res_low_scale"], res.flatten(), (1.0 - beta3), curr_block_size, True, 0.0, res.numel()
+                            )
+                        else:
+                            res_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"])
+                            res_deq.lerp_(res.flatten(), 1.0 - beta3)
+                            q, s, sh, pad = _log_quantize_nonneg(res_deq, curr_block_size)
+                            state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"] = q, s, sh, pad
+                    else:
+                        state["res_low"].lerp_(res.flatten(), 1.0 - beta3)
+                
+                res_low_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"]) if quantize else state["res_low"]
+                res_low_reshaped = res_low_deq.view_as(grad_low)
+                
+                update_low = m_low_deq * res_low_reshaped.clamp(min=eps_sq).rsqrt()
+            else:
+                update_low = U_t
+
+        else:
+            if beta1 is not None:
+                if quantize and _load_cuda_module(use_cuda_kernel) and apollo_scale_type == "channel":
+                    v_low_deq = None
+                else:
+                    v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+                
                 grad_low_flat = grad_low.flatten()
                 grad_low_numel = grad_low_flat.numel()
                 m_curr_block_size = state.get("m_block_size", m_block_size)
-                
                 if state.get("m_low_q") is None:
                     m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
                     state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
                     state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
                     state["m_block_size"] = m_curr_block_size
-
+                
                 if _load_cuda_module(use_cuda_kernel):
                     _CUDA_MODULE.fused_4bit_quantize_lerp(
                         state["m_low_q"], state["m_low_scale"], grad_low_flat, beta1, m_curr_block_size, grad_low_numel
                     )
-
-
-                    m_low_deq = _dequantize_4bit(
-                        state["m_low_q"], state["m_low_scale"],
-                        grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
-                    )
+                    if apollo_scale_type == "channel":
+                        R_low, C_low = grad_low.shape[-2], grad_low.shape[-1]
+                        if side == "right":
+                            N, D = R_low, C_low
+                            stride_N, stride_D = C_low, 1
+                        else:
+                            N, D = C_low, R_low
+                            stride_N, stride_D = 1, C_low
+                        
+                        norm_update = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                        norm_grad = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                        _CUDA_MODULE.compute_apollo_norms(
+                            state["m_low_q"].view(-1), state["m_low_scale"], state["v_low_q"].view(-1), state["v_low_scale"],
+                            grad_low.contiguous(), norm_update, norm_grad, N, D, stride_N, stride_D, m_curr_block_size, block_size, apollo_eps
+                        )
+                        scaling_factor = norm_update / (norm_grad + 1e-8)
+                        if side == "right":
+                            scaling_factor = scaling_factor.unsqueeze(1)
+                        else:
+                            scaling_factor = scaling_factor.unsqueeze(0)
+                        scaling_factor_computed = True
+                    else:
+                        m_low_deq = _dequantize_4bit(
+                            state["m_low_q"], state["m_low_scale"],
+                            grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
+                        )
                 else:
                     if "m_low_q" in state:
                         m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
@@ -1527,131 +1797,13 @@ def _update_param_apollo(
                     m_low_deq = m_temp
                     del m_temp
             else:
-                if "m_low" not in state:
-                    state["m_low"] = torch.zeros_like(grad_low)
-                state["m_low"].lerp_(grad_low, 1.0 - beta1)
-                m_low_deq = state["m_low"]
-            update_low = m_low_deq / (torch.sqrt(v_low_est) + apollo_eps)
-        else:
-            update_low = grad_low / (torch.sqrt(v_low_est) + apollo_eps)
-        
-    else:
-        is_first_step = (state.get("v_low_q") is None and state.get("v_low") is None)
-        quantize = state.get("is_quantized", True)
-
-        if is_first_step:
-            v_init = (grad_low.flatten().square() * beta_val).clamp(min=_FP32_TINY)
-            if quantize:
-                q, s, sh, pad = _log_quantize_nonneg(v_init, block_size)
-                state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
-                if beta1 is not None and _load_cuda_module(use_cuda_kernel) and apollo_scale_type == "channel":
-                    v_low_deq = None
-                    del v_init
-                else:
-                    v_low_deq = v_init
-            else:
-                state["v_low"] = v_init
-                v_low_deq = v_init
-
-        else:
-            if quantize:
-                if _load_cuda_module(use_cuda_kernel):
-                    eps1_val = eps1 if eps1 is not None else apollo_eps
-                    _CUDA_MODULE.fused_log_quantize_lerp(
-                        state["v_low_q"], state["v_low_scale"], 
-                        grad_low.flatten(), beta_val, block_size, True, eps1_val, grad_low.numel()
-                    )
-                else:
-                    eps1_val = eps1 if eps1 is not None else apollo_eps
-                    grad_low_sq_flat = grad_low.flatten().square().add_(eps1_val)
-                    v_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"])
-                    v_deq.lerp_(grad_low_sq_flat, beta_val)
-                    q, s, sh, pad = _log_quantize_nonneg(v_deq, block_size)
-                    state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"] = q, s, sh, pad
-            else:
-                eps1_val = eps1 if eps1 is not None else apollo_eps
-                grad_low_sq_flat = grad_low.flatten().square().add_(eps1_val)
-                state["v_low"].lerp_(grad_low_sq_flat, beta_val)
-
-            if beta1 is not None and quantize and _load_cuda_module(use_cuda_kernel) and apollo_scale_type == "channel":
-                v_low_deq = None
-            else:
                 v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+                update_low = grad_low / (torch.sqrt(v_low_deq) + apollo_eps)
+                update_low = update_low.view_as(grad_low)
             
-        if beta1 is not None:
-            if quantize:
-                grad_low_flat = grad_low.flatten()
-                grad_low_numel = grad_low_flat.numel()
-                m_curr_block_size = state.get("m_block_size", m_block_size)
-                
-                if state.get("m_low_q") is None:
-                    m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
-                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
-                    state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
-                    state["m_block_size"] = m_curr_block_size
-
-                if _load_cuda_module(use_cuda_kernel):
-                    _CUDA_MODULE.fused_4bit_quantize_lerp(
-                        state["m_low_q"], state["m_low_scale"], grad_low.flatten(), beta1, m_curr_block_size, grad_low.numel()
-                    )
-                    
-                    if apollo_scale_type == "channel":
-                        R_low, C_low = grad_low.shape[-2], grad_low.shape[-1]
-                        if side == "right":
-                            N, D = R_low, C_low
-                            stride_N, stride_D = C_low, 1
-                        else:
-                            # N corresponds to output channels (C), D corresponds to rank
-                            # stride maps to column-major traversal of (rank, C) matrix
-                            N, D = C_low, R_low
-                            stride_N, stride_D = 1, C_low  
-                            
-                        norm_update = torch.empty(N, device=grad_low.device, dtype=torch.float32)
-                        norm_grad = torch.empty(N, device=grad_low.device, dtype=torch.float32)
-                        
-                        _CUDA_MODULE.compute_apollo_norms(
-                            state["m_low_q"].view(-1), state["m_low_scale"],
-                            state["v_low_q"].view(-1), state["v_low_scale"],
-                            grad_low.contiguous(),
-                            norm_update, norm_grad,
-                            N, D, stride_N, stride_D,
-                            m_curr_block_size, block_size, apollo_eps
-                        )
-                        
-                        scaling_factor = norm_update / (norm_grad + 1e-8)
-                            
-                        if side == "right":
-                            scaling_factor = scaling_factor.unsqueeze(1)
-                        else:
-                            scaling_factor = scaling_factor.unsqueeze(0)
-                            
-                        scaling_factor_computed = True
-                    else:
-                        m_low_deq = _dequantize_4bit(
-                            state["m_low_q"], state["m_low_scale"],
-                            grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device
-                        )
-                        v_low_reshaped = v_low_deq.view_as(grad_low)
-                        update_low = m_low_deq / (torch.sqrt(v_low_reshaped) + apollo_eps)
-                else:
-                    if "m_low_q" in state:
-                        m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
-                    else:
-                        m_temp = torch.zeros_like(grad_low)
-                    m_temp.lerp_(grad_low, 1.0 - beta1)
-                    state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
-                    v_low_reshaped = v_low_deq.view_as(grad_low)
-                    update_low = m_temp / (torch.sqrt(v_low_reshaped) + apollo_eps)
-                    del m_temp
-            else:
-                if "m_low" not in state:
-                    state["m_low"] = torch.zeros_like(grad_low)
-                state["m_low"].lerp_(grad_low, 1.0 - beta1)
+            if beta1 is not None and not scaling_factor_computed:
                 v_low_reshaped = v_low_deq.view_as(grad_low)
-                update_low = state["m_low"] / (torch.sqrt(v_low_reshaped) + apollo_eps)
-        else:
-            update_low = grad_low.flatten() / (torch.sqrt(v_low_deq) + apollo_eps)
-            update_low = update_low.view_as(grad_low)
+                update_low = m_low_deq / (torch.sqrt(v_low_reshaped) + apollo_eps)
 
     if not scaling_factor_computed:
         if apollo_scale_type == "channel":

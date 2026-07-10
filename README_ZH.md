@@ -257,7 +257,7 @@ optimizer = Adafactor8Bit(
 
 置信度阶段会衡量当前更新方向与历史动量之间的一致性，并自适应地抑制高震荡的更新。
 
-- **`beta3`**：置信度矩阵的 EMA 衰减系数。需要配合 `beta1`（动量）且 `factored=True` 使用。与 `apollo_rank` 互斥。默认值为 `None`（禁用）。
+- **`beta3`**：置信度矩阵的 EMA 衰减系数。需要配合 `beta1`（动量）且 `factored=True` 使用。默认值为 `None`（禁用）。
 - **学习率**：原版 CAME 官方建议使用 AdamW 学习率的 **0.5–0.9 倍**（见[调参指南](https://github.com/yangluo7/CAME/tree/master#hyper-parameter-tuning)）。若要在本库中使用此学习率，需同时禁用 Adafactor 的缩放与裁剪（`scale_parameter=False`, `d=1e9`）以对齐原版行为。
 - **预热**：置信度矩阵采用零初始化且没有偏差校正，因此建议使用学习率预热，以安全地建立置信度基线。
 - **`beta3` 的选择**：`beta3` 一般应大于 `beta2`，使置信度估计比方差估计演化得更慢。当 `beta2=0.999` 时，实用的起始范围是 **0.9995–0.99995**。
@@ -271,15 +271,16 @@ optimizer = Adafactor8Bit(
     "params": param_group,
     "lr": lr,                           # 原版 CAME 建议 0.5-0.9 倍 AdamW 学习率
     "beta1": 0.9,
-    "beta1": 0.999,
+    "beta2": 0.999,
     "beta3": 0.9999,                    # 启用 CAME 置信度引导
-    "apollo_rank": 0,                   # 与 CAME 互斥
+    "apollo_rank": 0,                   # 设置为 0 还原CAME (设置为 >0 启用 APOLLO+CAME 的融合算法)
     "weight_decay": weight_decay,
     "scale_weight_decay": False,
     "scale_parameter": False,           # 禁用 Adafactor RMS 缩放以对齐原版 CAME
     "d": 1.0,
     "relative_step": False,
 },
+```
 
 ## 📈 学习率建议（从 AdamW 迁移）
 
@@ -320,5 +321,3 @@ optimizer = Adafactor8Bit(
 ## ⭐ 支持项目
 
 如果这个优化器对你的工作有所帮助，请考虑给本仓库点一个 Star。这将帮助更多人发现这个项目，并支持未来的持续开发。
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yanfeiwong/adafactor-8bit&type=Date&theme=dark)](https://star-history.com/#yanfeiwong/adafactor-8bit&Date)

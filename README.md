@@ -264,7 +264,7 @@ Enable the CAME (Confidence-guided Adaptive Memory Efficient Optimization) path 
 
 The confidence stage measures the consistency between the current update direction and historical momentum, adaptively suppressing highly oscillatory updates.
 
-- **`beta3`**: EMA decay coefficient for the confidence matrix. Requires `beta1` (momentum) and `factored=True`. Mutually exclusive with `apollo_rank`. Defaults to `None` (disabled).
+- **`beta3`**: EMA decay coefficient for the confidence matrix. Requires `beta1` (momentum) and `factored=True`. Defaults to `None` (disabled).
 - **Learning Rate**: The official CAME implementation recommends **0.5–0.9×** the AdamW learning rate (see [official tuning guide](https://github.com/yangluo7/CAME/tree/master#hyper-parameter-tuning)). To use this learning rate in this library, you need to disable Adafactor's scaling and clipping (`scale_parameter=False`, `d=1e9`) to align with the original CAME behavior.
 - **Warmup**: Since the confidence matrix is zero-initialized without bias correction, a learning rate warmup is recommended to safely establish the confidence baseline.
 - **Choosing `beta3`**: `beta3` should generally be larger than `beta2` so the confidence estimate evolves more slowly than the variance estimate. A practical starting range is **0.9995–0.99995** when `beta2=0.999`.
@@ -279,9 +279,9 @@ To replicate "vanilla" CAME (stripping Adafactor's native modifications), you ca
     "params": param_group,
     "lr": lr,                           # Original CAME recommends 0.5-0.9x AdamW LR
     "beta1": 0.9,
-    "beta1": 0.999,
+    "beta2": 0.999,
     "beta3": 0.9999,                    # Enable CAME confidence guidance
-    "apollo_rank": 0,                   # Mutually exclusive with CAME
+    "apollo_rank": 0,                   # Set to 0 for vanilla CAME. (Set >0 to enable APOLLO+CAME fusion)
     "weight_decay": weight_decay,
     "scale_weight_decay": False,
     "scale_parameter": False,           # Disable Adafactor RMS scaling to align with vanilla CAME
@@ -330,5 +330,3 @@ This project builds upon the foundational work of several researchers and open-s
 ## ⭐ Star the Project
 
 If this optimizer has been useful in your work, consider giving the repository a star. It helps others discover the project and supports future development.
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yanfeiwong/adafactor-8bit&type=Date&theme=dark)](https://star-history.com/#yanfeiwong/adafactor-8bit&Date)
