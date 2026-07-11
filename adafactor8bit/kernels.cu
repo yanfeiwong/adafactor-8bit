@@ -798,7 +798,7 @@ void apply_update_m_1d_cuda(
 }
 
 // ==========================================
-// 9. Apollo Channel Norms (4-bit m + 8-bit v, zero FP32 materialization)
+// 9. Apollo Channel Norms (4-bit m + 8-bit v)
 // ==========================================
 __global__ void compute_apollo_norms_kernel(
     const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
@@ -816,11 +816,11 @@ __global__ void compute_apollo_norms_kernel(
     float sum_g2 = 0.0f;
     for (int i = tid; i < D; i += stride) {
         int global_idx = row * stride_N + i * stride_D;
-        // 4-bit m 解包
+        // 4-bit m
         unsigned char m_byte = m_q[global_idx / 2];
         int m_int = (global_idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
         float m_val = dequant_uniform_4bit(m_int, m_scale[global_idx / m_block_size]);
-        // 8-bit log v 解包
+        // 8-bit log v
         unsigned char v_byte = v_q[global_idx];
         float log_v = (float)v_byte * INV_255 * v_scale[global_idx / v_block_size] + MIN_LOG;
 
@@ -942,7 +942,6 @@ __global__ void compute_update_norm_1d_full_kernel(
         sq += u * u;
     }
     
-    // Warp/Block 规约
     for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
     int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
@@ -1048,7 +1047,6 @@ __global__ void compute_update_norm_1d_full_m_kernel(
         sq += u * u;
     }
     
-    // Warp/Block 规约
     for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
     int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
@@ -1186,6 +1184,213 @@ void came_compute_residual_2d_cuda(
 
 
 
+// ==========================================
+// 16. Apollo+CAME Phase 1: Compute RMS for U_t
+// ==========================================
+__global__ void compute_apollo_came_rms_kernel(
+    const float* __restrict__ grad_low,
+    const unsigned char* __restrict__ v_q, const float* __restrict__ v_scale,
+    float* __restrict__ sum_u2,
+    float eps_sq, int numel, int v_block_size)
+{
+    float sq = 0.0f;
+    int stride = gridDim.x * blockDim.x;
+    
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
+        float log_v = (float)v_q[idx] * INV_255 * v_scale[idx / v_block_size] + MIN_LOG;
+        float v_val = exp2f(fmaxf(log_v, -53.0f));
+        
+        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
+        float u_t = g_val * rsqrtf(fmaxf(v_val, eps_sq));
+        sq += u_t * u_t;
+    }
+    
+    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
+    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
+    __shared__ float s_sum[32];
+    if (lane == 0) s_sum[wid] = sq;
+    __syncthreads();
+    if (wid == 0) {
+        if (lane < num_warps) sq = s_sum[lane];
+        else sq = 0.0f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other = __shfl_down_sync(0xffffffff, sq, offset);
+            if (lane + offset < num_warps) sq += other;
+        }
+        if (lane == 0) atomicAdd(sum_u2, sq);
+    }
+}
+
+void compute_apollo_came_rms_cuda(
+    torch::Tensor grad_low, torch::Tensor v_q, torch::Tensor v_scale,
+    torch::Tensor sum_u2, float eps_sq, int numel, int v_block_size)
+{
+    int threads = 256;
+    int blocks = min(1024, (numel + threads - 1) / threads);
+    compute_apollo_came_rms_kernel<<<blocks, threads>>>(
+        grad_low.data_ptr<float>(), v_q.data_ptr<unsigned char>(), v_scale.data_ptr<float>(),
+        sum_u2.data_ptr<float>(), eps_sq, numel, v_block_size
+    );
+}
+
+// ==========================================
+// 17. Apollo+CAME Phase 2: Compute M_new & Res
+// ==========================================
+__global__ void apollo_came_compute_m_res_kernel(
+    const float* __restrict__ grad_low,
+    const unsigned char* __restrict__ v_q, const float* __restrict__ v_scale,
+    const unsigned char* __restrict__ m_q_old, const float* __restrict__ m_scale_old,
+    const unsigned char* __restrict__ res_q_old, const float* __restrict__ res_scale_old,
+    float* __restrict__ m_temp, float* __restrict__ res_temp,
+    const float* __restrict__ clip_factor_ptr, 
+    float beta1, float beta3, float eps_came, float eps_sq,
+    int v_block_size, int m_block_size, int res_block_size, int numel)
+{
+    float clip_factor = *clip_factor_ptr;
+    int stride = gridDim.x * blockDim.x;
+    const float one_minus_b1 = 1.0f - beta1;
+    const float one_minus_b3 = 1.0f - beta3;
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
+        float log_v = (float)v_q[idx] * INV_255 * v_scale[idx / v_block_size] + MIN_LOG;
+        float v_val = exp2f(fmaxf(log_v, -53.0f));
+        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
+        float u_t = g_val * rsqrtf(fmaxf(v_val, eps_sq));
+        u_t /= clip_factor;
+
+        unsigned char m_byte = m_q_old[idx / 2];
+        int m_int = (idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
+        float m_old = dequant_uniform_4bit(m_int, m_scale_old[idx / m_block_size]);
+        float m_new = beta1 * m_old + one_minus_b1 * u_t;
+        m_temp[idx] = m_new;
+
+        float diff = u_t - m_new;
+        float res_raw = diff * diff + eps_came;
+        float c_old_log = (float)res_q_old[idx] * INV_255 * res_scale_old[idx / res_block_size] + MIN_LOG;
+        float c_old = exp2f(c_old_log);
+        float c_new = beta3 * c_old + one_minus_b3 * res_raw;
+        res_temp[idx] = fmaxf(c_new, MIN_VAL);
+    }
+}
+
+void apollo_came_compute_m_res_cuda(
+    torch::Tensor grad_low,
+    torch::Tensor v_q, torch::Tensor v_scale,
+    torch::Tensor m_q_old, torch::Tensor m_scale_old,
+    torch::Tensor res_q_old, torch::Tensor res_scale_old,
+    torch::Tensor m_temp, torch::Tensor res_temp,
+    torch::Tensor clip_factor,
+    float beta1, float beta3, float eps_came, float eps_sq,
+    int v_block_size, int m_block_size, int res_block_size, int numel)
+{
+    int threads = 256;
+    int blocks = min(1024, (numel + threads - 1) / threads);
+    apollo_came_compute_m_res_kernel<<<blocks, threads>>>(
+        grad_low.data_ptr<float>(),
+        v_q.data_ptr<unsigned char>(), v_scale.data_ptr<float>(),
+        m_q_old.data_ptr<unsigned char>(), m_scale_old.data_ptr<float>(),
+        res_q_old.data_ptr<unsigned char>(), res_scale_old.data_ptr<float>(),
+        m_temp.data_ptr<float>(), res_temp.data_ptr<float>(),
+        clip_factor.data_ptr<float>(),
+        beta1, beta3, eps_came, eps_sq,
+        v_block_size, m_block_size, res_block_size, numel
+    );
+}
+
+// ==========================================
+// 18. Apollo+CAME Phase 3: Compute Final Update & Norms
+// ==========================================
+__global__ void apollo_came_compute_update_norms_kernel(
+    const unsigned char* __restrict__ m_q_new, const float* __restrict__ m_scale_new,
+    const unsigned char* __restrict__ res_q_new, const float* __restrict__ res_scale_new,
+    const float* __restrict__ grad_low,
+    float* __restrict__ norm_update, float* __restrict__ norm_grad,
+    float eps_sq, int N, int D, int stride_N, int stride_D, int numel,
+    int m_block_size, int res_block_size)
+{
+    int channel = blockIdx.x;
+    if (channel >= N) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    float sum_u2 = 0.0f;
+    float sum_g2 = 0.0f;
+    
+    for (int i = tid; i < D; i += stride) {
+        int idx = channel * stride_N + i * stride_D;
+        if (idx >= numel) break;
+        
+        unsigned char m_byte = m_q_new[idx / 2];
+        int m_int = (idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
+        float m_val = dequant_uniform_4bit(m_int, m_scale_new[idx / m_block_size]);
+
+        float log_res = (float)res_q_new[idx] * INV_255 * res_scale_new[idx / res_block_size] + MIN_LOG;
+        float res_val = exp2f(fmaxf(log_res, -53.0f));
+
+        float u_final = m_val * rsqrtf(fmaxf(res_val, eps_sq));
+        sum_u2 += u_final * u_final;
+        
+        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
+        sum_g2 += g_val * g_val;
+    }
+    
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
+        sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
+    }
+    __shared__ float s_u2[32];
+    __shared__ float s_g2[32];
+    int lane = tid % 32;
+    int wid = tid / 32;
+    int num_warps = blockDim.x / 32;
+    if (lane == 0) {
+        s_u2[wid] = sum_u2;
+        s_g2[wid] = sum_g2;
+    }
+    __syncthreads();
+    
+    if (wid == 0) {
+        if (lane < num_warps) {
+            sum_u2 = s_u2[lane];
+            sum_g2 = s_g2[lane];
+        } else {
+            sum_u2 = 0.0f;
+            sum_g2 = 0.0f;
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
+            sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
+        }
+        if (lane == 0) {
+            norm_update[channel] = sqrtf(sum_u2);
+            norm_grad[channel] = sqrtf(sum_g2);
+        }
+    }
+}
+
+void apollo_came_compute_update_norms_cuda(
+    torch::Tensor m_q_new, torch::Tensor m_scale_new,
+    torch::Tensor res_q_new, torch::Tensor res_scale_new,
+    torch::Tensor grad_low,
+    torch::Tensor norm_update, torch::Tensor norm_grad,
+    float eps_sq, int N, int D, int stride_N, int stride_D, int numel,
+    int m_block_size, int res_block_size)
+{
+    int threads = 256;
+    if (D < 256) threads = 128;
+    if (D < 128) threads = 64;
+    if (D < 64) threads = 32;
+    apollo_came_compute_update_norms_kernel<<<N, threads>>>(
+        m_q_new.data_ptr<unsigned char>(), m_scale_new.data_ptr<float>(),
+        res_q_new.data_ptr<unsigned char>(), res_scale_new.data_ptr<float>(),
+        grad_low.data_ptr<float>(),
+        norm_update.data_ptr<float>(), norm_grad.data_ptr<float>(),
+        eps_sq, N, D, stride_N, stride_D, numel,
+        m_block_size, res_block_size
+    );
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_log_quantize_lerp", &fused_log_quantize_lerp_cuda, "Fused log quantize lerp (CUDA)");
     m.def("fused_4bit_quantize_lerp", &fused_4bit_quantize_lerp_cuda, "Fused 4-bit packed quantize lerp for m_t (CUDA)");
@@ -1210,4 +1415,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("apply_update_1d_full_m", &apply_update_1d_full_m_cuda, "Apply update 1D full precision with momentum (CUDA)");
 
     m.def("came_compute_residual_2d", &came_compute_residual_2d_cuda, "Compute CAME residual row/col sums (CUDA)");
+
+    m.def("compute_apollo_came_rms", &compute_apollo_came_rms_cuda, "Compute Apollo CAME RMS (CUDA)");
+    m.def("apollo_came_compute_m_res", &apollo_came_compute_m_res_cuda, "Apollo CAME compute M and Res (CUDA)");
+    m.def("apollo_came_compute_update_norms", &apollo_came_compute_update_norms_cuda, "Apollo CAME compute update and norms (CUDA)");
 }

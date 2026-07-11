@@ -1676,69 +1676,119 @@ def _update_param_apollo(
                 state["v_low"].lerp_(grad_low_sq_flat, beta_val)
 
         if beta3 is not None:
-            v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
-            v_low_reshaped = v_low_deq.view_as(grad_low)
-            
-            U_t = grad_low * v_low_reshaped.clamp(min=eps_sq).rsqrt()
-            rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
-            U_t.div_(torch.clamp(rms_u / d, min=1.0))
-            
+            eps1_val = eps1 if eps1 is not None else apollo_eps
+            eps_sq = max(eps1_val * eps1_val, torch.finfo(torch.float32).tiny)
+            curr_block_size = state.get("block_size", block_size)
+
             if beta1 is not None:
-                if quantize:
-                    grad_low_numel = grad_low.numel()
-                    m_curr_block_size = state.get("m_block_size", m_block_size)
-                    if state.get("m_low_q") is None:
-                        m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
-                        state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
-                        state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
-                        state["m_block_size"] = m_curr_block_size
-                    
-                    if _load_cuda_module(use_cuda_kernel):
-                        _CUDA_MODULE.fused_4bit_quantize_lerp(state["m_low_q"], state["m_low_scale"], U_t.flatten(), beta1, m_curr_block_size, grad_low_numel)
-                        m_low_deq = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low_numel, grad_low.shape, m_curr_block_size, grad_low.device)
-                    else:
-                        if "m_low_q" in state:
-                            m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
-                        else:
-                            m_temp = torch.zeros_like(grad_low)
-                        m_temp.lerp_(U_t, 1.0 - beta1)
-                        state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
-                        m_low_deq = m_temp
-                        del m_temp
-                else:
-                    if "m_low" not in state:
-                        state["m_low"] = torch.zeros_like(grad_low)
-                    state["m_low"].lerp_(U_t, 1.0 - beta1)
-                    m_low_deq = state["m_low"]
+                grad_low_numel = grad_low.numel()
+                m_curr_block_size = state.get("m_block_size", m_block_size)
                 
-                res = (U_t - m_low_deq).square() + eps_came
-                del U_t
+                if state.get("m_low_q") is None and quantize:
+                    m_padded_numel = ((grad_low_numel + m_curr_block_size - 1) // m_curr_block_size) * m_curr_block_size
+                    state["m_low_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=grad_low.device)
+                    state["m_low_scale"] = torch.ones(m_padded_numel // m_curr_block_size, dtype=torch.float32, device=grad_low.device)
+                    state["m_block_size"] = m_curr_block_size
                 
                 if state.get("res_low_q") is None and quantize:
-                    res_init = (res.flatten() * (1.0 - beta3)).clamp(min=_FP32_TINY)
-                    q, s, sh, pad = _log_quantize_nonneg(res_init, curr_block_size)
-                    state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"] = q, s, sh, pad
-                elif state.get("res_low") is None and not quantize:
-                    state["res_low"] = (res.flatten() * (1.0 - beta3)).clamp(min=_FP32_TINY)
-                else:
-                    if quantize:
-                        if _load_cuda_module(use_cuda_kernel):
-                            _CUDA_MODULE.fused_log_quantize_lerp(
-                                state["res_low_q"], state["res_low_scale"], res.flatten(), (1.0 - beta3), curr_block_size, True, 0.0, res.numel()
-                            )
+                    r_numel = grad_low_numel
+                    r_pad = (curr_block_size - r_numel % curr_block_size) % curr_block_size
+                    state["res_low_q"] = torch.zeros(r_numel + r_pad, dtype=torch.uint8, device=grad_low.device)
+                    state["res_low_scale"] = torch.ones((r_numel + r_pad) // curr_block_size, dtype=torch.float32, device=grad_low.device)
+                    state["res_low_shape"] = grad_low.shape
+                    state["res_low_pad"] = r_pad
+
+                if quantize and _load_cuda_module(use_cuda_kernel):
+                    total_sum_sq = torch.zeros(1, device=grad_low.device, dtype=torch.float32)
+                    _CUDA_MODULE.compute_apollo_came_rms(
+                        grad_low.contiguous(), state["v_low_q"].view(-1), state["v_low_scale"],
+                        total_sum_sq, eps_sq, grad_low_numel, curr_block_size
+                    )
+                    
+                    clip_factor_t = torch.clamp(torch.sqrt(total_sum_sq / grad_low_numel) / d, min=1.0)
+                    
+                    m_temp = torch.empty(grad_low_numel, device=grad_low.device, dtype=torch.float32)
+                    res_temp = torch.empty(grad_low_numel, device=grad_low.device, dtype=torch.float32)
+                    
+                    _CUDA_MODULE.apollo_came_compute_m_res(
+                        grad_low.contiguous(), 
+                        state["v_low_q"].view(-1), state["v_low_scale"],
+                        state["m_low_q"].view(-1), state["m_low_scale"],
+                        state["res_low_q"].view(-1), state["res_low_scale"],
+                        m_temp, res_temp,
+                        clip_factor_t, beta1, beta3, eps_came, eps_sq,
+                        curr_block_size, m_curr_block_size, curr_block_size, grad_low_numel
+                    )
+                    
+                    _CUDA_MODULE.fused_4bit_quantize_lerp(
+                        state["m_low_q"].view(-1), state["m_low_scale"], m_temp, 0.0, m_curr_block_size, grad_low_numel
+                    )
+                    _CUDA_MODULE.fused_log_quantize_lerp(
+                        state["res_low_q"].view(-1), state["res_low_scale"], res_temp, 1.0, curr_block_size, False, 0.0, grad_low_numel
+                    )
+                    
+                    del m_temp, res_temp
+                    
+                    if apollo_scale_type == "channel":
+                        R_low, C_low = grad_low.shape[-2], grad_low.shape[-1]
+                        if side == "right":
+                            N, D, stride_N, stride_D = R_low, C_low, C_low, 1
                         else:
-                            res_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"])
-                            res_deq.lerp_(res.flatten(), 1.0 - beta3)
-                            q, s, sh, pad = _log_quantize_nonneg(res_deq, curr_block_size)
-                            state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"] = q, s, sh, pad
+                            N, D, stride_N, stride_D = C_low, R_low, 1, C_low
                     else:
-                        state["res_low"].lerp_(res.flatten(), 1.0 - beta3)
-                
-                res_low_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"]) if quantize else state["res_low"]
-                res_low_reshaped = res_low_deq.view_as(grad_low)
-                
-                update_low = m_low_deq * res_low_reshaped.clamp(min=eps_sq).rsqrt()
+                        N, D, stride_N, stride_D = 1, grad_low_numel, grad_low_numel, 1
+
+                    norm_update = torch.zeros(N, device=grad_low.device, dtype=torch.float32)
+                    norm_grad = torch.zeros(N, device=grad_low.device, dtype=torch.float32)
+                    
+                    _CUDA_MODULE.apollo_came_compute_update_norms(
+                        state["m_low_q"].view(-1), state["m_low_scale"],
+                        state["res_low_q"].view(-1), state["res_low_scale"],
+                        grad_low.contiguous(),
+                        norm_update, norm_grad,
+                        eps_sq, N, D, stride_N, stride_D, grad_low_numel,
+                        m_curr_block_size, curr_block_size
+                    )
+                    
+                    scaling_factor = norm_update / (norm_grad + 1e-8)
+                    if apollo_scale_type == "channel":
+                        scaling_factor = scaling_factor.unsqueeze(1 if side == "right" else 0)
+                    scaling_factor_computed = True
+                else:
+                    v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+                    v_low_reshaped = v_low_deq.view_as(grad_low)
+                    
+                    U_t = grad_low * v_low_reshaped.clamp(min=eps_sq).rsqrt()
+                    rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
+                    U_t.div_(torch.clamp(rms_u / d, min=1.0))
+                    
+                    if "m_low_q" in state:
+                        m_temp = _dequantize_4bit(state["m_low_q"], state["m_low_scale"], grad_low.numel(), grad_low.shape, m_curr_block_size, grad_low.device)
+                    else:
+                        m_temp = torch.zeros_like(grad_low)
+                    m_temp.lerp_(U_t, 1.0 - beta1)
+                    state["m_low_q"], state["m_low_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
+                    m_low_deq = m_temp
+                    del m_temp
+                    
+                    res = (U_t - m_low_deq).square() + eps_came
+                    del U_t
+                    
+                    res_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"])
+                    res_deq.lerp_(res.flatten(), 1.0 - beta3)
+                    q, s, sh, pad = _log_quantize_nonneg(res_deq, curr_block_size)
+                    state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"] = q, s, sh, pad
+                    
+                    res_low_deq = _log_dequantize_nonneg(state["res_low_q"], state["res_low_scale"], state["res_low_shape"], state["res_low_pad"])
+                    res_low_reshaped = res_low_deq.view_as(grad_low)
+                    update_low = m_low_deq * res_low_reshaped.clamp(min=eps_sq).rsqrt()
             else:
+                v_low_deq = _log_dequantize_nonneg(state["v_low_q"], state["v_low_scale"], state["v_low_shape"], state["v_low_pad"]) if quantize else state["v_low"]
+                v_low_reshaped = v_low_deq.view_as(grad_low)
+                
+                U_t = grad_low * v_low_reshaped.clamp(min=eps_sq).rsqrt()
+                rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
+                U_t.div_(torch.clamp(rms_u / d, min=1.0))
                 update_low = U_t
 
         else:
