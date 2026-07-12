@@ -26,6 +26,7 @@ optimizer_rmsprop = Adafactor8Bit(
     scale_parameter=False,     # Disable Adafactor RMS scaling
     d=1e9,                     # Disable Adafactor global RMS clipping
     relative_step=False,       # Use constant external LR
+    factored=False,            # Use full-rank variance
 )
 
 # ==============================================================================
@@ -41,6 +42,7 @@ optimizer_adam = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
+    factored=False,           
 )
 
 # ==============================================================================
@@ -57,6 +59,7 @@ optimizer_adamw = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
+    factored=False,
 )
 
 # ==============================================================================
