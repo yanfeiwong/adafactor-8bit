@@ -86,9 +86,31 @@ optimizer_adafactor_continual = Adafactor8Bit(
 # 6. APOLLO
 # Low-rank subspace projection with decoupled weight decay and constant learning rate.
 # Fira Norm-Growth Limiter is inherently active in the APOLLO path.
+# Note: Official APOLLO only applies projection to 'attn' and 'mlp' 2D weights.
 # ==============================================================================
+
+# Simple inline grouping to match official APOLLO behavior
+apollo_params = []
+regular_params = []
+for name, param in model.named_parameters():
+    if not param.requires_grad: continue
+    if param.ndim == 2 and any(t in name for t in ["attn", "mlp"]):
+        apollo_params.append(param)
+    else:
+        regular_params.append(param)
+
+param_groups_apollo = [
+    {"params": regular_params}, # Will use default apollo_rank=0 (AdamW behavior)
+    {
+        "params": apollo_params,
+        "apollo_rank": 256,               # Enable APOLLO projection
+        "apollo_scale_type": 'channel',   # 'channel' (Standard) or 'tensor' (Mini)
+        "apollo_update_proj_gap": 200,    # Steps between random projection matrix refreshes
+    }
+]
+
 optimizer_apollo = Adafactor8Bit(
-    model.parameters(),
+    param_groups_apollo,
     lr=ADAM_STYLE_LR,
     beta1=0.9,
     beta2=0.999,
@@ -97,9 +119,6 @@ optimizer_apollo = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
-    apollo_rank=256,               # Enable APOLLO projection
-    apollo_scale_type='channel',   # 'channel' (Standard) or 'tensor' (Mini)
-    apollo_update_proj_gap=200,    # Steps between random projection matrix refreshes
 )
 
 # ==============================================================================
@@ -107,8 +126,21 @@ optimizer_apollo = Adafactor8Bit(
 # Extreme memory savings with rank=1 projection. 
 # Relies on momentum (beta1) to smooth projection noise and a heuristic scale factor.
 # ==============================================================================
+
+# Re-use the same grouping logic defined above
+param_groups_apollo_mini = [
+    {"params": regular_params},
+    {
+        "params": apollo_params,
+        "apollo_rank": 1,               # Extreme low-rank projection
+        "apollo_scale_type": 'tensor',  # Global norm matching recommended for Mini
+        "apollo_scale": 128.0,          # Heuristic multiplier to compensate for rank=1 attenuation
+        "apollo_update_proj_gap": 200,
+    }
+]
+
 optimizer_apollo_mini = Adafactor8Bit(
-    model.parameters(),
+    param_groups_apollo_mini,
     lr=ADAM_STYLE_LR,
     beta1=0.9,                 # Crucial for smoothing rank=1 projection noise
     beta2=0.999,
@@ -117,10 +149,6 @@ optimizer_apollo_mini = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
-    apollo_rank=1,               # Extreme low-rank projection
-    apollo_scale_type='tensor',  # Global norm matching recommended for Mini
-    apollo_scale=128.0,          # Heuristic multiplier to compensate for rank=1 attenuation
-    apollo_update_proj_gap=200,
 )
 
 # ==============================================================================
@@ -134,6 +162,7 @@ optimizer_came = Adafactor8Bit(
     beta1=0.9,
     beta2=0.999,
     beta3=0.9999,              # Enable CAME confidence guidance
+    eps_came=1e-16,            # Align with official CAME residual epsilon
     weight_decay=1e-2,
     scale_weight_decay=False,
     scale_parameter=False,
