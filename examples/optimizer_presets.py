@@ -27,6 +27,7 @@ optimizer_rmsprop = Adafactor8Bit(
     d=1e9,                     # Disable Adafactor global RMS clipping
     relative_step=False,       # Use constant external LR
     factored=False,            # Use full-rank variance
+    eps=(1e-8, 1e-3),          # Align with PyTorch RMSprop/Adam eps
 )
 
 # ==============================================================================
@@ -42,7 +43,8 @@ optimizer_adam = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
-    factored=False,           
+    factored=False,  
+    eps=(1e-8, 1e-3),         
 )
 
 # ==============================================================================
@@ -60,6 +62,7 @@ optimizer_adamw = Adafactor8Bit(
     d=1e9,
     relative_step=False,
     factored=False,
+    eps=(1e-8, 1e-3),
 )
 
 # ==============================================================================
@@ -119,6 +122,7 @@ optimizer_apollo = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
+    eps=(1e-8, 1e-3),
 )
 
 # ==============================================================================
@@ -149,6 +153,7 @@ optimizer_apollo_mini = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
+    eps=(1e-8, 1e-3),
 )
 
 # ==============================================================================
