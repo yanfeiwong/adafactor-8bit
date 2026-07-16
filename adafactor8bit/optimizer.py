@@ -229,11 +229,13 @@ class Adafactor8Bit(Optimizer):
         apollo_scale_front (bool): If ``True``, applies ``apollo_scale`` before the Fira 
             Norm-Growth Limiter. If ``False``, applies it after. Defaults to False.
         apollo_eps (float): Epsilon for APOLLO low-rank variance normalization to prevent division by zero. 
-            Independent of `eps1`. Defaults to 1e-8.
+            Independent of `eps1`. Defaults to 1e-6.
         apollo_factorize (bool): If True, applies Adafactor-style row/col factorization 
             within the low-rank space (FP32, ~16KB state) instead of full matrix variance 
             (8-bit, ~100KB+ state) to drastically reduce optimizer state memory. Defaults to False.
-            
+        apollo_cache_proj (bool): If ``True``, caches the APOLLO random projection matrix in the 
+            optimizer state to avoid the computational overhead of regenerating it at every step. 
+            Defaults to False.
         --- Stabilizers & Regularization ---
         scale_weight_decay (bool): If `True` (default), weight decay is coupled with the 
             parameter's RMS scale. If `False`, decoupled (AdamW-style).
@@ -273,8 +275,9 @@ class Adafactor8Bit(Optimizer):
         apollo_scale_type: str = 'channel',
         apollo_scale: float = 1.0,
         apollo_scale_front: bool = False,
-        apollo_eps: float = 1e-8,
+        apollo_eps: float = 1e-6,
         apollo_factorize: bool = False,
+        apollo_cache_proj: bool = False,
         # --- Stabilizers & Regularization ---
         scale_weight_decay: bool = True,
         enable_fira_for_adafactor: bool = False,
@@ -331,7 +334,7 @@ class Adafactor8Bit(Optimizer):
             apollo_rank=apollo_rank, apollo_update_proj_gap=apollo_update_proj_gap,
             apollo_scale_type=apollo_scale_type, apollo_scale=apollo_scale, 
             apollo_scale_front=apollo_scale_front, apollo_eps=apollo_eps, 
-            apollo_factorize=apollo_factorize,
+            apollo_factorize=apollo_factorize, apollo_cache_proj=apollo_cache_proj,
             # Stabilizers & Regularization
             scale_weight_decay=scale_weight_decay, 
             enable_fira_for_adafactor=enable_fira_for_adafactor, fira_margin=fira_margin,
@@ -465,6 +468,7 @@ class Adafactor8Bit(Optimizer):
                     state["beta3"] = beta3
                     state["apollo_update_proj_gap"] = update_proj_gap
                     state["last_proj_step"] = -update_proj_gap
+                    state["apollo_proj_matrix_T"] = None
                     state["v_low_q"] = None
                     state["v_low_scale"] = None
                     state["v_low_shape"] = None
@@ -731,8 +735,9 @@ class Adafactor8Bit(Optimizer):
                         apollo_scale_type=group.get("apollo_scale_type", "channel"),
                         apollo_scale=group.get("apollo_scale", 1.0),
                         apollo_scale_front=group.get("apollo_scale_front", False),
-                        apollo_eps=group.get("apollo_eps", 1e-8),
+                        apollo_eps=group.get("apollo_eps", 1e-6),
                         apollo_factorize=group.get("apollo_factorize", False),
+                        apollo_cache_proj=group.get("apollo_cache_proj", False),
                         fira_margin=group.get("fira_margin", 0.01),
                         eps_came=group.get("eps_came", 1e-8),
                         beta3=group.get("beta3"),
@@ -842,6 +847,11 @@ def _update_param_8bit(
         eps1 = 1e-30
     eps_sq = max(eps1 * eps1, torch.finfo(torch.float32).tiny)
     log_eps_sq = math.log2(eps_sq)
+    
+    # Differentiate eps semantics between Adam and Adafactor paths.
+    # Adafactor (factored=True): eps is added to squared gradients (aligns with HF).
+    # Adam (factored=False): eps is strictly a denominator lower bound, not added to gradients (aligns with PyTorch).
+    eps_for_grad_sq = eps1 if factored else 0.0
 
     grad_contig = grad.contiguous()
     if maximize:
@@ -902,7 +912,7 @@ def _update_param_8bit(
     if is_full_rank:
         if quantize:
             if _load_cuda_module(use_cuda_kernel):
-                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32.view(-1), beta_val, curr_block_size, True, eps1, N)
+                _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32.view(-1), beta_val, curr_block_size, True, eps_for_grad_sq, N)
                 
                 numel = param_work.numel()
                 grad_fp32_flat = grad_fp32.view(-1)
@@ -950,7 +960,11 @@ def _update_param_8bit(
                         total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
                     )
             else:
-                grad_sq = grad_fp32.square().add_(eps1)
+                if not factored:
+                    grad_sq = grad_fp32.square()
+                else:
+                    grad_sq = grad_fp32.square().add_(eps1)
+                    
                 variance = _log_dequantize_nonneg(state["variance_q"], state["variance_scale"], state["variance_shape"], state["variance_pad"])
                 variance.lerp_(grad_sq, beta_val)
                 del grad_sq
@@ -1410,13 +1424,17 @@ def _update_param_8bit(
 
 
 def _get_apollo_proj_matrix(state: Dict[str, Any], shape: torch.Size, step: int,
-                            dtype: torch.dtype, device: torch.device) -> Tuple[Tensor, bool]:
+                            dtype: torch.dtype, device: torch.device, 
+                            cache_proj: bool = False) -> Tuple[Tensor, bool]:
     rank = int(state["apollo_rank"])
     update_proj_gap = int(state["apollo_update_proj_gap"])
     last_proj_step = int(state.get("last_proj_step", -update_proj_gap))
     
     needs_refresh = (step - last_proj_step) >= update_proj_gap
-    
+
+    if not needs_refresh and cache_proj and state.get("apollo_proj_matrix_T") is not None:
+        return state["apollo_proj_matrix_T"], False
+        
     if needs_refresh:
         state["current_proj_seed"] = int(state["apollo_seed"])
         state["apollo_seed"] = next_seed(state["current_proj_seed"])
@@ -1428,8 +1446,12 @@ def _get_apollo_proj_matrix(state: Dict[str, Any], shape: torch.Size, step: int,
 
     current_seed = state.get("current_proj_seed", state["apollo_seed"])
     proj = stable_randn(m_shape, seed=current_seed, device=device, dtype=dtype) / math.sqrt(rank)
+    proj_T = proj.T.to(dtype).contiguous()
     
-    return proj, needs_refresh 
+    if cache_proj:
+        state["apollo_proj_matrix_T"] = proj_T
+        
+    return proj_T, needs_refresh 
 
 
 def _update_param_apollo(
@@ -1442,6 +1464,7 @@ def _update_param_apollo(
     block_size: int, m_block_size: int, use_cuda_kernel: bool,
     apollo_scale_type: str, apollo_scale: float, apollo_scale_front: bool, apollo_eps: float,
     apollo_factorize: bool,
+    apollo_cache_proj: bool = False,
     fira_margin: float = 0.01,
     eps_came: float = 1e-8,
     beta3: Optional[float] = None,
@@ -1483,14 +1506,13 @@ def _update_param_apollo(
         alpha_t = rho_t
 
     shape = grad_work.shape
-    proj_matrix, is_proj_refreshed = _get_apollo_proj_matrix(
-        state, shape, step, dtype=torch.float32, device=grad_work.device
+    proj_matrix_T, is_proj_refreshed = _get_apollo_proj_matrix(
+        state, shape, step, dtype=grad_work.dtype, device=grad_work.device, cache_proj=apollo_cache_proj
     )
 
     R, C = shape[-2], shape[-1]
     side = "right" if R >= C else "left"
     
-    proj_matrix_T = proj_matrix.T.to(grad_work.dtype)
     if side == "right":
         grad_low = torch.matmul(grad_work, proj_matrix_T).float()
     else:
@@ -1951,7 +1973,7 @@ def _update_param_apollo(
     if apollo_scale_type == "channel":
         del norm_G_sq, norm_G
         
-    del grad_low, scaling_factor, final_scale, proj_matrix_T, proj_matrix
+    del grad_low, scaling_factor, final_scale, proj_matrix_T
     del update_low
     
     if needs_copy_back:

@@ -122,7 +122,8 @@ optimizer_apollo = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
-    eps=(1e-8, 1e-3),
+    apollo_eps = 1e-6,
+    eps=(1e-6, 1e-3),
 )
 
 # ==============================================================================
@@ -153,7 +154,8 @@ optimizer_apollo_mini = Adafactor8Bit(
     scale_parameter=False,
     d=1e9,
     relative_step=False,
-    eps=(1e-8, 1e-3),
+    apollo_eps = 1e-6,
+    eps=(1e-6, 1e-3),
 )
 
 # ==============================================================================
