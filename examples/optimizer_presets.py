@@ -14,7 +14,24 @@ ADAM_STYLE_LR = 1e-4
 ADAFACTOR_STYLE_LR = 1e-3
 
 # ==============================================================================
-# 1. RMSprop
+# 1. SGD
+# Pure first-order update. Set beta1=0.9 to enable classical momentum.
+# ==============================================================================
+optimizer_sgd = Adafactor8Bit(
+    model.parameters(),
+    lr=ADAM_STYLE_LR,
+    beta1=None,                # Disable momentum
+    beta2=None,                # Disable second moment
+    beta2_decay=None,          # Enter SGD mode
+    weight_decay=0.0,
+    scale_parameter=False,     # Disable RMS scaling
+    d=1e9,                     # Disable global RMS clipping
+    relative_step=False,       # Required for SGD mode
+    factored=False,
+)
+
+# ==============================================================================
+# 2. RMSprop
 # Strips momentum, weight decay, RMS scaling, and global clipping.
 # ==============================================================================
 optimizer_rmsprop = Adafactor8Bit(
@@ -31,7 +48,7 @@ optimizer_rmsprop = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 2. Adam
+# 3. Adam
 # Adds momentum back to the RMSprop configuration.
 # ==============================================================================
 optimizer_adam = Adafactor8Bit(
@@ -48,7 +65,7 @@ optimizer_adam = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 3. AdamW
+# 4. AdamW
 # Adds decoupled weight decay to the Adam configuration.
 # ==============================================================================
 optimizer_adamw = Adafactor8Bit(
@@ -66,7 +83,7 @@ optimizer_adamw = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 4. Adafactor (Native Default)
+# 5. Adafactor (Native Default)
 # Utilizes Adafactor's native relative step sizing, RMS scaling, and factorization.
 # ==============================================================================
 optimizer_adafactor = Adafactor8Bit(
@@ -75,7 +92,7 @@ optimizer_adafactor = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 5. Adafactor (Continual / Lifelong Learning)
+# 6. Adafactor (Continual / Lifelong Learning)
 # Locks the EMA window and disables internal LR scheduling to prevent "blunting".
 # ==============================================================================
 optimizer_adafactor_continual = Adafactor8Bit(
@@ -86,7 +103,7 @@ optimizer_adafactor_continual = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 6. APOLLO
+# 7. APOLLO
 # Low-rank subspace projection with decoupled weight decay and constant learning rate.
 # Fira Norm-Growth Limiter is inherently active in the APOLLO path.
 # Note: Official APOLLO only applies projection to 'attn' and 'mlp' 2D weights.
@@ -127,7 +144,7 @@ optimizer_apollo = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 7. APOLLO-Mini
+# 8. APOLLO-Mini
 # Extreme memory savings with rank=1 projection. 
 # Relies on momentum (beta1) to smooth projection noise and a heuristic scale factor.
 # ==============================================================================
@@ -159,7 +176,7 @@ optimizer_apollo_mini = Adafactor8Bit(
 )
 
 # ==============================================================================
-# 8. CAME
+# 9. CAME
 # Confidence-guided adaptive optimization with momentum and decoupled weight decay.
 # Requires beta1. Mutually exclusive with apollo_rank.
 # ==============================================================================

@@ -462,16 +462,22 @@ void apply_update_2d_cuda(
 __global__ void compute_update_norm_1d_kernel(
     const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
     const float* __restrict__ grad, float* __restrict__ total_sum_sq,
-    float log_eps_sq, int numel, int block_size)
+    float log_eps_sq, int numel, int block_size, float eps_for_denom, bool use_adam_denom)
 {
     float sq = 0.0f;
     int stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
         
-        float max_log = fmaxf(log_v, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
+        float inv_std;
+        if (use_adam_denom) {
+            float v_val = exp2f(fmaxf(log_v, -53.0f));
+            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
+        } else {
+            float max_log = fmaxf(log_v, log_eps_sq);
+            max_log = fmaxf(max_log, -53.0f); 
+            inv_std = exp2f(-0.5f * max_log); 
+        }
         
         float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float u_val = g_val * inv_std;
@@ -496,13 +502,15 @@ __global__ void compute_update_norm_1d_kernel(
 
 void compute_update_norm_1d_cuda(
     torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor grad, torch::Tensor total_sum_sq, float log_eps_sq, int numel, int block_size)
+    torch::Tensor grad, torch::Tensor total_sum_sq, float log_eps_sq, int numel, int block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
     compute_update_norm_1d_kernel<<<blocks, threads>>>(
         variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-        grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(), log_eps_sq, numel, block_size
+        grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(), log_eps_sq, numel, block_size,
+        eps_for_denom, use_adam_denom
     );
 }
 
@@ -511,7 +519,7 @@ __global__ void apply_update_1d_kernel(
     scalar_t* __restrict__ param, const float* __restrict__ grad,
     const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
     const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    float d, float log_eps_sq, int numel, int block_size)
+    float d, float log_eps_sq, int numel, int block_size, float eps_for_denom, bool use_adam_denom)
 {
     float sum_sq_val = *sum_sq_ptr;
     float alpha_val = *alpha;
@@ -522,9 +530,15 @@ __global__ void apply_update_1d_kernel(
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
         
-        float max_log = fmaxf(log_v, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
+        float inv_std;
+        if (use_adam_denom) {
+            float v_val = exp2f(fmaxf(log_v, -53.0f));
+            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
+        } else {
+            float max_log = fmaxf(log_v, log_eps_sq);
+            max_log = fmaxf(max_log, -53.0f); 
+            inv_std = exp2f(-0.5f * max_log); 
+        }
         
         float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float u_val = g_val * inv_std;
@@ -538,7 +552,8 @@ __global__ void apply_update_1d_kernel(
 void apply_update_1d_cuda(
     torch::Tensor param, torch::Tensor grad,
     torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int block_size)
+    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
@@ -547,7 +562,8 @@ void apply_update_1d_cuda(
             apply_update_1d_kernel<scalar_t><<<blocks, threads>>>(
                 param.data_ptr<scalar_t>(), grad.data_ptr<float>(),
                 variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, block_size
+                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, block_size,
+                eps_for_denom, use_adam_denom
             );
         }));
 }
@@ -695,7 +711,8 @@ void apply_update_m_2d_cuda(
 __global__ void compute_update_norm_m_1d_kernel(
     const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
     const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
-    float* __restrict__ total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size)
+    float* __restrict__ total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     float sq = 0.0f;
     int stride = gridDim.x * blockDim.x;
@@ -707,9 +724,15 @@ __global__ void compute_update_norm_m_1d_kernel(
         
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
         
-        float max_log = fmaxf(log_v, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
+        float inv_std;
+        if (use_adam_denom) {
+            float v_val = exp2f(fmaxf(log_v, -53.0f));
+            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
+        } else {
+            float max_log = fmaxf(log_v, log_eps_sq);
+            max_log = fmaxf(max_log, -53.0f); 
+            inv_std = exp2f(-0.5f * max_log); 
+        }
         
         float u_val = m_val * inv_std;
         sq += u_val * u_val;
@@ -733,14 +756,16 @@ __global__ void compute_update_norm_m_1d_kernel(
 void compute_update_norm_m_1d_cuda(
     torch::Tensor m_q, torch::Tensor m_scale,
     torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size)
+    torch::Tensor total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
     compute_update_norm_m_1d_kernel<<<blocks, threads>>>(
         m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
         variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-        total_sum_sq.data_ptr<float>(), log_eps_sq, numel, m_block_size, v_block_size
+        total_sum_sq.data_ptr<float>(), log_eps_sq, numel, m_block_size, v_block_size,
+        eps_for_denom, use_adam_denom
     );
 }
 
@@ -750,7 +775,8 @@ __global__ void apply_update_m_1d_kernel(
     const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
     const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
     const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    float d, float log_eps_sq, int numel, int m_block_size, int v_block_size)
+    float d, float log_eps_sq, int numel, int m_block_size, int v_block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     float sum_sq_val = *sum_sq_ptr;
     float alpha_val = *alpha;
@@ -766,9 +792,15 @@ __global__ void apply_update_m_1d_kernel(
         
         float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
         
-        float max_log = fmaxf(log_v, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
+        float inv_std;
+        if (use_adam_denom) {
+            float v_val = exp2f(fmaxf(log_v, -53.0f));
+            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
+        } else {
+            float max_log = fmaxf(log_v, log_eps_sq);
+            max_log = fmaxf(max_log, -53.0f); 
+            inv_std = exp2f(-0.5f * max_log); 
+        }
         
         float u_val = m_val * inv_std;
 
@@ -782,7 +814,8 @@ void apply_update_m_1d_cuda(
     torch::Tensor param, 
     torch::Tensor m_q, torch::Tensor m_scale,
     torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int m_block_size, int v_block_size)
+    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int m_block_size, int v_block_size,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
@@ -792,7 +825,8 @@ void apply_update_m_1d_cuda(
                 param.data_ptr<scalar_t>(), 
                 m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
                 variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, m_block_size, v_block_size
+                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, m_block_size, v_block_size,
+                eps_for_denom, use_adam_denom
             );
         }));
 }
@@ -926,7 +960,7 @@ __global__ void compute_update_norm_1d_full_kernel(
     float* __restrict__ variance,
     const float* __restrict__ grad,
     float* __restrict__ total_sum_sq,
-    float beta, float eps_sq, int numel)
+    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     float sq = 0.0f;
     int stride = gridDim.x * blockDim.x;
@@ -937,7 +971,13 @@ __global__ void compute_update_norm_1d_full_kernel(
         float g2 = g * g;
         float v = one_minus_b * variance[idx] + beta * g2;
         variance[idx] = v;
-        float inv_std = rsqrtf(fmaxf(v, eps_sq));
+        
+        float inv_std;
+        if (use_adam_denom) {
+            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
+        } else {
+            inv_std = rsqrtf(fmaxf(v, eps_sq));
+        }
         float u = g * inv_std;
         sq += u * u;
     }
@@ -960,13 +1000,13 @@ __global__ void compute_update_norm_1d_full_kernel(
 
 void compute_update_norm_1d_full_cuda(
     torch::Tensor variance, torch::Tensor grad, torch::Tensor total_sum_sq, 
-    float beta, float eps_sq, int numel)
+    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
     compute_update_norm_1d_full_kernel<<<blocks, threads>>>(
         variance.data_ptr<float>(), grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(),
-        beta, eps_sq, numel
+        beta, eps_sq, numel, eps_for_denom, use_adam_denom
     );
 }
 
@@ -980,7 +1020,7 @@ __global__ void apply_update_1d_full_kernel(
     const float* __restrict__ grad,
     const float* __restrict__ sum_sq_ptr,
     const float* __restrict__ alpha,
-    float d, float eps_sq, int numel)
+    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     float sum_sq_val = *sum_sq_ptr;
     float alpha_val = *alpha;
@@ -991,7 +1031,13 @@ __global__ void apply_update_1d_full_kernel(
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
         float v = variance[idx];
-        float inv_std = rsqrtf(fmaxf(v, eps_sq));
+        
+        float inv_std;
+        if (use_adam_denom) {
+            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
+        } else {
+            inv_std = rsqrtf(fmaxf(v, eps_sq));
+        }
         float u = g * inv_std;
 
         float p_val = static_cast<float>(param[idx]);
@@ -1002,7 +1048,8 @@ __global__ void apply_update_1d_full_kernel(
 
 void apply_update_1d_full_cuda(
     torch::Tensor param, torch::Tensor variance, torch::Tensor grad,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel)
+    torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
@@ -1010,7 +1057,8 @@ void apply_update_1d_full_cuda(
         param.scalar_type(), "apply_update_1d_full_cuda", ([&] {
             apply_update_1d_full_kernel<scalar_t><<<blocks, threads>>>(
                 param.data_ptr<scalar_t>(), variance.data_ptr<float>(), grad.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel
+                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel,
+                eps_for_denom, use_adam_denom
             );
         }));
 }
@@ -1025,7 +1073,7 @@ __global__ void compute_update_norm_1d_full_m_kernel(
     float* __restrict__ m,
     const float* __restrict__ grad,
     float* __restrict__ total_sum_sq,
-    float beta1, float beta_val, float eps_sq, int numel)
+    float beta1, float beta_val, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     float sq = 0.0f;
     int stride = gridDim.x * blockDim.x;
@@ -1042,7 +1090,12 @@ __global__ void compute_update_norm_1d_full_m_kernel(
         float m_new = beta1 * m[idx] + one_minus_b1 * g;
         m[idx] = m_new;
         
-        float inv_std = rsqrtf(fmaxf(v, eps_sq));
+        float inv_std;
+        if (use_adam_denom) {
+            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
+        } else {
+            inv_std = rsqrtf(fmaxf(v, eps_sq));
+        }
         float u = m_new * inv_std;
         sq += u * u;
     }
@@ -1065,13 +1118,13 @@ __global__ void compute_update_norm_1d_full_m_kernel(
 
 void compute_update_norm_1d_full_m_cuda(
     torch::Tensor variance, torch::Tensor m, torch::Tensor grad, torch::Tensor total_sum_sq, 
-    float beta1, float beta_val, float eps_sq, int numel)
+    float beta1, float beta_val, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
     compute_update_norm_1d_full_m_kernel<<<blocks, threads>>>(
         variance.data_ptr<float>(), m.data_ptr<float>(), grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(),
-        beta1, beta_val, eps_sq, numel
+        beta1, beta_val, eps_sq, numel, eps_for_denom, use_adam_denom
     );
 }
 
@@ -1085,7 +1138,7 @@ __global__ void apply_update_1d_full_m_kernel(
     const float* __restrict__ m,
     const float* __restrict__ sum_sq_ptr,
     const float* __restrict__ alpha,
-    float d, float eps_sq, int numel)
+    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
 {
     float sum_sq_val = *sum_sq_ptr;
     float alpha_val = *alpha;
@@ -1096,7 +1149,13 @@ __global__ void apply_update_1d_full_m_kernel(
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
         float v = variance[idx];
         float m_val = m[idx];
-        float inv_std = rsqrtf(fmaxf(v, eps_sq));
+        
+        float inv_std;
+        if (use_adam_denom) {
+            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
+        } else {
+            inv_std = rsqrtf(fmaxf(v, eps_sq));
+        }
         float u = m_val * inv_std;
 
         float p_val = static_cast<float>(param[idx]);
@@ -1107,7 +1166,8 @@ __global__ void apply_update_1d_full_m_kernel(
 
 void apply_update_1d_full_m_cuda(
     torch::Tensor param, torch::Tensor variance, torch::Tensor m,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel)
+    torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel,
+    float eps_for_denom, bool use_adam_denom)
 {
     int threads = 256;
     int blocks = min(1024, (numel + threads - 1) / threads);
@@ -1115,7 +1175,8 @@ void apply_update_1d_full_m_cuda(
         param.scalar_type(), "apply_update_1d_full_m_cuda", ([&] {
             apply_update_1d_full_m_kernel<scalar_t><<<blocks, threads>>>(
                 param.data_ptr<scalar_t>(), variance.data_ptr<float>(), m.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel
+                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel,
+                eps_for_denom, use_adam_denom
             );
         }));
 }

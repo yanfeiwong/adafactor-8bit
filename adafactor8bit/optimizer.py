@@ -243,6 +243,11 @@ class Adafactor8Bit(Optimizer):
             explosion by smoothing update norms. Defaults to False.
         fira_margin (float): The tolerance margin for Fira Limiter (e.g., 0.01 for 1%). 
             Shared with Apollo path. Defaults to 0.01.
+        bias_correction (bool, optional): Override the default bias correction behavior.
+            - If `None` (default), uses algorithm-specific defaults (Enabled for Adam/Apollo, 
+              Disabled for Adafactor/CAME to match official implementations).
+            - If `True`, forces bias correction on all momentum-based paths.
+            - If `False`, forces bias correction off.
     """
     
     def __init__(
@@ -252,7 +257,7 @@ class Adafactor8Bit(Optimizer):
         lr: float = 1e-2,
         beta1: Optional[float] = None,
         beta2: Optional[float] = None,
-        beta2_decay: float = -0.8,
+        beta2_decay: Optional[float] = -0.8,
         beta3: Optional[float] = None,
         eps_came: float = 1e-8,
         eps: Tuple[Optional[float], float] = (1e-30, 1e-3),
@@ -282,12 +287,31 @@ class Adafactor8Bit(Optimizer):
         scale_weight_decay: bool = True,
         enable_fira_for_adafactor: bool = False,
         fira_margin: float = 0.01,
+        bias_correction: Optional[bool] = None,
     ):
         
         if lr < 0.0: raise ValueError(f"Invalid lr: {lr}, must be >= 0.0")
         if beta1 is not None and (beta1 < 0.0 or beta1 >= 1.0):
             raise ValueError(f"Invalid beta1: {beta1}, must be in [0.0, 1.0)")
-        if beta2_decay > 0.0: raise ValueError(f"Invalid beta2_decay: {beta2_decay}, must be <= 0.0")
+        
+        if beta2_decay is not None and beta2_decay > 0.0: raise ValueError(f"Invalid beta2_decay: {beta2_decay}, must be <= 0.0")
+
+        is_sgd_mode = (beta2 is None) and (beta2_decay is None)
+        if is_sgd_mode:
+            if relative_step:
+                raise ValueError(
+                    "When `beta2` and `beta2_decay` are both None, `relative_step` must be False. "
+                    "Please set `relative_step=False` for standard SGD, or specify `beta2`/`beta2_decay` to use adaptive optimizers."
+                )
+            if apollo_rank > 0:
+                raise ValueError(
+                    "APOLLO requires a second-moment estimate (`beta2` or `beta2_decay`), but both are currently None."
+                )
+            if beta3 is not None:
+                raise ValueError(
+                    "CAME (`beta3`) requires both `beta1` and `beta2`, but `beta2` is currently None."
+                )
+
         eps1, eps2 = eps
         if eps1 is None:
             eps1 = 1e-30
@@ -338,6 +362,7 @@ class Adafactor8Bit(Optimizer):
             # Stabilizers & Regularization
             scale_weight_decay=scale_weight_decay, 
             enable_fira_for_adafactor=enable_fira_for_adafactor, fira_margin=fira_margin,
+            bias_correction=bias_correction,
         )
         super().__init__(params, defaults)
 
@@ -394,7 +419,11 @@ class Adafactor8Bit(Optimizer):
         apollo_factorize = group.get("apollo_factorize", False)
         factored = group.get("factored", True)
         beta1 = group.get("beta1")
+        beta2 = group.get("beta2")
+        beta2_decay = group.get("beta2_decay")
         beta3 = group.get("beta3")
+        
+        is_sgd_mode = (beta2 is None) and (beta2_decay is None)
 
         for p in group["params"]:
             if p.grad is None: continue
@@ -457,7 +486,16 @@ class Adafactor8Bit(Optimizer):
                 state["is_quantized"] = use_quant
                 state["block_size"] = block_size
 
-                if use_apollo:
+                if is_sgd_mode:
+                    if beta1 is not None:
+                        if use_quant:
+                            m_padded_numel = ((p.numel() + m_block_size - 1) // m_block_size) * m_block_size
+                            state["m_q"] = torch.full((m_padded_numel // 2,), 0x88, dtype=torch.uint8, device=p.device)
+                            state["m_scale"] = torch.ones(m_padded_numel // m_block_size, dtype=torch.float32, device=p.device)
+                            state["m_block_size"] = m_block_size
+                        else:
+                            state["m"] = torch.zeros_like(p.grad, dtype=torch.float32, device=p.device, memory_format=torch.preserve_format)
+                elif use_apollo:
                     seed = self._apollo_seed_counter
                     self._apollo_seed_counter += 1
                     update_proj_gap = group.get("apollo_update_proj_gap", 200)
@@ -741,6 +779,7 @@ class Adafactor8Bit(Optimizer):
                         fira_margin=group.get("fira_margin", 0.01),
                         eps_came=group.get("eps_came", 1e-8),
                         beta3=group.get("beta3"),
+                        bias_correction=group.get("bias_correction"),
                     )
                 else:
                     _update_param_8bit(
@@ -759,6 +798,7 @@ class Adafactor8Bit(Optimizer):
                         factored=group.get("factored", True),
                         beta3=group.get("beta3"),
                         eps_came=group.get("eps_came", 1e-8),
+                        bias_correction=group.get("bias_correction"),
                     )
         return loss
 
@@ -842,11 +882,15 @@ def _update_param_8bit(
     factored: bool = True,
     beta3: Optional[float] = None,
     eps_came: float = 1e-8,
+    bias_correction: Optional[bool] = None,
 ):
     if eps1 is None:
         eps1 = 1e-30
     eps_sq = max(eps1 * eps1, torch.finfo(torch.float32).tiny)
     log_eps_sq = math.log2(eps_sq)
+    
+    use_adam_denom = (not factored) and (beta1 is not None) and (beta2 is not None) and (not relative_step)
+    eps_for_denom = eps1 if use_adam_denom else 0.0
     
     # Differentiate eps semantics between Adam and Adafactor paths.
     # Adafactor (factored=True): eps is added to squared gradients (aligns with HF).
@@ -874,7 +918,11 @@ def _update_param_8bit(
     step = state["step"] + 1
     state["step"] = step 
 
-    if beta2 is not None:
+    is_sgd = (beta2 is None) and (beta2_decay is None)
+    
+    if is_sgd:
+        beta_val = 0.0
+    elif beta2 is not None:
         beta_val = 1.0 - beta2
     else:
         beta_val = math.pow(step, beta2_decay)
@@ -895,21 +943,60 @@ def _update_param_8bit(
     else:
         alpha = rho_t
 
-    if beta1 is not None and not relative_step:
-        bc1 = 1.0 - beta1 ** step
-        if beta2 is not None:
-            bc2 = 1.0 - beta2 ** step
-            alpha = alpha * (math.sqrt(bc2) / bc1)
-        else:
-            alpha = alpha / bc1
+    if beta1 is not None and not relative_step and not is_sgd:
+        apply_bc = use_adam_denom if bias_correction is None else bias_correction
+        if apply_bc:
+            bc1 = 1.0 - beta1 ** step
+            if beta2 is not None:
+                bc2 = 1.0 - beta2 ** step
+                alpha = alpha * (math.sqrt(bc2) / bc1)
+                if use_adam_denom:
+                    eps_for_denom = eps1 * math.sqrt(bc2)
+            else:
+                alpha = alpha / bc1
 
     if weight_decay != 0:
         wd_multiplier = alpha if scale_weight_decay else rho_t
         param_work.mul_(1.0 - (wd_multiplier * weight_decay))
 
-    is_full_rank = (grad_fp32.dim() < 2) or (not factored)
+    is_full_rank = (grad_fp32.dim() < 2) or (not factored) or is_sgd
 
     if is_full_rank:
+        if is_sgd:
+            if beta1 is not None:
+                if quantize:
+                    if _load_cuda_module(use_cuda_kernel):
+                        _CUDA_MODULE.fused_4bit_quantize_lerp(
+                            state["m_q"], state["m_scale"], grad_fp32.view(-1), beta1, m_curr_block_size, N
+                        )
+                        update = _dequantize_4bit(state["m_q"], state["m_scale"], N, grad_fp32.shape, m_curr_block_size, param_work.device)
+                    else:
+                        if "m_q" in state:
+                            update = _dequantize_4bit(state["m_q"], state["m_scale"], N, grad_fp32.shape, m_curr_block_size, param_work.device)
+                        else:
+                            update = torch.zeros_like(grad_fp32)
+                        update.lerp_(grad_fp32, 1.0 - beta1)
+                        state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(update, m_curr_block_size)
+                else:
+                    if "m" not in state:
+                        state["m"] = torch.zeros_like(grad_fp32)
+                    state["m"].lerp_(grad_fp32, 1.0 - beta1)
+                    update = state["m"]
+                
+                update = update / (1.0 - beta1)
+            else:
+                update = grad_fp32
+                
+            if enable_fira_for_adafactor:
+                update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
+            else:
+                denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
+            param_work.add_(update, alpha=-alpha / denom)
+            
+            if needs_copy_back:
+                param.copy_(param_work)
+            return
+
         if quantize:
             if _load_cuda_module(use_cuda_kernel):
                 _CUDA_MODULE.fused_log_quantize_lerp(state["variance_q"], state["variance_scale"], grad_fp32.view(-1), beta_val, curr_block_size, True, eps_for_grad_sq, N)
@@ -933,7 +1020,8 @@ def _update_param_8bit(
                     _CUDA_MODULE.compute_update_norm_m_1d(
                         m_q_flat, m_scale_flat,
                         variance_q_flat, variance_scale_flat,
-                        total_sum_sq, log_eps_sq, numel, m_curr_block_size, curr_block_size
+                        total_sum_sq, log_eps_sq, numel, m_curr_block_size, curr_block_size,
+                        eps_for_denom, use_adam_denom
                     )
                     
                     if enable_fira_for_adafactor:
@@ -943,12 +1031,14 @@ def _update_param_8bit(
                         param_work.view(-1),
                         m_q_flat, m_scale_flat,
                         variance_q_flat, variance_scale_flat,
-                        total_sum_sq, alpha, d, log_eps_sq, numel, m_curr_block_size, curr_block_size
+                        total_sum_sq, alpha, d, log_eps_sq, numel, m_curr_block_size, curr_block_size,
+                        eps_for_denom, use_adam_denom
                     )
                 else:
                     _CUDA_MODULE.compute_update_norm_1d(
                         variance_q_flat, variance_scale_flat,
-                        grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size
+                        grad_fp32_flat, total_sum_sq, log_eps_sq, numel, curr_block_size,
+                        eps_for_denom, use_adam_denom
                     )
                     
                     if enable_fira_for_adafactor:
@@ -957,7 +1047,8 @@ def _update_param_8bit(
                     _CUDA_MODULE.apply_update_1d(
                         param_work.view(-1), grad_fp32_flat,
                         variance_q_flat, variance_scale_flat,
-                        total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size
+                        total_sum_sq, alpha, d, log_eps_sq, numel, curr_block_size,
+                        eps_for_denom, use_adam_denom
                     )
             else:
                 if not factored:
@@ -980,7 +1071,10 @@ def _update_param_8bit(
                     m_temp.lerp_(grad_fp32, 1.0 - beta1)
                     del grad_fp32 
                     
-                    update = m_temp * variance.clamp_(min=eps_sq).rsqrt_()
+                    if use_adam_denom:
+                        update = m_temp / (variance.sqrt() + eps_for_denom)
+                    else:
+                        update = m_temp * variance.clamp_(min=eps_sq).rsqrt_()
                     state["m_q"], state["m_scale"] = _quantize_4bit_pytorch(m_temp, m_curr_block_size)
                     del m_temp, variance
                     
@@ -990,7 +1084,10 @@ def _update_param_8bit(
                         denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
                     param_work.add_(update, alpha=-alpha / denom)
                 else:
-                    update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
+                    if use_adam_denom:
+                        update = grad_fp32 / (variance.sqrt() + eps_for_denom)
+                    else:
+                        update = variance.clamp_(min=eps_sq).rsqrt_().mul_(grad_fp32)
                     del variance
                     
                     if enable_fira_for_adafactor:
@@ -1017,26 +1114,26 @@ def _update_param_8bit(
                         
                     _CUDA_MODULE.compute_update_norm_1d_full_m(
                         var_flat.view(-1), m_flat.view(-1), grad_fp32.view(-1), total_sum_sq,
-                        beta1, beta_val, eps_sq, N
+                        beta1, beta_val, eps_sq, N, eps_for_denom, use_adam_denom
                     )
                     if enable_fira_for_adafactor:
                         alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
                         
                     _CUDA_MODULE.apply_update_1d_full_m(
                         param_work.view(-1), var_flat.view(-1), m_flat.view(-1),
-                        total_sum_sq, alpha, d, eps_sq, N
+                        total_sum_sq, alpha, d, eps_sq, N, eps_for_denom, use_adam_denom
                     )
                 else:
                     _CUDA_MODULE.compute_update_norm_1d_full(
                         var_flat.view(-1), grad_fp32.view(-1), total_sum_sq,
-                        beta_val, eps_sq, N
+                        beta_val, eps_sq, N, eps_for_denom, use_adam_denom
                     )
                     if enable_fira_for_adafactor:
                         alpha, total_sum_sq = _apply_fira_cuda(state, total_sum_sq, alpha, fira_margin)
                         
                     _CUDA_MODULE.apply_update_1d_full(
                         param_work.view(-1), var_flat.view(-1), grad_fp32.view(-1),
-                        total_sum_sq, alpha, d, eps_sq, N
+                        total_sum_sq, alpha, d, eps_sq, N, eps_for_denom, use_adam_denom
                     )
             else:
                 variance = state["variance"]
@@ -1048,10 +1145,13 @@ def _update_param_8bit(
                     state["m"].lerp_(grad_fp32, 1.0 - beta1)
                     del grad_fp32 
                     
-                    update = torch.empty_like(variance)
-                    torch.clamp(variance, min=eps_sq, out=update)
-                    torch.rsqrt(update, out=update)
-                    update.mul_(state["m"])
+                    if use_adam_denom:
+                        update = state["m"] / (variance.sqrt() + eps_for_denom)
+                    else:
+                        update = torch.empty_like(variance)
+                        torch.clamp(variance, min=eps_sq, out=update)
+                        torch.rsqrt(update, out=update)
+                        update.mul_(state["m"])
                     
                     if enable_fira_for_adafactor:
                         update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
@@ -1059,10 +1159,13 @@ def _update_param_8bit(
                         denom = torch.clamp(torch.linalg.vector_norm(update) / (math.sqrt(update.numel()) * d), min=1.0)
                     param_work.add_(update, alpha=-alpha / denom)
                 else:
-                    update = torch.empty_like(variance)
-                    torch.clamp(variance, min=eps_sq, out=update)
-                    torch.rsqrt(update, out=update)
-                    update.mul_(grad_fp32)
+                    if use_adam_denom:
+                        update = grad_fp32 / (variance.sqrt() + eps_for_denom)
+                    else:
+                        update = torch.empty_like(variance)
+                        torch.clamp(variance, min=eps_sq, out=update)
+                        torch.rsqrt(update, out=update)
+                        update.mul_(grad_fp32)
                     
                     if enable_fira_for_adafactor:
                         update, denom = _apply_fira_pytorch(state, update, fira_margin, update.numel(), d)
@@ -1468,6 +1571,7 @@ def _update_param_apollo(
     fira_margin: float = 0.01,
     eps_came: float = 1e-8,
     beta3: Optional[float] = None,
+    bias_correction: Optional[bool] = None,
 ):
     grad_work = grad.neg().float() if maximize else grad.float()
     grad_work = torch.where(torch.isfinite(grad_work), grad_work, torch.zeros_like(grad_work))
@@ -1957,12 +2061,14 @@ def _update_param_apollo(
     update_scale_t = -alpha_t / denom_t
     
     if beta1 is not None and not relative_step:
-        bc1 = 1.0 - beta1 ** step
-        if beta2 is not None:
-            bc2 = 1.0 - beta2 ** step
-            update_scale_t = update_scale_t * (math.sqrt(bc2) / bc1)
-        else:
-            update_scale_t = update_scale_t / bc1
+        apply_bc = True if bias_correction is None else bias_correction
+        if apply_bc:
+            bc1 = 1.0 - beta1 ** step
+            if beta2 is not None:
+                bc2 = 1.0 - beta2 ** step
+                update_scale_t = update_scale_t * (math.sqrt(bc2) / bc1)
+            else:
+                update_scale_t = update_scale_t / bc1
         
     if apollo_scale_type == "channel":
         final_scale_cast = final_scale.to(grad_work.dtype)
