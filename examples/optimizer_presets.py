@@ -25,7 +25,7 @@ optimizer_sgd = Adafactor8Bit(
     beta2_decay=None,          # Enter SGD mode
     weight_decay=0.0,
     scale_parameter=False,     # Disable RMS scaling
-    d=1e9,                     # Disable global RMS clipping
+    d=0,                       # Disable global RMS clipping
     relative_step=False,       # Required for SGD mode
     factored=False,
 )
@@ -38,10 +38,10 @@ optimizer_rmsprop = Adafactor8Bit(
     model.parameters(),
     lr=ADAM_STYLE_LR,
     beta1=None,                # Disable first moment
-    beta2=0.999,               # Lock second moment EMA window
+    beta2=0.99,               # Lock second moment EMA window
     weight_decay=0.0,
     scale_parameter=False,     # Disable Adafactor RMS scaling
-    d=1e9,                     # Disable Adafactor global RMS clipping
+    d=0,                       # Disable Adafactor global RMS clipping
     relative_step=False,       # Use constant external LR
     factored=False,            # Use full-rank variance
     eps=(1e-8, 1e-3),          # Align with PyTorch RMSprop/Adam eps
@@ -58,7 +58,7 @@ optimizer_adam = Adafactor8Bit(
     beta2=0.999,
     weight_decay=0.0,
     scale_parameter=False,
-    d=1e9,
+    d=0,
     relative_step=False,
     factored=False,  
     eps=(1e-8, 1e-3),         
@@ -76,7 +76,7 @@ optimizer_adamw = Adafactor8Bit(
     weight_decay=1e-2,
     scale_weight_decay=False,  # Decouple weight decay from LR scaling
     scale_parameter=False,
-    d=1e9,
+    d=0,
     relative_step=False,
     factored=False,
     eps=(1e-8, 1e-3),
@@ -120,7 +120,7 @@ for name, param in model.named_parameters():
         regular_params.append(param)
 
 param_groups_apollo = [
-    {"params": regular_params}, # Will use default apollo_rank=0 (AdamW behavior)
+    {"params": regular_params},
     {
         "params": apollo_params,
         "apollo_rank": 256,               # Enable APOLLO projection
@@ -137,7 +137,7 @@ optimizer_apollo = Adafactor8Bit(
     weight_decay=1e-2,
     scale_weight_decay=False,
     scale_parameter=False,
-    d=1e9,
+    d=0,
     relative_step=False,
     apollo_eps = 1e-6,
     eps=(1e-6, 1e-3),
@@ -169,7 +169,7 @@ optimizer_apollo_mini = Adafactor8Bit(
     weight_decay=1e-2,
     scale_weight_decay=False,
     scale_parameter=False,
-    d=1e9,
+    d=0,
     relative_step=False,
     apollo_eps = 1e-6,
     eps=(1e-6, 1e-3),

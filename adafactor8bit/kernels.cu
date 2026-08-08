@@ -4,1480 +4,1822 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-__device__ constexpr float INV_255 = 1.0f / 255.0f;
-__device__ constexpr float MIN_LOG = -126.0f; 
-__device__ constexpr float MIN_VAL = 1.17549435e-38f; 
+__device__ constexpr float INV_254 = 1.0f / 254.0f;
+__device__ constexpr float MIN_VAL = 1.17549435e-38f;  // FP32_TINY
+__device__ constexpr float LOG_ZERO  = -1e30f;   // sentinel: V=0 in log space
+__device__ constexpr float LOG_MAX   = 126.0f;    // practical upper bound for log2(V)
+__device__ constexpr float MIN_SCALE = 1e-12f;    // floor for quantization scale
 
-__device__ __forceinline__ float dequant_uniform_4bit(int q_int, float scale) {
-    return ((float)q_int - 8.0f) * (scale * 0.125f);
-}
 
-__device__ __forceinline__ int quant_uniform_4bit(float x, float inv_scale) {
-    int q = __float2int_rn(x * inv_scale);
-    q = max(-8, min(7, q));
-    return q + 8;
+// Kernel mode constants
+// NOCLIP: d<=0, single pass, no norm clipping
+// NORM:   d>0 pass 1, accumulate norm only (read-only, no state writes)
+// APPLY:  d>0 pass 2, apply update with exact norm scaling, quantize M
+// LAG:    d>0, single pass with previous step's norm (approximate clipping)
+enum { MODE_NOCLIP = 0, MODE_NORM = 1, MODE_APPLY = 2, MODE_LAG = 3 };
+
+// ==========================================
+// 0. Constant Memory + Initialization
+// ==========================================
+__constant__ float d_qmap_8[256];
+__constant__ float d_qmap_4[16];
+
+void set_qmap_cuda(torch::Tensor qmap_8, torch::Tensor qmap_4) {
+    TORCH_CHECK(qmap_8.numel() == 256 && qmap_8.scalar_type() == at::kFloat && qmap_8.is_cuda());
+    TORCH_CHECK(qmap_4.numel() == 16 && qmap_4.scalar_type() == at::kFloat && qmap_4.is_cuda());
+    cudaMemcpyToSymbol(d_qmap_8, qmap_8.data_ptr<float>(), 256 * sizeof(float), 0, cudaMemcpyDeviceToDevice);
+    cudaMemcpyToSymbol(d_qmap_4, qmap_4.data_ptr<float>(), 16 * sizeof(float), 0, cudaMemcpyDeviceToDevice);
 }
 
 // ==========================================
-// 1. Fused Log-Quantize Lerp (EMA Update for V_t)
+// 1. Layer 0: Shared Device Functions
 // ==========================================
+template <typename T>
+__device__ __forceinline__ float load_grad(const T* g, int idx) {
+    float v = static_cast<float>(g[idx]);
+    return (isnan(v) || isinf(v)) ? 0.0f : v;
+}
+
+// Load dynamic maps from constant memory into shared memory.
+// Eliminates constant-memory serialization on random-access binary search.
+__device__ __forceinline__ void load_codebook_smem(float* s_qmap8, float* s_qmap4, int tid, int nthreads) {
+    for (int i = tid; i < 256; i += nthreads) s_qmap8[i] = d_qmap_8[i];
+    if (tid < 16) s_qmap4[tid] = d_qmap_4[tid];
+}
+
+// m_mode: 0 = uniform (uf4/uf8), 1 = dynamic map (d4/d8)
+// s_qmap8/s_qmap4: shared-memory codebook (replaces constant-memory reads)
+__device__ __forceinline__ float dequant_m(const void* m_q, int idx, const float* m_scale,
+                                           int m_block_size, int m_bits, int m_mode,
+                                           const float* s_qmap8, const float* s_qmap4) {
+    float scale = m_scale[idx / m_block_size];
+    if (m_mode == 0) {
+        if (m_bits == 4) {
+            unsigned char packed = ((const unsigned char*)m_q)[idx / 2];
+            int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
+            return ((float)q_int - 8.0f) * (scale * 0.125f);
+        } else {
+            return ((float)((const unsigned char*)m_q)[idx] - 128.0f) * (scale * (1.0f / 128.0f));
+        }
+    } else {
+        if (m_bits == 8) return s_qmap8[((const unsigned char*)m_q)[idx]] * scale;
+        unsigned char packed = ((const unsigned char*)m_q)[idx / 2];
+        int q_idx = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
+        return s_qmap4[q_idx] * scale;
+    }
+}
+
+// Half-range search: restrict to correct-sign half (128 entries, 7 iterations).
+// Sign correction retained as safety net.
+__device__ __forceinline__ unsigned char quant_dynamic_8(float x_norm, float x_orig, const float* s_qmap8) {
+    int lo = (x_orig >= 0.0f) ? 127 : 0;
+    int hi = (x_orig >= 0.0f) ? 255 : 127;
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (s_qmap8[mid] < x_norm) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && fabsf(x_norm - s_qmap8[lo - 1]) < fabsf(x_norm - s_qmap8[lo])) lo--;
+    if (x_orig != 0.0f && signbit(s_qmap8[lo]) != signbit(x_orig)) {
+        if (x_orig > 0.0f && lo < 255) lo++; else if (lo > 0) lo--;
+    }
+    return (unsigned char)lo;
+}
+
+__device__ __forceinline__ unsigned char quant_dynamic_4(float x_norm, float x_orig, const float* s_qmap4) {
+    int lo = (x_orig >= 0.0f) ? 7 : 0;
+    int hi = (x_orig >= 0.0f) ? 15 : 7;
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (s_qmap4[mid] < x_norm) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && fabsf(x_norm - s_qmap4[lo - 1]) < fabsf(x_norm - s_qmap4[lo])) lo--;
+    if (x_orig != 0.0f && signbit(s_qmap4[lo]) != signbit(x_orig)) {
+        if (x_orig > 0.0f && lo < 15) lo++; else if (lo > 0) lo--;
+    }
+    return (unsigned char)lo;
+}
+
+__device__ __forceinline__ void quant_m_store(void* m_q, int idx, float m0, float m1,
+                                              float inv_abs, int m_bits, int m_mode, int numel,
+                                              const float* s_qmap8, const float* s_qmap4) {
+    if (m_mode == 0) {
+        if (m_bits == 4) {
+            float inv_s = inv_abs * 8.0f;
+            int q0 = max(0, min(15, __float2int_rn(m0 * inv_s) + 8));
+            int q1 = 8;
+            if (idx + 1 < numel) q1 = max(0, min(15, __float2int_rn(m1 * inv_s) + 8));
+            ((unsigned char*)m_q)[idx / 2] = (unsigned char)((q0 << 4) | q1);
+        } else {
+            ((unsigned char*)m_q)[idx] = (unsigned char)max(0, min(255, __float2int_rn(m0 * inv_abs * 128.0f) + 128));
+        }
+    } else {
+        if (m_bits == 8) {
+            ((unsigned char*)m_q)[idx] = quant_dynamic_8(m0 * inv_abs, m0, s_qmap8);
+        } else {
+            unsigned char q0 = quant_dynamic_4(m0 * inv_abs, m0, s_qmap4);
+            unsigned char q1 = 7;
+            if (idx + 1 < numel) q1 = quant_dynamic_4(m1 * inv_abs, m1, s_qmap4);
+            ((unsigned char*)m_q)[idx / 2] = (unsigned char)((q0 << 4) | q1);
+        }
+    }
+}
+
+__device__ __forceinline__ float block_reduce_max(float val, float* s, int tid, int num_warps, float identity = 0.0f) {
+    for (int o = 16; o > 0; o /= 2) val = fmaxf(val, __shfl_down_sync(0xffffffff, val, o));
+    int lane = tid % 32, wid = tid / 32;
+    if (lane == 0) s[wid] = val;
+    __syncthreads();
+    if (wid == 0) {
+        val = (lane < num_warps) ? s[lane] : identity;
+        for (int o = 16; o > 0; o /= 2) { float t = __shfl_down_sync(0xffffffff, val, o); if (lane + o < num_warps) val = fmaxf(val, t); }
+        if (lane == 0) s[0] = val;
+    }
+    __syncthreads();
+    return s[0];
+}
+
+// Combined min+max in a single reduction pass (saves one __syncthreads).
+// s_max and s_min each need num_warps floats; caller must provide 2*num_warps total.
+__device__ __forceinline__ void block_reduce_minmax(
+    float val_max, float val_min,
+    float* s_max, float* s_min,
+    int tid, int num_warps,
+    float id_max, float id_min,
+    float* out_max, float* out_min) {
+    for (int o = 16; o > 0; o /= 2) {
+        val_max = fmaxf(val_max, __shfl_down_sync(0xffffffff, val_max, o));
+        val_min = fminf(val_min, __shfl_down_sync(0xffffffff, val_min, o));
+    }
+    int lane = tid % 32, wid = tid / 32;
+    if (lane == 0) { s_max[wid] = val_max; s_min[wid] = val_min; }
+    __syncthreads();
+    if (wid == 0) {
+        val_max = (lane < num_warps) ? s_max[lane] : id_max;
+        val_min = (lane < num_warps) ? s_min[lane] : id_min;
+        for (int o = 16; o > 0; o /= 2) {
+            float t_max = __shfl_down_sync(0xffffffff, val_max, o);
+            float t_min = __shfl_down_sync(0xffffffff, val_min, o);
+            if (lane + o < num_warps) { val_max = fmaxf(val_max, t_max); val_min = fminf(val_min, t_min); }
+        }
+        if (lane == 0) { s_max[0] = val_max; s_min[0] = val_min; }
+    }
+    __syncthreads();
+    *out_max = s_max[0];
+    *out_min = s_min[0];
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val, float* s, int tid, int num_warps) {
+    for (int o = 16; o > 0; o /= 2) val += __shfl_down_sync(0xffffffff, val, o);
+    int lane = tid % 32, wid = tid / 32;
+    if (lane == 0) s[wid] = val;
+    __syncthreads();
+    if (wid == 0) {
+        val = (lane < num_warps) ? s[lane] : 0.0f;
+        for (int o = 16; o > 0; o /= 2) { float t = __shfl_down_sync(0xffffffff, val, o); if (lane + o < num_warps) val += t; }
+        if (lane == 0) s[0] = val;
+    }
+    __syncthreads();
+    return s[0];
+}
+
+// Warp-level row atomic add with active-mask safety.
+// Full warp: reduce 32 atomics to 1. Partial warp: direct atomic.
+__device__ __forceinline__ void warp_atomic_add_row(float val, int r, float* row_sum, int lane) {
+    if (r < 0) return;
+    unsigned active = __activemask();
+    if (__popc(active) == 32) {
+        int r_lane0 = __shfl_sync(0xffffffff, r, 0);
+        unsigned int ballot = __ballot_sync(0xffffffff, r == r_lane0);
+        if (ballot == 0xffffffff) {
+            for (int o = 16; o > 0; o /= 2)
+                val += __shfl_down_sync(0xffffffff, val, o);
+            if (lane == 0) atomicAdd(&row_sum[r_lane0], val);
+            return;
+        }
+    }
+    atomicAdd(&row_sum[r], val);
+}
+
+__device__ __forceinline__ float dequant_v(unsigned char q, float scale, float min_log) {
+    return (q == 0) ? 0.0f : exp2f((float)(q - 1) * INV_254 * scale + min_log);
+}
+
+// Adaptive log-space V quant: returns q=0 for zero, q=1..255 for non-zero
+__device__ __forceinline__ unsigned char quant_v(float vlog, float min_log, float inv_scale) {
+    if (vlog <= -1e20f) return 0;
+    int qi = __float2int_rn((vlog - min_log) * inv_scale) + 1;
+    return (unsigned char)max(1, min(255, qi));
+}
+
+static inline int calc_threads(int block_size, int m_bits) {
+    int elems = (m_bits == 8) ? 1 : 2;
+    int slots = block_size / elems;
+    return min(256, max(32, ((slots + 31) / 32) * 32));
+}
+
+// Shared memory overhead for codebook (floats)
+static constexpr int SMEM_QMAP = 256 + 16;
+
+// ==========================================
+// 2. Fused Log-Quantize Lerp (standalone V EMA)
+//    Used for: Apollo v_low, state migration
+//    Adaptive per-block min_log, 1+255 zero-point scheme
+//    NOTE: when square_input=false, caller must ensure new_val >= 0
+//    fp32_out: optional buffer to receive the fp32 EMA result (before
+//              quantization). Pass nullptr when not needed.
+// ==========================================
+template <typename T>
 __global__ void fused_log_quantize_lerp_kernel(
-    unsigned char* __restrict__ q,
-    float* __restrict__ scale,
-    const float* __restrict__ new_val,
-    const float beta,
-    int block_size,
-    bool square_input,
-    float eps1,
-    int N)
-{
-    int block_id = blockIdx.x;
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-    int start = block_id * block_size;
-    int num_warps = stride / 32;
-
+    unsigned char* __restrict__ q, float* __restrict__ scale, float* __restrict__ min_log_out,
+    const T* __restrict__ new_val, float* __restrict__ fp32_out,
+    float beta, int block_size, bool square_input, float eps1, int N, float log_floor) {
+    int block_id = blockIdx.x, tid = threadIdx.x, stride = blockDim.x;
+    int start = block_id * block_size, num_warps = stride / 32;
     extern __shared__ float shared_mem[];
-    float* local_logs = shared_mem;           
-    float* s_max = &shared_mem[block_size];
-
-    float old_scale = scale[block_id];
-    float thread_max = MIN_LOG;
+    float* local_logs = shared_mem;
+    // s_reduce now holds 2*num_warps for combined minmax
+    float* s_reduce = &shared_mem[block_size];
+    float old_scale = scale[block_id], old_min_log = min_log_out[block_id];
     float one_minus_b = 1.0f - beta;
-    
-    const float4* new_val_vec = reinterpret_cast<const float4*>(new_val + start);
+    float thread_max = LOG_ZERO, thread_min = LOG_MAX;
     uchar4* q_vec = reinterpret_cast<uchar4*>(q + start);
-
-    int vec_iters = (block_size / 4) / stride; 
-
+    int vec_iters = (block_size / 4) / stride;
     for (int i = 0; i < vec_iters; i++) {
-        int idx = tid + i * stride; 
-        int base_idx = start + idx * 4;
-        
-        float val_x, val_y, val_z, val_w;
-        
+        int idx = tid + i * stride, base_idx = start + idx * 4;
+        float vx, vy, vz, vw;
         if (base_idx + 3 < N) {
-            // Vectorized read for aligned elements
-            float4 nv = new_val_vec[idx];
-            if (square_input) {
-                nv.x = nv.x * nv.x + eps1;
-                nv.y = nv.y * nv.y + eps1;
-                nv.z = nv.z * nv.z + eps1;
-                nv.w = nv.w * nv.w + eps1;
-            }
-            val_x = (isnan(nv.x) || isinf(nv.x)) ? 0.0f : nv.x;
-            val_y = (isnan(nv.y) || isinf(nv.y)) ? 0.0f : nv.y;
-            val_z = (isnan(nv.z) || isinf(nv.z)) ? 0.0f : nv.z;
-            val_w = (isnan(nv.w) || isinf(nv.w)) ? 0.0f : nv.w;
+            if constexpr (sizeof(T) == 4) { float4 nv = reinterpret_cast<const float4*>(new_val + base_idx)[0]; vx=nv.x; vy=nv.y; vz=nv.z; vw=nv.w; }
+            else { vx=static_cast<float>(new_val[base_idx]); vy=static_cast<float>(new_val[base_idx+1]); vz=static_cast<float>(new_val[base_idx+2]); vw=static_cast<float>(new_val[base_idx+3]); }
+            if (square_input) { vx=vx*vx+eps1; vy=vy*vy+eps1; vz=vz*vz+eps1; vw=vw*vw+eps1; }
+            vx=(isnan(vx)||isinf(vx))?0.0f:vx; vy=(isnan(vy)||isinf(vy))?0.0f:vy;
+            vz=(isnan(vz)||isinf(vz))?0.0f:vz; vw=(isnan(vw)||isinf(vw))?0.0f:vw;
         } else {
-            // Scalar fallback for boundary elements
-            float v0 = (base_idx + 0 < N) ? new_val[base_idx + 0] : 0.0f;
-            float v1 = (base_idx + 1 < N) ? new_val[base_idx + 1] : 0.0f;
-            float v2 = (base_idx + 2 < N) ? new_val[base_idx + 2] : 0.0f;
-            float v3 = (base_idx + 3 < N) ? new_val[base_idx + 3] : 0.0f;
-            if (square_input) {
-                v0 = v0 * v0 + eps1; v1 = v1 * v1 + eps1; v2 = v2 * v2 + eps1; v3 = v3 * v3 + eps1;
-            }
-            val_x = (isnan(v0) || isinf(v0)) ? 0.0f : v0;
-            val_y = (isnan(v1) || isinf(v1)) ? 0.0f : v1;
-            val_z = (isnan(v2) || isinf(v2)) ? 0.0f : v2;
-            val_w = (isnan(v3) || isinf(v3)) ? 0.0f : v3;
+            float v0=(base_idx<N)?static_cast<float>(new_val[base_idx]):0.0f;
+            float v1=(base_idx+1<N)?static_cast<float>(new_val[base_idx+1]):0.0f;
+            float v2=(base_idx+2<N)?static_cast<float>(new_val[base_idx+2]):0.0f;
+            float v3=(base_idx+3<N)?static_cast<float>(new_val[base_idx+3]):0.0f;
+            if (square_input) { v0=v0*v0+eps1; v1=v1*v1+eps1; v2=v2*v2+eps1; v3=v3*v3+eps1; }
+            vx=(isnan(v0)||isinf(v0))?0.0f:v0; vy=(isnan(v1)||isinf(v1))?0.0f:v1;
+            vz=(isnan(v2)||isinf(v2))?0.0f:v2; vw=(isnan(v3)||isinf(v3))?0.0f:v3;
         }
-
-        uchar4 q_val = q_vec[idx];
-
-        float v_old0 = exp2f((float)q_val.x * INV_255 * old_scale + MIN_LOG);
-        float v_old1 = exp2f((float)q_val.y * INV_255 * old_scale + MIN_LOG);
-        float v_old2 = exp2f((float)q_val.z * INV_255 * old_scale + MIN_LOG);
-        float v_old3 = exp2f((float)q_val.w * INV_255 * old_scale + MIN_LOG);
-
-        float v_upd0 = fmaxf(v_old0 * one_minus_b + fmaxf(val_x, MIN_VAL) * beta, MIN_VAL);
-        float v_upd1 = fmaxf(v_old1 * one_minus_b + fmaxf(val_y, MIN_VAL) * beta, MIN_VAL);
-        float v_upd2 = fmaxf(v_old2 * one_minus_b + fmaxf(val_z, MIN_VAL) * beta, MIN_VAL);
-        float v_upd3 = fmaxf(v_old3 * one_minus_b + fmaxf(val_w, MIN_VAL) * beta, MIN_VAL);
-
-        float log0 = log2f(v_upd0);
-        float log1 = log2f(v_upd1);
-        float log2 = log2f(v_upd2);
-        float log3 = log2f(v_upd3);
-
-        local_logs[idx * 4 + 0] = log0;
-        local_logs[idx * 4 + 1] = log1;
-        local_logs[idx * 4 + 2] = log2;
-        local_logs[idx * 4 + 3] = log3;
-
-        thread_max = fmaxf(thread_max, fmaxf(fmaxf(log0, log1), fmaxf(log2, log3)));
-    }
-
-    // Warp-level reduce
-    float val = thread_max;
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-    }
-
-    if (tid % 32 == 0) s_max[tid / 32] = val;
-    __syncthreads();
-
-    // Block-level reduce
-    if (tid < 32) { 
-        if (tid < num_warps) val = s_max[tid];
-        else val = MIN_LOG;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, val, offset);
-            if (tid + offset < num_warps) val = fmaxf(val, other);
+        uchar4 qv = q_vec[idx];
+        float o0=dequant_v(qv.x,old_scale,old_min_log), o1=dequant_v(qv.y,old_scale,old_min_log);
+        float o2=dequant_v(qv.z,old_scale,old_min_log), o3=dequant_v(qv.w,old_scale,old_min_log);
+        float u0=fmaxf(o0*one_minus_b+vx*beta,0.0f);
+        float u1=fmaxf(o1*one_minus_b+vy*beta,0.0f);
+        float u2=fmaxf(o2*one_minus_b+vz*beta,0.0f);
+        float u3=fmaxf(o3*one_minus_b+vw*beta,0.0f);
+        if (fp32_out) {
+            if (base_idx < N)     fp32_out[base_idx]     = u0;
+            if (base_idx + 1 < N) fp32_out[base_idx + 1] = u1;
+            if (base_idx + 2 < N) fp32_out[base_idx + 2] = u2;
+            if (base_idx + 3 < N) fp32_out[base_idx + 3] = u3;
         }
-        if (tid == 0) s_max[0] = val;
+        float l0=(u0>0.0f)?log2f(fmaxf(u0,MIN_VAL)):LOG_ZERO, l1=(u1>0.0f)?log2f(fmaxf(u1,MIN_VAL)):LOG_ZERO;
+        float l2=(u2>0.0f)?log2f(fmaxf(u2,MIN_VAL)):LOG_ZERO, l3=(u3>0.0f)?log2f(fmaxf(u3,MIN_VAL)):LOG_ZERO;
+        local_logs[idx*4]=l0; local_logs[idx*4+1]=l1; local_logs[idx*4+2]=l2; local_logs[idx*4+3]=l3;
+        thread_max = fmaxf(thread_max, fmaxf(fmaxf(l0,l1),fmaxf(l2,l3)));
+        float local_min = LOG_MAX;
+        if(u0>0.0f) local_min=fminf(local_min,l0); if(u1>0.0f) local_min=fminf(local_min,l1);
+        if(u2>0.0f) local_min=fminf(local_min,l2); if(u3>0.0f) local_min=fminf(local_min,l3);
+        thread_min = fminf(thread_min, local_min);
     }
-    __syncthreads(); 
-
-    float max_log = fminf(fmaxf(s_max[0], MIN_LOG + 1e-12f), 126.0f);
-    float new_scale = max_log - MIN_LOG; 
-    float inv_scale = 255.0f / (max_log - MIN_LOG);
-
+    // Combined minmax reduce (single pass)
+    float raw_max, raw_min;
+    block_reduce_minmax(thread_max, thread_min, s_reduce, s_reduce + num_warps,
+                        tid, num_warps, LOG_ZERO, LOG_MAX, &raw_max, &raw_min);
+    float max_log = fminf(raw_max, LOG_MAX);
+    float min_log = fmaxf(raw_min, log_floor);
+    if (min_log >= max_log) min_log = max_log - 1.0f;
+    float new_scale = fmaxf(max_log - min_log, MIN_SCALE), inv_s = 254.0f / new_scale;
     for (int i = 0; i < vec_iters; i++) {
         int idx = tid + i * stride;
-        
-        float l0 = local_logs[idx * 4 + 0];
-        float l1 = local_logs[idx * 4 + 1];
-        float l2 = local_logs[idx * 4 + 2];
-        float l3 = local_logs[idx * 4 + 3];
-
-        uchar4 out_q;
-        out_q.x = (unsigned char)fminf(fmaxf((l0 - MIN_LOG) * inv_scale + 0.5f, 0.0f), 255.0f);
-        out_q.y = (unsigned char)fminf(fmaxf((l1 - MIN_LOG) * inv_scale + 0.5f, 0.0f), 255.0f);
-        out_q.z = (unsigned char)fminf(fmaxf((l2 - MIN_LOG) * inv_scale + 0.5f, 0.0f), 255.0f);
-        out_q.w = (unsigned char)fminf(fmaxf((l3 - MIN_LOG) * inv_scale + 0.5f, 0.0f), 255.0f);
-
-        q_vec[idx] = out_q; 
+        uchar4 out;
+        out.x=quant_v(local_logs[idx*4],min_log,inv_s);
+        out.y=quant_v(local_logs[idx*4+1],min_log,inv_s);
+        out.z=quant_v(local_logs[idx*4+2],min_log,inv_s);
+        out.w=quant_v(local_logs[idx*4+3],min_log,inv_s);
+        q_vec[idx] = out;
     }
-
-    if (tid == 0) scale[block_id] = new_scale;
+    if (tid == 0) { scale[block_id] = new_scale; min_log_out[block_id] = min_log; }
 }
 
-torch::Tensor fused_log_quantize_lerp_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor new_val, 
-    float beta, int block_size, bool square_input, float eps1, int N)
-{
-    TORCH_CHECK(q.scalar_type() == at::kByte && scale.scalar_type() == at::kFloat && new_val.scalar_type() == at::kFloat);
-    TORCH_CHECK(q.is_cuda() && scale.is_cuda() && new_val.is_cuda());
-    TORCH_CHECK(q.is_contiguous() && scale.is_contiguous() && new_val.is_contiguous());
-    
-    int threads = 256;
-    TORCH_CHECK(block_size >= threads && block_size % 4 == 0 && block_size % (4 * threads) == 0,
-                "block_size must be a multiple of 4 * threads for vectorization.");
-
-    int num_blocks = (N + block_size - 1) / block_size;
-    int num_warps = threads / 32;
-    size_t shared_mem = (block_size + num_warps) * sizeof(float); 
-
-    TORCH_CHECK(shared_mem <= 49152, "block_size is too large, exceeding 48KB shared memory limit.");
-    
-    fused_log_quantize_lerp_kernel<<<num_blocks, threads, shared_mem>>>(
-        q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), 
-        beta, block_size, square_input, eps1, N
-    );
-    return q;
+void fused_log_quantize_lerp_cuda(torch::Tensor q, torch::Tensor scale, torch::Tensor min_log_out,
+    torch::Tensor new_val, c10::optional<torch::Tensor> fp32_out,
+    float beta, int block_size, bool square_input, float eps1, int N, float log_floor) {
+    TORCH_CHECK(q.scalar_type()==at::kByte && scale.scalar_type()==at::kFloat && min_log_out.scalar_type()==at::kFloat);
+    TORCH_CHECK(q.is_cuda() && scale.is_cuda() && min_log_out.is_cuda() && new_val.is_cuda());
+    int threads = min(256, block_size/4); threads = max(32, (threads/32)*32);
+    TORCH_CHECK(block_size>=128 && block_size%4==0 && block_size%(4*threads)==0);
+    int num_blocks=(N+block_size-1)/block_size, num_warps=threads/32;
+    // 2*num_warps for combined minmax
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    float* fp32_ptr = fp32_out.has_value() ? fp32_out.value().data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+        new_val.scalar_type(), "fused_log_quantize_lerp", ([&] {
+            fused_log_quantize_lerp_kernel<scalar_t><<<num_blocks, threads, smem>>>(
+                q.data_ptr<unsigned char>(), scale.data_ptr<float>(), min_log_out.data_ptr<float>(),
+                new_val.data_ptr<scalar_t>(), fp32_ptr,
+                beta, block_size, square_input, eps1, N, log_floor);
+        }));
 }
 
 // ==========================================
-// 2. M_t (Momentum) EMA Update (Physical 4-bit Packed Quantization)
+// 3. Standalone M EMA (all modes, for fallback/migration)
 // ==========================================
-__global__ void fused_4bit_quantize_lerp_kernel(
-    unsigned char* __restrict__ q, 
-    float* __restrict__ scale,
-    const float* __restrict__ new_val,
-    const float beta,
-    int block_size,
-    int N) 
-{
-    int block_id = blockIdx.x;
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-    int start = block_id * block_size;
-    int num_warps = stride / 32;
-
+template <typename T>
+__global__ void fused_m_quantize_lerp_kernel(
+    unsigned char* __restrict__ q, float* __restrict__ scale,
+    const T* __restrict__ new_val, float beta,
+    int block_size, int N, int m_bits, int m_mode) {
+    int block_id=blockIdx.x, tid=threadIdx.x, stride=blockDim.x;
+    int start=block_id*block_size, num_warps=stride/32;
     extern __shared__ float shared_mem[];
-    float* local_m = shared_mem;           
-    float* s_max = &shared_mem[block_size];
+    float* local_m=shared_mem; float* s_max=&shared_mem[block_size];
+    // Codebook in shared memory
+    float* s_qmap8=&shared_mem[block_size+num_warps];
+    float* s_qmap4=s_qmap8+256;
+    load_codebook_smem(s_qmap8, s_qmap4, tid, stride);
+    __syncthreads();
 
-    float old_scale = scale[block_id];
-    float thread_max = 0.0f;
-    float one_minus_b = 1.0f - beta;
-    
-    const float4* new_val_vec = reinterpret_cast<const float4*>(new_val + start);
-    uchar2* q_vec = reinterpret_cast<uchar2*>(q + (start / 2)); 
+    float thread_max=0.0f, one_minus_b=1.0f-beta;
+    int elems=(m_bits==8)?1:2;
+    int total_slots=block_size/elems, slot_iters=(total_slots+stride-1)/stride;
+    for (int i=0;i<slot_iters;i++) {
+        int slot=tid+i*stride; if(slot>=total_slots) break;
+        int idx0=start+slot*elems;
+        float m_new_0=0.0f, m_new_1=0.0f;
+        if (idx0<N) {
+            float g0=load_grad(new_val,idx0);
+            float m_old0=dequant_m(q,idx0,scale,block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_0=beta*m_old0+one_minus_b*g0;
+            thread_max=fmaxf(thread_max,fabsf(m_new_0));
+        }
+        if (elems==2 && idx0+1<N) {
+            float g1=load_grad(new_val,idx0+1);
+            float m_old1=dequant_m(q,idx0+1,scale,block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_1=beta*m_old1+one_minus_b*g1;
+            thread_max=fmaxf(thread_max,fabsf(m_new_1));
+        }
+        local_m[slot*elems]=m_new_0;
+        if(elems==2) local_m[slot*elems+1]=m_new_1;
+    }
+    float abs_max=fmaxf(block_reduce_max(thread_max,s_max,tid,num_warps),MIN_SCALE);
+    float inv_abs=1.0f/abs_max;
+    for (int i=0;i<slot_iters;i++) {
+        int slot=tid+i*stride; if(slot>=total_slots) break;
+        int idx0=start+slot*elems;
+        float m0=local_m[slot*elems];
+        float m1=(elems==2)?local_m[slot*elems+1]:0.0f;
+        if(idx0<N) quant_m_store(q,idx0,m0,m1,inv_abs,m_bits,m_mode,N,s_qmap8,s_qmap4);
+    }
+    if(tid==0) scale[block_id]=abs_max;
+}
 
-    int total_vecs = block_size / 4;
-    int vec_iters = (total_vecs + stride - 1) / stride;
+void fused_m_quantize_lerp_cuda(torch::Tensor q, torch::Tensor scale, torch::Tensor new_val,
+    float beta, int block_size, int N, int m_bits, int m_mode) {
+    TORCH_CHECK(q.scalar_type()==at::kByte && scale.scalar_type()==at::kFloat);
+    int threads=calc_threads(block_size, m_bits);
+    int num_blocks=(N+block_size-1)/block_size, num_warps=threads/32;
+    // +SMEM_QMAP for codebook
+    size_t smem=(block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+        new_val.scalar_type(), "fused_m_quantize_lerp", ([&] {
+            fused_m_quantize_lerp_kernel<scalar_t><<<num_blocks, threads, smem>>>(
+                q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<scalar_t>(),
+                beta, block_size, N, m_bits, m_mode);
+        }));
+}
 
-    for (int i = 0; i < vec_iters; i++) {
-        int idx = tid + i * stride; 
-        if (idx >= total_vecs) break;
-        
-        int base_idx = start + idx * 4;
-        float val_x, val_y, val_z, val_w;
+// ==========================================
+// 4. Fused 1D Update (V-EMA fused, exact v for update)
+//    Requires: block_size % m_block_size == 0
+//    v_buf: fp32 buffer for NORM->APPLY handoff (nullptr for NOCLIP/LAG)
+//    V uses adaptive per-block min_log, 1+255 zero-point scheme
+// ==========================================
+template <typename T, int MODE>
+__global__ void fused_update_1d_kernel(
+    T* __restrict__ param, const T* __restrict__ grad,
+    void* __restrict__ m_q, float* __restrict__ m_scale,
+    unsigned char* __restrict__ v_q, float* __restrict__ v_scale, float* __restrict__ v_min_log,
+    float* __restrict__ v_buf,
+    float* __restrict__ norm_buf, const float* __restrict__ alpha,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq,
+    int numel, float sqrt_numel, int block_size, int m_block_size, int m_bits, int m_mode,
+    const float* __restrict__ prev_norm_ptr, float d) {
+    int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
+    int start=block_id*block_size;
+    extern __shared__ float shared_mem[];
 
-        if (base_idx + 3 < N) {
-            float4 nv = new_val_vec[idx];
-            val_x = (isnan(nv.x) || isinf(nv.x)) ? 0.0f : nv.x;
-            val_y = (isnan(nv.y) || isinf(nv.y)) ? 0.0f : nv.y;
-            val_z = (isnan(nv.z) || isinf(nv.z)) ? 0.0f : nv.z;
-            val_w = (isnan(nv.w) || isinf(nv.w)) ? 0.0f : nv.w;
+    // Shared memory layout (codebook appended at end):
+    // NOCLIP/LAG: [smem_m | smem_vlog | s_reduce(2*nw) | s_qmap8 | s_qmap4]
+    // NORM:       [smem_vlog | s_reduce(2*nw) | s_qmap8 | s_qmap4]
+    // APPLY:      [smem_m | s_reduce(nw) | s_qmap8 | s_qmap4]
+    float* smem_m;
+    float* smem_vlog;
+    float* s_reduce;
+    float* s_qmap8;
+    float* s_qmap4;
+    if constexpr (MODE == MODE_NORM) {
+        smem_m = nullptr;
+        smem_vlog = shared_mem;
+        s_reduce = &shared_mem[block_size];
+        s_qmap8 = &shared_mem[block_size + 2*num_warps];
+        s_qmap4 = s_qmap8 + 256;
+    } else if constexpr (MODE == MODE_APPLY) {
+        smem_m = shared_mem;
+        smem_vlog = nullptr;
+        s_reduce = &shared_mem[block_size];
+        s_qmap8 = &shared_mem[block_size + num_warps];
+        s_qmap4 = s_qmap8 + 256;
+    } else {
+        smem_m = shared_mem;
+        smem_vlog = &shared_mem[block_size];
+        s_reduce = &shared_mem[2 * block_size];
+        s_qmap8 = &shared_mem[2*block_size + 2*num_warps];
+        s_qmap4 = s_qmap8 + 256;
+    }
+    load_codebook_smem(s_qmap8, s_qmap4, tid, blockDim.x);
+    __syncthreads();
+
+    float one_minus_b1=1.0f-beta1, one_minus_bv=1.0f-beta_val;
+    int elems=(m_bits==8)?1:2;
+    float old_v_scale=v_scale[block_id], old_v_min_log=v_min_log[block_id];
+
+    float step_scale=0.0f;
+    if constexpr (MODE==MODE_NOCLIP) { step_scale=*alpha; }
+    else if constexpr (MODE==MODE_APPLY) {
+        float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(*norm_buf)/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    } else if constexpr (MODE==MODE_LAG) {
+        float pn=*prev_norm_ptr;
+        float denom=(d>0.0f)?fmaxf(1.0f,pn/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    }
+
+    int total_slots=block_size/elems;
+    int slot_iters=(total_slots+blockDim.x-1)/blockDim.x;
+    float thread_max_m=0.0f, thread_max_vlog=LOG_ZERO, thread_min_vlog=LOG_MAX, local_sq=0.0f;
+
+    for (int iter=0; iter<slot_iters; iter++) {
+        int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+        int idx0=start+slot*elems;
+        float m_new_0=0.0f, m_new_1=0.0f, vlog_0=LOG_ZERO, vlog_1=LOG_ZERO;
+
+        if (idx0<numel) {
+            float g0=load_grad(grad,idx0);
+            float inv_std0;
+
+            if constexpr (MODE == MODE_APPLY) {
+                float v_exact=v_buf[idx0];
+                inv_std0=use_adam_denom ? 1.0f/(sqrtf(v_exact)+eps_for_denom)
+                                        : (v_exact>0.0f?rsqrtf(v_exact):0.0f);
+            } else {
+                float v_old0=dequant_v(v_q[idx0],old_v_scale,old_v_min_log);
+                float v_new0=v_old0*one_minus_bv+(g0*g0+eps_for_grad_sq)*beta_val;
+                if (v_new0>0.0f) { vlog_0=log2f(fmaxf(v_new0,MIN_VAL)); thread_min_vlog=fminf(thread_min_vlog,vlog_0); }
+                inv_std0=use_adam_denom ? 1.0f/(sqrtf(v_new0)+eps_for_denom)
+                                        : (v_new0>0.0f?rsqrtf(v_new0):0.0f);
+                if constexpr (MODE==MODE_NORM) { v_buf[idx0]=v_new0; }
+            }
+
+            float m_old0=dequant_m(m_q,idx0,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_0=beta1*m_old0+one_minus_b1*g0;
+            float u0=m_new_0*inv_std0;
+
+            if constexpr (MODE==MODE_NORM) { local_sq+=u0*u0; }
+            else { float p=static_cast<float>(param[idx0]); param[idx0]=static_cast<T>(p-step_scale*u0); }
+            if constexpr (MODE==MODE_LAG) { local_sq+=u0*u0; }
+            thread_max_m=fmaxf(thread_max_m,fabsf(m_new_0));
+            thread_max_vlog=fmaxf(thread_max_vlog,vlog_0);
+        }
+
+        if (elems==2 && idx0+1<numel) {
+            float g1=load_grad(grad,idx0+1);
+            float inv_std1;
+
+            if constexpr (MODE == MODE_APPLY) {
+                float v_exact=v_buf[idx0+1];
+                inv_std1=use_adam_denom ? 1.0f/(sqrtf(v_exact)+eps_for_denom)
+                                        : (v_exact>0.0f?rsqrtf(v_exact):0.0f);
+            } else {
+                float v_old1=dequant_v(v_q[idx0+1],old_v_scale,old_v_min_log);
+                float v_new1=v_old1*one_minus_bv+(g1*g1+eps_for_grad_sq)*beta_val;
+                if (v_new1>0.0f) { vlog_1=log2f(fmaxf(v_new1,MIN_VAL)); thread_min_vlog=fminf(thread_min_vlog,vlog_1); }
+                inv_std1=use_adam_denom ? 1.0f/(sqrtf(v_new1)+eps_for_denom)
+                                        : (v_new1>0.0f?rsqrtf(v_new1):0.0f);
+                if constexpr (MODE==MODE_NORM) { v_buf[idx0+1]=v_new1; }
+            }
+
+            float m_old1=dequant_m(m_q,idx0+1,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_1=beta1*m_old1+one_minus_b1*g1;
+            float u1=m_new_1*inv_std1;
+
+            if constexpr (MODE==MODE_NORM) { local_sq+=u1*u1; }
+            else { float p=static_cast<float>(param[idx0+1]); param[idx0+1]=static_cast<T>(p-step_scale*u1); }
+            if constexpr (MODE==MODE_LAG) { local_sq+=u1*u1; }
+            thread_max_m=fmaxf(thread_max_m,fabsf(m_new_1));
+            thread_max_vlog=fmaxf(thread_max_vlog,vlog_1);
+        }
+
+        if constexpr (MODE==MODE_NOCLIP || MODE==MODE_LAG) {
+            smem_m[slot*elems]=m_new_0; smem_vlog[slot*elems]=vlog_0;
+            if(elems==2){smem_m[slot*elems+1]=m_new_1; smem_vlog[slot*elems+1]=vlog_1;}
+        } else if constexpr (MODE==MODE_NORM) {
+            smem_vlog[slot*elems]=vlog_0;
+            if(elems==2) smem_vlog[slot*elems+1]=vlog_1;
         } else {
-            float v0 = (base_idx + 0 < N) ? new_val[base_idx + 0] : 0.0f;
-            float v1 = (base_idx + 1 < N) ? new_val[base_idx + 1] : 0.0f;
-            float v2 = (base_idx + 2 < N) ? new_val[base_idx + 2] : 0.0f;
-            float v3 = (base_idx + 3 < N) ? new_val[base_idx + 3] : 0.0f;
-            val_x = (isnan(v0) || isinf(v0)) ? 0.0f : v0;
-            val_y = (isnan(v1) || isinf(v1)) ? 0.0f : v1;
-            val_z = (isnan(v2) || isinf(v2)) ? 0.0f : v2;
-            val_w = (isnan(v3) || isinf(v3)) ? 0.0f : v3;
+            smem_m[slot*elems]=m_new_0;
+            if(elems==2) smem_m[slot*elems+1]=m_new_1;
         }
-
-        uchar2 old_q = q_vec[idx];
-
-        float m_old0 = dequant_uniform_4bit(old_q.x >> 4, old_scale);
-        float m_old1 = dequant_uniform_4bit(old_q.x & 0x0F, old_scale);
-        float m_old2 = dequant_uniform_4bit(old_q.y >> 4, old_scale);
-        float m_old3 = dequant_uniform_4bit(old_q.y & 0x0F, old_scale);
-
-        float m_new0 = beta * m_old0 + one_minus_b * val_x;
-        float m_new1 = beta * m_old1 + one_minus_b * val_y;
-        float m_new2 = beta * m_old2 + one_minus_b * val_z;
-        float m_new3 = beta * m_old3 + one_minus_b * val_w;
-
-        local_m[idx * 4 + 0] = m_new0;
-        local_m[idx * 4 + 1] = m_new1;
-        local_m[idx * 4 + 2] = m_new2;
-        local_m[idx * 4 + 3] = m_new3;
-
-        thread_max = fmaxf(thread_max, fabsf(m_new0));
-        thread_max = fmaxf(thread_max, fabsf(m_new1));
-        thread_max = fmaxf(thread_max, fabsf(m_new2));
-        thread_max = fmaxf(thread_max, fabsf(m_new3));
     }
 
-    float val = thread_max;
-    for (int offset = 16; offset > 0; offset /= 2)
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    // V quantize (NOCLIP, LAG, NORM only — APPLY skips, v already written by NORM)
+    if constexpr (MODE != MODE_APPLY) {
+        // Combined minmax reduce
+        float raw_max_v, raw_min_v;
+        block_reduce_minmax(thread_max_vlog, thread_min_vlog,
+                            s_reduce, s_reduce + num_warps,
+                            tid, num_warps, LOG_ZERO, LOG_MAX, &raw_max_v, &raw_min_v);
+        float max_log_v=fminf(raw_max_v,LOG_MAX);
+        float min_log_v=fmaxf(raw_min_v,log_eps_sq);
+        if(min_log_v>=max_log_v) min_log_v=max_log_v-1.0f;
+        float new_v_scale=fmaxf(max_log_v-min_log_v,MIN_SCALE), inv_v_s=254.0f/new_v_scale;
+        
+        if (elems == 2) {
+            unsigned short* v_q_16 = reinterpret_cast<unsigned short*>(v_q + start);
+            for (int iter=0;iter<slot_iters;iter++) {
+                int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+                float vl0=smem_vlog[slot*2];
+                float vl1=smem_vlog[slot*2+1];
+                unsigned char q0 = quant_v(vl0,min_log_v,inv_v_s);
+                unsigned char q1 = quant_v(vl1,min_log_v,inv_v_s);
+                v_q_16[slot] = (unsigned short)q0 | ((unsigned short)q1 << 8);
+            }
+        } else {
+            for (int iter=0;iter<slot_iters;iter++) {
+                int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+                int idx0=start+slot;
+                if(idx0<numel) v_q[idx0]=quant_v(smem_vlog[slot],min_log_v,inv_v_s);
+            }
+        }
+        if(tid==0) { v_scale[block_id]=new_v_scale; v_min_log[block_id]=min_log_v; }
+    }
 
-    if (tid % 32 == 0) s_max[tid / 32] = val;
+    // M quantize (NOCLIP, LAG, APPLY — NORM does not write m)
+    // Sub-block reduces: one m_scale per m_block_size elements
+    if constexpr (MODE != MODE_NORM) {
+        int num_m_blocks = block_size / m_block_size;
+        int m_slots_per_block = m_block_size / elems;
+        for (int mb = 0; mb < num_m_blocks; mb++) {
+            int mb_slot_start = mb * m_slots_per_block;
+            float local_max = 0.0f;
+            for (int j = tid; j < m_slots_per_block; j += blockDim.x) {
+                int si = mb_slot_start + j;
+                local_max = fmaxf(local_max, fabsf(smem_m[si * elems]));
+                if (elems == 2) local_max = fmaxf(local_max, fabsf(smem_m[si * elems + 1]));
+            }
+            float abs_max_m = fmaxf(block_reduce_max(local_max, s_reduce, tid, num_warps), MIN_SCALE);
+            float inv_abs_m = 1.0f / abs_max_m;
+            for (int j = tid; j < m_slots_per_block; j += blockDim.x) {
+                int si = mb_slot_start + j;
+                int idx0 = start + si * elems;
+                float m0 = smem_m[si * elems];
+                float m1 = (elems == 2) ? smem_m[si * elems + 1] : 0.0f;
+                if (idx0 < numel) quant_m_store(m_q, idx0, m0, m1, inv_abs_m, m_bits, m_mode, numel, s_qmap8, s_qmap4);
+            }
+            if (tid == 0) m_scale[block_id * num_m_blocks + mb] = abs_max_m;
+        }
+    }
+
+    // Norm accumulation (NORM, LAG)
+    if constexpr (MODE==MODE_NORM || MODE==MODE_LAG) {
+        float total_sq=block_reduce_sum(local_sq,s_reduce,tid,num_warps);
+        if(tid==0) atomicAdd(norm_buf,total_sq);
+    }
+}
+
+#define LAUNCH_1D(T,M) fused_update_1d_kernel<T,M><<<blocks,threads,smem>>>
+
+void fused_update_1d_noclip_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log, torch::Tensor alpha,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    // 2*num_warps for minmax + SMEM_QMAP for codebook
+    size_t smem=(2*block_size+2*num_warps+SMEM_QMAP)*sizeof(float);
+    TORCH_CHECK(smem<=49152, "block_size too large for 48KB shared memory limit.");
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_noclip",([&]{
+            LAUNCH_1D(scalar_t,MODE_NOCLIP)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                nullptr,nullptr,alpha.data_ptr<float>(),
+                beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        }));
+}
+
+void fused_update_1d_norm_cuda(
+    torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor v_buf, torch::Tensor norm_buf,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    // 2*num_warps for minmax + SMEM_QMAP for codebook
+    size_t smem=(block_size+2*num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"fused_update_1d_norm",([&]{
+            LAUNCH_1D(scalar_t,MODE_NORM)(
+                nullptr,grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,
+                beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        }));
+}
+
+void fused_update_1d_apply_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor v_buf,
+    torch::Tensor norm_buf, torch::Tensor alpha,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode, float d) {
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    // num_warps (no minmax in APPLY) + SMEM_QMAP for codebook
+    size_t smem=(block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_apply",([&]{
+            LAUNCH_1D(scalar_t,MODE_APPLY)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d);
+        }));
+}
+
+void fused_update_1d_lag_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode, float d) {
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    // 2*num_warps for minmax + SMEM_QMAP for codebook
+    size_t smem=(2*block_size+2*num_warps+SMEM_QMAP)*sizeof(float);
+    TORCH_CHECK(smem<=49152, "block_size too large for 48KB shared memory limit.");
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_lag",([&]{
+            LAUNCH_1D(scalar_t,MODE_LAG)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d);
+        }));
+}
+#undef LAUNCH_1D
+
+// ==========================================
+// 5. Fused 1D V-only Update (beta1=None, V-EMA fused)
+//    No M quantization — no codebook needed.
+// ==========================================
+template <typename T, int MODE>
+__global__ void fused_update_1d_vonly_kernel(
+    T* __restrict__ param, const T* __restrict__ grad,
+    unsigned char* __restrict__ v_q, float* __restrict__ v_scale, float* __restrict__ v_min_log,
+    float* __restrict__ v_buf,
+    float* __restrict__ norm_buf, const float* __restrict__ alpha,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq,
+    int numel, float sqrt_numel, int block_size,
+    const float* __restrict__ prev_norm_ptr, float d) {
+    int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
+    int start=block_id*block_size;
+    extern __shared__ float shared_mem[];
+    float* smem_vlog;
+    float* s_reduce;
+    if constexpr (MODE == MODE_APPLY) {
+        smem_vlog = nullptr;
+        s_reduce = shared_mem;
+    } else {
+        smem_vlog = shared_mem;
+        // 2*num_warps for combined minmax
+        s_reduce = &shared_mem[block_size];
+    }
+
+    float one_minus_bv=1.0f-beta_val;
+    float old_v_scale=v_scale[block_id], old_v_min_log=v_min_log[block_id];
+
+    float step_scale=0.0f;
+    if constexpr (MODE==MODE_NOCLIP) { step_scale=*alpha; }
+    else if constexpr (MODE==MODE_APPLY) {
+        float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(*norm_buf)/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    } else if constexpr (MODE==MODE_LAG) {
+        float pn=*prev_norm_ptr;
+        float denom=(d>0.0f)?fmaxf(1.0f,pn/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    }
+
+    float thread_max_vlog=LOG_ZERO, thread_min_vlog=LOG_MAX, local_sq=0.0f;
+
+    for (int i=tid; i<block_size; i+=blockDim.x) {
+        int gi=start+i;
+        if (gi>=numel) break;
+        float g=load_grad(grad,gi);
+        float inv_std;
+        if constexpr (MODE==MODE_APPLY) {
+            float v_exact=v_buf[gi];
+            inv_std=use_adam_denom?1.0f/(sqrtf(v_exact)+eps_for_denom):(v_exact>0.0f?rsqrtf(v_exact):0.0f);
+        } else {
+            float v_old=dequant_v(v_q[gi],old_v_scale,old_v_min_log);
+            float v_new=v_old*one_minus_bv+(g*g+eps_for_grad_sq)*beta_val;
+            float vl=(v_new>0.0f)?log2f(fmaxf(v_new,MIN_VAL)):LOG_ZERO;
+            smem_vlog[i]=vl;
+            thread_max_vlog=fmaxf(thread_max_vlog,vl);
+            if(v_new>0.0f) thread_min_vlog=fminf(thread_min_vlog,vl);
+            inv_std=use_adam_denom?1.0f/(sqrtf(v_new)+eps_for_denom):(v_new>0.0f?rsqrtf(v_new):0.0f);
+            if constexpr (MODE==MODE_NORM) { v_buf[gi]=v_new; }
+        }
+        float u=g*inv_std;
+        if constexpr (MODE==MODE_NORM) { local_sq+=u*u; }
+        else { float p=static_cast<float>(param[gi]); param[gi]=static_cast<T>(p-step_scale*u); }
+        if constexpr (MODE==MODE_LAG) { local_sq+=u*u; }
+    }
+
+    if constexpr (MODE!=MODE_APPLY) {
+        // Combined minmax reduce
+        float raw_max_v, raw_min_v;
+        block_reduce_minmax(thread_max_vlog, thread_min_vlog,
+                            s_reduce, s_reduce + num_warps,
+                            tid, num_warps, LOG_ZERO, LOG_MAX, &raw_max_v, &raw_min_v);
+        float max_log_v=fminf(raw_max_v,LOG_MAX);
+        float min_log_v=fmaxf(raw_min_v,log_eps_sq);
+        if(min_log_v>=max_log_v) min_log_v=max_log_v-1.0f;
+        float new_v_scale=fmaxf(max_log_v-min_log_v,MIN_SCALE), inv_v_s=254.0f/new_v_scale;
+        for (int i=tid; i<block_size; i+=blockDim.x) {
+            int gi=start+i;
+            if(gi>=numel) break;
+            v_q[gi]=quant_v(smem_vlog[i],min_log_v,inv_v_s);
+        }
+        if(tid==0) { v_scale[block_id]=new_v_scale; v_min_log[block_id]=min_log_v; }
+    }
+
+    if constexpr (MODE==MODE_NORM || MODE==MODE_LAG) {
+        float total_sq=block_reduce_sum(local_sq,s_reduce,tid,num_warps);
+        if(tid==0) atomicAdd(norm_buf,total_sq);
+    }
+}
+
+void fused_update_1d_vonly_noclip_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor v_q, torch::Tensor v_scale,
+    torch::Tensor v_min_log, torch::Tensor alpha,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size) {
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    // 2*num_warps for minmax
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_noclip",([&]{
+            fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP><<<blocks,threads,smem>>>(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                nullptr,nullptr,alpha.data_ptr<float>(),
+                beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,nullptr,0.0f);
+        }));
+}
+
+void fused_update_1d_vonly_norm_cuda(
+    torch::Tensor grad, torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor v_buf, torch::Tensor norm_buf,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size) {
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    // 2*num_warps for minmax
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"fused_update_1d_vonly_norm",([&]{
+            fused_update_1d_vonly_kernel<scalar_t,MODE_NORM><<<blocks,threads,smem>>>(
+                nullptr,grad.data_ptr<scalar_t>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,
+                beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,nullptr,0.0f);
+        }));
+}
+
+void fused_update_1d_vonly_apply_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor v_q, torch::Tensor v_scale,
+    torch::Tensor v_min_log, torch::Tensor v_buf, torch::Tensor norm_buf, torch::Tensor alpha,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, float d) {
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    size_t smem=num_warps*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_apply",([&]{
+            fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY><<<blocks,threads,smem>>>(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,nullptr,d);
+        }));
+}
+
+void fused_update_1d_vonly_lag_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor v_q, torch::Tensor v_scale,
+    torch::Tensor v_min_log,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, float d) {
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    // 2*num_warps for minmax
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_lag",([&]{
+            fused_update_1d_vonly_kernel<scalar_t,MODE_LAG><<<blocks,threads,smem>>>(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                v_q.data_ptr<unsigned char>(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),
+                nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,
+                numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d);
+        }));
+}
+
+// ==========================================
+// 6. Fused 2D Update (fp32 row/col for inv_std, quantized m)
+//    row_fp32/col_fp32: exact fp32 EMA results from fused_log_quantize_lerp.
+// ==========================================
+template <typename T, int MODE>
+__global__ void fused_update_2d_kernel(
+    T* __restrict__ param, const T* __restrict__ grad,
+    void* __restrict__ m_q, float* __restrict__ m_scale,
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
+    const float* __restrict__ row_mean_val_ptr,
+    float* __restrict__ norm_buf, const float* __restrict__ alpha,
+    float beta1, int R, int C, int numel, float sqrt_numel,
+    int m_block_size, int m_bits, int m_mode,
+    const float* __restrict__ prev_norm_ptr, float d) {
+    int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
+    int start=block_id*m_block_size;
+    extern __shared__ float shared_mem[];
+    float* smem_m=(MODE==MODE_NORM)?nullptr:shared_mem;
+    float* s_reduce=(MODE==MODE_NORM)?shared_mem:&shared_mem[m_block_size];
+    int reduce_base = (MODE==MODE_NORM) ? 0 : m_block_size;
+    float* s_qmap8 = &shared_mem[reduce_base + num_warps];
+    float* s_qmap4 = s_qmap8 + 256;
+    load_codebook_smem(s_qmap8, s_qmap4, tid, blockDim.x);
     __syncthreads();
 
-    if (tid < 32) { 
-        if (tid < num_warps) val = s_max[tid];
-        else val = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, val, offset);
-            if (tid + offset < num_warps) val = fmaxf(val, other);
+    float one_minus_b1=1.0f-beta1;
+    int elems=(m_bits==8)?1:2;
+    float step_scale=0.0f;
+    if constexpr (MODE==MODE_NOCLIP) { step_scale=*alpha; }
+    else if constexpr (MODE==MODE_APPLY) {
+        float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(*norm_buf)/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    } else if constexpr (MODE==MODE_LAG) {
+        float pn=*prev_norm_ptr;
+        float denom=(d>0.0f)?fmaxf(1.0f,pn/(sqrt_numel*d)):1.0f;
+        step_scale=*alpha/denom;
+    }
+
+    int total_slots=m_block_size/elems;
+    int slot_iters=(total_slots+blockDim.x-1)/blockDim.x;
+    float thread_max=0.0f, local_sq=0.0f;
+
+    for (int iter=0;iter<slot_iters;iter++) {
+        int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+        int idx0=start+slot*elems;
+        float m_new_0=0.0f, m_new_1=0.0f;
+        if (idx0<numel) {
+            int b0=idx0/(R*C), r0=(idx0/C)%R, c0=idx0%C;
+            float g0=load_grad(grad,idx0);
+            float m_old0=dequant_m(m_q,idx0,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_0=beta1*m_old0+one_minus_b1*g0;
+            int r_idx0=b0*R+r0, c_idx0=b0*C+c0;
+            float inv_std0=sqrtf(fmaxf(row_mean_val_ptr[b0],MIN_VAL))*rsqrtf(fmaxf(row_fp32[r_idx0],MIN_VAL))*rsqrtf(fmaxf(col_fp32[c_idx0],MIN_VAL));
+            float u0=m_new_0*inv_std0;
+            if constexpr (MODE==MODE_NORM) { local_sq+=u0*u0; }
+            else { float p=static_cast<float>(param[idx0]); param[idx0]=static_cast<T>(p-step_scale*u0); }
+            if constexpr (MODE==MODE_LAG) { local_sq+=u0*u0; }
+            thread_max=fmaxf(thread_max,fabsf(m_new_0));
         }
-        if (tid == 0) s_max[0] = val;
+        if (elems==2 && idx0+1<numel) {
+            int idx1=idx0+1, b1=idx1/(R*C), r1=(idx1/C)%R, c1=idx1%C;
+            float g1=load_grad(grad,idx1);
+            float m_old1=dequant_m(m_q,idx1,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_1=beta1*m_old1+one_minus_b1*g1;
+            int r_idx1=b1*R+r1, c_idx1=b1*C+c1;
+            float r_val1=fmaxf(row_fp32[r_idx1],MIN_VAL);
+            float c_val1=fmaxf(col_fp32[c_idx1],MIN_VAL);
+            float rm_val1=fmaxf(row_mean_val_ptr[b1],MIN_VAL);
+            float inv_std1=sqrtf(rm_val1)*rsqrtf(r_val1)*rsqrtf(c_val1);
+            float u1=m_new_1*inv_std1;
+            if constexpr (MODE==MODE_NORM) { local_sq+=u1*u1; }
+            else { float p=static_cast<float>(param[idx1]); param[idx1]=static_cast<T>(p-step_scale*u1); }
+            if constexpr (MODE==MODE_LAG) { local_sq+=u1*u1; }
+            thread_max=fmaxf(thread_max,fabsf(m_new_1));
+        }
+        if constexpr (MODE!=MODE_NORM) {
+            smem_m[slot*elems]=m_new_0;
+            if(elems==2) smem_m[slot*elems+1]=m_new_1;
+        }
     }
-    __syncthreads(); 
-
-    float abs_max = fmaxf(s_max[0], 1e-12f);
-    float new_scale = abs_max;
-    float inv_scale = 8.0f / new_scale;
-
-    for (int i = 0; i < vec_iters; i++) {
-        int idx = tid + i * stride;
-        if (idx >= total_vecs) break;
-        
-        float m0 = local_m[idx * 4 + 0];
-        float m1 = local_m[idx * 4 + 1];
-        float m2 = local_m[idx * 4 + 2];
-        float m3 = local_m[idx * 4 + 3];
-
-        int q0 = quant_uniform_4bit(m0, inv_scale);
-        int q1 = quant_uniform_4bit(m1, inv_scale);
-        int q2 = quant_uniform_4bit(m2, inv_scale);
-        int q3 = quant_uniform_4bit(m3, inv_scale);
-
-        uchar2 out_q;
-        out_q.x = (unsigned char)((q0 << 4) | q1);
-        out_q.y = (unsigned char)((q2 << 4) | q3);
-
-        q_vec[idx] = out_q;
+    if constexpr (MODE!=MODE_NORM) {
+        float abs_max=fmaxf(block_reduce_max(thread_max,s_reduce,tid,num_warps),MIN_SCALE);
+        float inv_abs=1.0f/abs_max;
+        for (int iter=0;iter<slot_iters;iter++) {
+            int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+            int idx0=start+slot*elems;
+            float m0=smem_m[slot*elems];
+            float m1=(elems==2)?smem_m[slot*elems+1]:0.0f;
+            if(idx0<numel) quant_m_store(m_q,idx0,m0,m1,inv_abs,m_bits,m_mode,numel,s_qmap8,s_qmap4);
+        }
+        if(tid==0) m_scale[block_id]=abs_max;
     }
-
-    if (tid == 0) scale[block_id] = new_scale;
+    if constexpr (MODE==MODE_NORM || MODE==MODE_LAG) {
+        float total_sq=block_reduce_sum(local_sq,s_reduce,tid,num_warps);
+        if(tid==0) atomicAdd(norm_buf,total_sq);
+    }
 }
 
-void fused_4bit_quantize_lerp_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor new_val, 
-    float beta, int block_size, int N)
-{
-    TORCH_CHECK(q.scalar_type() == at::kByte && scale.scalar_type() == at::kFloat && new_val.scalar_type() == at::kFloat);
-    TORCH_CHECK(q.is_cuda() && scale.is_cuda() && new_val.is_cuda());
-    TORCH_CHECK(q.is_contiguous() && scale.is_contiguous() && new_val.is_contiguous());
-    
-    int total_vecs = block_size / 4;
-    int threads = min(256, ((total_vecs + 31) / 32) * 32);
-    if (threads == 0) threads = 32;
+#define LAUNCH_2D(T,M) fused_update_2d_kernel<T,M><<<blocks,threads,smem>>>
 
-    TORCH_CHECK(block_size >= 32 && block_size % 4 == 0, 
-                "block_size must be a multiple of 4 and >= 32 for 4-bit quantization.");
-
-    int num_blocks = (N + block_size - 1) / block_size;
-    int num_warps = threads / 32;
-    size_t shared_mem = (block_size + num_warps) * sizeof(float); 
-
-    TORCH_CHECK(shared_mem <= 49152, "block_size is too large, exceeding 48KB shared memory limit.");
-    
-    fused_4bit_quantize_lerp_kernel<<<num_blocks, threads, shared_mem>>>(
-        q.data_ptr<unsigned char>(), scale.data_ptr<float>(), new_val.data_ptr<float>(), 
-        beta, block_size, N
-    );
+void fused_update_2d_noclip_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor alpha,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_noclip",([&]{
+            LAUNCH_2D(scalar_t,MODE_NOCLIP)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),
+                beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        }));
 }
 
+void fused_update_2d_norm_cuda(
+    torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"fused_update_2d_norm",([&]{
+            LAUNCH_2D(scalar_t,MODE_NORM)(
+                nullptr,grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,
+                beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        }));
+}
+
+void fused_update_2d_apply_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode, float d) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_apply",([&]{
+            LAUNCH_2D(scalar_t,MODE_APPLY)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,d);
+        }));
+}
+
+void fused_update_2d_lag_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode, float d) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_lag",([&]{
+            LAUNCH_2D(scalar_t,MODE_LAG)(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+                beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d);
+        }));
+}
+#undef LAUNCH_2D
+
 // ==========================================
-// 3. Phase 1: Compute Update Norm (2D, V_t only)
+// 6b. Factored Means (eliminates g_sq temporary)
+//     Row sums: warp-reduce before atomic (32x less contention).
+//     Col sums: direct atomic (adjacent lanes hit distinct slots).
 // ==========================================
-__global__ void compute_update_norm_2d_kernel(
-    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
-    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
-    const float* __restrict__ grad, float* __restrict__ total_sum_sq,
-    const float* __restrict__ row_mean_val_ptr, float log_eps_sq, int R, int C, int numel, int block_size)
-{
-    float sq = 0.0f;
+template <typename T>
+__global__ void compute_factored_sums_kernel(
+    const T* __restrict__ grad,
+    float* __restrict__ row_sum, float* __restrict__ col_sum,
+    int R, int C, int numel) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int b = idx / (R * C);
-        int r = (idx / C) % R;
-        int c = idx % C;
-        
-        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / block_size] + MIN_LOG;
-        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / block_size] + MIN_LOG;
-        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
+    int lane = threadIdx.x % 32;
 
-        float log_v_ij = log_r + log_c - log_row_mean; 
+    for (int i = tid; i < numel; i += stride) {
+        float g = load_grad(grad, i);
+        float g_sq = g * g;
+        int r = i / C;
+        int c = i % C;
+        int b = i / (R * C);
         
-        float max_log = fmaxf(log_v_ij, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
-        
-        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float u_ij = g_val * inv_std;
-        
-        sq += u_ij * u_ij;
-    }
-    
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
-    __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
+        warp_atomic_add_row(g_sq, r, row_sum, lane);
+
+        // --- Col Sum (Low Contention Risk) ---
+        // Adjacent threads process different columns, so direct atomic is fine.
+        atomicAdd(&col_sum[b * C + c], g_sq);
     }
 }
 
-void compute_update_norm_2d_cuda(
-    torch::Tensor row_var_q, torch::Tensor row_var_scale,
-    torch::Tensor col_var_q, torch::Tensor col_var_scale,
+void compute_factored_sums_cuda(torch::Tensor grad, torch::Tensor row_sum, torch::Tensor col_sum,
+    int R, int C, int numel) {
+    int threads = 256, blocks = min(1024, (numel + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+        grad.scalar_type(), "compute_factored_sums", ([&] {
+            compute_factored_sums_kernel<scalar_t><<<blocks, threads>>>(
+                grad.data_ptr<scalar_t>(),
+                row_sum.data_ptr<float>(), col_sum.data_ptr<float>(),
+                R, C, numel);
+        }));
+}
+
+// ==========================================
+// 7. CAME: U_t RMS + Pass 1 + Pass 2
+//    All inv_std computed from fp32 EMA buffers.
+// ==========================================
+template <typename T>
+__global__ void compute_ut_rms_kernel(
+    const T* __restrict__ grad,
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
+    const float* __restrict__ row_mean_val_ptr,
+    float* __restrict__ ut_sq_sum,
+    int R, int C, int numel) {
+    float sq=0.0f;
+    int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x; idx<numel; idx+=stride) {
+        int b=idx/(R*C), r=(idx/C)%R, c=idx%C;
+        float g=load_grad(grad,idx);
+        int r_idx=b*R+r, c_idx=b*C+c;
+        float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+        float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+        float rm_val=fmaxf(row_mean_val_ptr[b],MIN_VAL);
+        float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+        float u=g*inv_std;
+        sq+=u*u;
+    }
+    __shared__ float s_sum[32];
+    float total=block_reduce_sum(sq,s_sum,threadIdx.x,blockDim.x/32);
+    if(threadIdx.x==0) atomicAdd(ut_sq_sum,total);
+}
+
+void compute_ut_rms_cuda(
+    torch::Tensor grad,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor ut_sq_sum,
+    int R, int C, int numel) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"compute_ut_rms",([&]{
+            compute_ut_rms_kernel<scalar_t><<<blocks,threads>>>(
+                grad.data_ptr<scalar_t>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),ut_sq_sum.data_ptr<float>(),
+                R,C,numel);
+        }));
+}
+
+template <typename T>
+__global__ void fused_came_pass1_kernel(
+    const T* __restrict__ grad,
+    const void* __restrict__ m_q, const float* __restrict__ m_scale,
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
+    const float* __restrict__ row_mean_val_ptr,
+    float* __restrict__ res_row_sum, float* __restrict__ res_col_sum,
+    const float* __restrict__ clip_factor_ptr,
+    float beta1, float eps_came,
+    int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int block_id=blockIdx.x, tid=threadIdx.x;
+    int start=block_id*m_block_size;
+    __shared__ float s_qmap8[256];
+    __shared__ float s_qmap4[16];
+    load_codebook_smem(s_qmap8, s_qmap4, tid, blockDim.x);
+    __syncthreads();
+
+    float one_minus_b1=1.0f-beta1;
+    int elems=(m_bits==8)?1:2;
+    float clip_factor=*clip_factor_ptr;
+    int total_slots=m_block_size/elems;
+    int slot_iters=(total_slots+blockDim.x-1)/blockDim.x;
+
+    for (int iter=0;iter<slot_iters;iter++) {
+        int slot=tid+iter*blockDim.x;
+        bool valid=(slot<total_slots);
+        int idx0=valid?(start+slot*elems):0;
+        float res_0=0.0f, res_1=0.0f;
+
+        if (valid && idx0<numel) {
+            int b0=idx0/(R*C), r0=(idx0/C)%R, c0=idx0%C;
+            float g=load_grad(grad,idx0);
+            int r_idx=b0*R+r0, c_idx=b0*C+c0;
+            float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+            float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+            float rm_val=fmaxf(row_mean_val_ptr[b0],MIN_VAL);
+            float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+            float u_t=g*inv_std/clip_factor;
+            float m_old=dequant_m(m_q,idx0,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            float m_new=beta1*m_old+one_minus_b1*u_t;
+            float diff=u_t-m_new;
+            res_0=diff*diff+eps_came;
+            atomicAdd(&res_col_sum[b0*C+c0],res_0);
+        }
+        if (valid && elems==2 && idx0+1<numel) {
+            int idx1=idx0+1, b1=idx1/(R*C), r1=(idx1/C)%R, c1=idx1%C;
+            float g=load_grad(grad,idx1);
+            int r_idx=b1*R+r1, c_idx=b1*C+c1;
+            float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+            float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+            float rm_val=fmaxf(row_mean_val_ptr[b1],MIN_VAL);
+            float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+            float u_t=g*inv_std/clip_factor;
+            float m_old=dequant_m(m_q,idx1,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            float m_new=beta1*m_old+one_minus_b1*u_t;
+            float diff=u_t-m_new;
+            res_1=diff*diff+eps_came;
+            atomicAdd(&res_col_sum[b1*C+c1],res_1);
+        }
+
+        int lane=tid%32;
+        int r_idx0=(valid&&idx0<numel)?(idx0/(R*C))*R+(idx0/C)%R:-1;
+        warp_atomic_add_row((valid&&idx0<numel)?res_0:0.0f, r_idx0, res_row_sum, lane);
+
+        if(elems==2){
+            int r_idx1=(valid&&idx0+1<numel)?((idx0+1)/(R*C))*R+((idx0+1)/C)%R:-1;
+            warp_atomic_add_row((valid&&idx0+1<numel)?res_1:0.0f, r_idx1, res_row_sum, lane);
+        }
+    }
+}
+
+void fused_came_pass1_cuda(
+    torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val,
+    torch::Tensor res_row_sum, torch::Tensor res_col_sum, torch::Tensor clip_factor,
+    float beta1, float eps_came,
+    int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(m_block_size,m_bits);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"fused_came_pass1",([&]{
+            fused_came_pass1_kernel<scalar_t><<<blocks,threads>>>(
+                grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),
+                res_row_sum.data_ptr<float>(),res_col_sum.data_ptr<float>(),
+                clip_factor.data_ptr<float>(),
+                beta1,eps_came,R,C,numel,m_block_size,m_bits,m_mode);
+        }));
+}
+
+// CAME Pass 2: MODE_NORM for Fira norm computation, MODE_APPLY for final update
+template <typename T, int MODE>
+__global__ void fused_came_pass2_kernel(
+    T* __restrict__ param, const T* __restrict__ grad,
+    void* __restrict__ m_q, float* __restrict__ m_scale,
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
+    const float* __restrict__ row_mean_val_ptr,
+    const float* __restrict__ conf_row_fp32, const float* __restrict__ conf_col_fp32,
+    const float* __restrict__ conf_row_mean_ptr,
+    const float* __restrict__ clip_factor_ptr,
+    const float* __restrict__ alpha, float* __restrict__ norm_buf,
+    float beta1,
+    int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
+    int start=block_id*m_block_size;
+    extern __shared__ float shared_mem[];
+    float* smem_m=(MODE==MODE_NORM)?nullptr:shared_mem;
+    float* s_reduce=(MODE==MODE_NORM)?shared_mem:&shared_mem[m_block_size];
+    int reduce_base = (MODE==MODE_NORM) ? 0 : m_block_size;
+    float* s_qmap8 = &shared_mem[reduce_base + num_warps];
+    float* s_qmap4 = s_qmap8 + 256;
+    load_codebook_smem(s_qmap8, s_qmap4, tid, blockDim.x);
+    __syncthreads();
+
+    float one_minus_b1=1.0f-beta1;
+    int elems=(m_bits==8)?1:2;
+    float clip_factor=*clip_factor_ptr;
+    float alpha_val=(MODE==MODE_APPLY)?*alpha:0.0f;
+    int total_slots=m_block_size/elems;
+    int slot_iters=(total_slots+blockDim.x-1)/blockDim.x;
+    float thread_max=0.0f, local_sq=0.0f;
+
+    for (int iter=0;iter<slot_iters;iter++) {
+        int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+        int idx0=start+slot*elems;
+        float m_new_0=0.0f, m_new_1=0.0f;
+
+        if (idx0<numel) {
+            int b=idx0/(R*C), r=(idx0/C)%R, c=idx0%C;
+            float g=load_grad(grad,idx0);
+            int r_idx=b*R+r, c_idx=b*C+c;
+            float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+            float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+            float rm_val=fmaxf(row_mean_val_ptr[b],MIN_VAL);
+            float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+            float u_t=g*inv_std/clip_factor;
+            float m_old=dequant_m(m_q,idx0,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_0=beta1*m_old+one_minus_b1*u_t;
+            float inv_row=sqrtf(fmaxf(conf_row_mean_ptr[b],MIN_VAL))*rsqrtf(fmaxf(conf_row_fp32[r_idx],MIN_VAL));
+            float inv_col_c=rsqrtf(fmaxf(conf_col_fp32[c_idx],MIN_VAL));
+            float u_final=m_new_0*inv_row*inv_col_c;
+            if constexpr (MODE==MODE_NORM) { local_sq+=u_final*u_final; }
+            else { float p=static_cast<float>(param[idx0]); param[idx0]=static_cast<T>(p-alpha_val*u_final); }
+            thread_max=fmaxf(thread_max,fabsf(m_new_0));
+        }
+        if (elems==2 && idx0+1<numel) {
+            int idx1=idx0+1, b=idx1/(R*C), r=(idx1/C)%R, c=idx1%C;
+            float g=load_grad(grad,idx1);
+            int r_idx=b*R+r, c_idx=b*C+c;
+            float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+            float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+            float rm_val=fmaxf(row_mean_val_ptr[b],MIN_VAL);
+            float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+            float u_t=g*inv_std/clip_factor;
+            float m_old=dequant_m(m_q,idx1,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+            m_new_1=beta1*m_old+one_minus_b1*u_t;
+            float inv_row=sqrtf(fmaxf(conf_row_mean_ptr[b],MIN_VAL))*rsqrtf(fmaxf(conf_row_fp32[r_idx],MIN_VAL));
+            float inv_col_c=rsqrtf(fmaxf(conf_col_fp32[c_idx],MIN_VAL));
+            float u_final=m_new_1*inv_row*inv_col_c;
+            if constexpr (MODE==MODE_NORM) { local_sq+=u_final*u_final; }
+            else { float p=static_cast<float>(param[idx1]); param[idx1]=static_cast<T>(p-alpha_val*u_final); }
+            thread_max=fmaxf(thread_max,fabsf(m_new_1));
+        }
+        if constexpr (MODE==MODE_APPLY) {
+            smem_m[slot*elems]=m_new_0;
+            if(elems==2) smem_m[slot*elems+1]=m_new_1;
+        }
+    }
+    if constexpr (MODE==MODE_APPLY) {
+        float abs_max=fmaxf(block_reduce_max(thread_max,s_reduce,tid,num_warps),MIN_SCALE);
+        float inv_abs=1.0f/abs_max;
+        for (int iter=0;iter<slot_iters;iter++) {
+            int slot=tid+iter*blockDim.x; if(slot>=total_slots) break;
+            int idx0=start+slot*elems;
+            float m0=smem_m[slot*elems];
+            float m1=(elems==2)?smem_m[slot*elems+1]:0.0f;
+            if(idx0<numel) quant_m_store(m_q,idx0,m0,m1,inv_abs,m_bits,m_mode,numel,s_qmap8,s_qmap4);
+        }
+        if(tid==0) m_scale[block_id]=abs_max;
+    }
+    if constexpr (MODE==MODE_NORM) {
+        float total_sq=block_reduce_sum(local_sq,s_reduce,tid,num_warps);
+        if(tid==0) atomicAdd(norm_buf,total_sq);
+    }
+}
+
+void fused_came_pass2_norm_cuda(
+    torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val,
+    torch::Tensor conf_row_fp32, torch::Tensor conf_col_fp32,
+    torch::Tensor conf_row_mean,
+    torch::Tensor clip_factor, torch::Tensor norm_buf,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"fused_came_pass2_norm",([&]{
+            fused_came_pass2_kernel<scalar_t,MODE_NORM><<<blocks,threads,smem>>>(
+                nullptr,grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),
+                conf_row_fp32.data_ptr<float>(),conf_col_fp32.data_ptr<float>(),
+                conf_row_mean.data_ptr<float>(),
+                clip_factor.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),
+                beta1,R,C,numel,m_block_size,m_bits,m_mode);
+        }));
+}
+
+void fused_came_pass2_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val,
+    torch::Tensor conf_row_fp32, torch::Tensor conf_col_fp32,
+    torch::Tensor conf_row_mean,
+    torch::Tensor clip_factor, torch::Tensor alpha,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_came_pass2",([&]{
+            fused_came_pass2_kernel<scalar_t,MODE_APPLY><<<blocks,threads,smem>>>(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                m_q.data_ptr(),m_scale.data_ptr<float>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),
+                conf_row_fp32.data_ptr<float>(),conf_col_fp32.data_ptr<float>(),
+                conf_row_mean.data_ptr<float>(),
+                clip_factor.data_ptr<float>(),alpha.data_ptr<float>(),nullptr,
+                beta1,R,C,numel,m_block_size,m_bits,m_mode);
+        }));
+}
+
+// ==========================================
+// 8. V-only 2D (beta1=None, fp32 row/col for inv_std)
+//    No M — no codebook needed.
+// ==========================================
+template <typename T>
+__global__ void compute_update_norm_2d_vonly_kernel(
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
+    const T* __restrict__ grad, float* __restrict__ total_sum_sq,
+    const float* __restrict__ row_mean_val_ptr, int R, int C, int numel) {
+    float sq=0.0f; int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        int b=idx/(R*C), r=(idx/C)%R, c=idx%C;
+        int r_idx=b*R+r, c_idx=b*C+c;
+        float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+        float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+        float rm_val=fmaxf(row_mean_val_ptr[b],MIN_VAL);
+        float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+        float g=load_grad(grad,idx); float u=g*inv_std; sq+=u*u;
+    }
+    __shared__ float s_sum[32];
+    float total=block_reduce_sum(sq,s_sum,threadIdx.x,blockDim.x/32);
+    if(threadIdx.x==0) atomicAdd(total_sum_sq,total);
+}
+
+void compute_update_norm_2d_vonly_cuda(
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
     torch::Tensor grad, torch::Tensor total_sum_sq,
-    torch::Tensor row_mean_val, float log_eps_sq, int R, int C, int numel, int block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_2d_kernel<<<blocks, threads>>>(
-        row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
-        col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
-        grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(),
-        row_mean_val.data_ptr<float>(), log_eps_sq, R, C, numel, block_size
-    );
+    torch::Tensor row_mean_val, int R, int C, int numel) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        grad.scalar_type(),"compute_update_norm_2d_vonly",([&]{
+            compute_update_norm_2d_vonly_kernel<scalar_t><<<blocks,threads>>>(
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                grad.data_ptr<scalar_t>(),total_sum_sq.data_ptr<float>(),
+                row_mean_val.data_ptr<float>(),R,C,numel);
+        }));
 }
 
-// ==========================================
-// 4. Phase 2: Apply Update (2D, V_t only)
-// ==========================================
-template <typename scalar_t>
-__global__ void apply_update_2d_kernel(
-    scalar_t* __restrict__ param, const float* __restrict__ grad,
-    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
-    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
+template <typename T>
+__global__ void apply_update_2d_vonly_kernel(
+    T* __restrict__ param, const T* __restrict__ grad,
+    const float* __restrict__ row_fp32, const float* __restrict__ col_fp32,
     const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    const float* __restrict__ row_mean_val_ptr, float d, float log_eps_sq, int R, int C, int numel, int block_size)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int b = idx / (R * C);
-        int r = (idx / C) % R;
-        int c = idx % C;
-        
-        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / block_size] + MIN_LOG;
-        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / block_size] + MIN_LOG;
-        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
-
-        float log_v_ij = log_r + log_c - log_row_mean; 
-        
-        float max_log = fmaxf(log_v_ij, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
-        
-        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float u_ij = g_val * inv_std;
-        
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u_ij;
-        param[idx] = static_cast<scalar_t>(p_val);
+    const float* __restrict__ row_mean_val_ptr,
+    float d, int R, int C, int numel) {
+    float sum_sq_val=*sum_sq_ptr, alpha_val=*alpha;
+    float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(sum_sq_val)/(sqrtf((float)numel)*d)):1.0f;
+    float step_size=alpha_val/denom;
+    int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        int b=idx/(R*C), r=(idx/C)%R, c=idx%C;
+        int r_idx=b*R+r, c_idx=b*C+c;
+        float r_val=fmaxf(row_fp32[r_idx],MIN_VAL);
+        float c_val=fmaxf(col_fp32[c_idx],MIN_VAL);
+        float rm_val=fmaxf(row_mean_val_ptr[b],MIN_VAL);
+        float inv_std=sqrtf(rm_val)*rsqrtf(r_val)*rsqrtf(c_val);
+        float g=load_grad(grad,idx);
+        float p=static_cast<float>(param[idx]); param[idx]=static_cast<T>(p-step_size*g*inv_std);
     }
 }
 
-void apply_update_2d_cuda(
+void apply_update_2d_vonly_cuda(
     torch::Tensor param, torch::Tensor grad,
-    torch::Tensor row_var_q, torch::Tensor row_var_scale,
-    torch::Tensor col_var_q, torch::Tensor col_var_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha,
-    torch::Tensor row_mean_val, float d, float log_eps_sq, int R, int C, int numel, int block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_2d_cuda", ([&] {
-            apply_update_2d_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), grad.data_ptr<float>(),
-                row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
-                col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(),
-                row_mean_val.data_ptr<float>(), d, log_eps_sq, R, C, numel, block_size
-            );
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor sum_sq, torch::Tensor alpha, torch::Tensor row_mean_val,
+    float d, int R, int C, int numel) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"apply_update_2d_vonly",([&]{
+            apply_update_2d_vonly_kernel<scalar_t><<<blocks,threads>>>(
+                param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+                row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+                sum_sq.data_ptr<float>(),alpha.data_ptr<float>(),row_mean_val.data_ptr<float>(),
+                d,R,C,numel);
         }));
 }
 
 // ==========================================
-// 5. 1D Vector Variance Kernels (V_t only)
-// ==========================================
-__global__ void compute_update_norm_1d_kernel(
-    const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
-    const float* __restrict__ grad, float* __restrict__ total_sum_sq,
-    float log_eps_sq, int numel, int block_size, float eps_for_denom, bool use_adam_denom)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            float v_val = exp2f(fmaxf(log_v, -53.0f));
-            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
-        } else {
-            float max_log = fmaxf(log_v, log_eps_sq);
-            max_log = fmaxf(max_log, -53.0f); 
-            inv_std = exp2f(-0.5f * max_log); 
-        }
-        
-        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float u_val = g_val * inv_std;
-        
-        sq += u_val * u_val;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
-    __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
-    }
-}
-
-void compute_update_norm_1d_cuda(
-    torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor grad, torch::Tensor total_sum_sq, float log_eps_sq, int numel, int block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_1d_kernel<<<blocks, threads>>>(
-        variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-        grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(), log_eps_sq, numel, block_size,
-        eps_for_denom, use_adam_denom
-    );
-}
-
-template <typename scalar_t>
-__global__ void apply_update_1d_kernel(
-    scalar_t* __restrict__ param, const float* __restrict__ grad,
-    const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
-    const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    float d, float log_eps_sq, int numel, int block_size, float eps_for_denom, bool use_adam_denom)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / block_size] + MIN_LOG;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            float v_val = exp2f(fmaxf(log_v, -53.0f));
-            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
-        } else {
-            float max_log = fmaxf(log_v, log_eps_sq);
-            max_log = fmaxf(max_log, -53.0f); 
-            inv_std = exp2f(-0.5f * max_log); 
-        }
-        
-        float g_val = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float u_val = g_val * inv_std;
-
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u_val;
-        param[idx] = static_cast<scalar_t>(p_val);
-    }
-}
-
-void apply_update_1d_cuda(
-    torch::Tensor param, torch::Tensor grad,
-    torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_1d_cuda", ([&] {
-            apply_update_1d_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), grad.data_ptr<float>(),
-                variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, block_size,
-                eps_for_denom, use_adam_denom
-            );
-        }));
-}
-
-// ==========================================
-// 6. Phase 1: Compute Update Norm with M_t (2D, M_t + V_t)
-// ==========================================
-__global__ void compute_update_norm_m_2d_kernel(
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
-    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
-    float* __restrict__ total_sum_sq,
-    const float* __restrict__ row_mean_val_ptr, float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int b = idx / (R * C);
-        int r = (idx / C) % R;
-        int c = idx % C;
-        
-        // Unpack 4-bit m_t
-        unsigned char packed = m_q[idx / 2];
-        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
-        
-        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
-        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
-        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
-        float log_v_ij = log_r + log_c - log_row_mean; 
-        
-        float max_log = fmaxf(log_v_ij, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
-        
-        float u_ij = m_val * inv_std; 
-        sq += u_ij * u_ij;
-    }
-    
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
-    __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
-    }
-}
-
-void compute_update_norm_m_2d_cuda(
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor row_var_q, torch::Tensor row_var_scale,
-    torch::Tensor col_var_q, torch::Tensor col_var_scale,
-    torch::Tensor total_sum_sq,
-    torch::Tensor row_mean_val, float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_m_2d_kernel<<<blocks, threads>>>(
-        m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-        row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
-        col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
-        total_sum_sq.data_ptr<float>(),
-        row_mean_val.data_ptr<float>(), log_eps_sq, R, C, numel, m_block_size, v_block_size
-    );
-}
-
-// ==========================================
-// 7. Phase 2: Apply Final Update with M_t (2D, M_t + V_t)
-// ==========================================
-template <typename scalar_t>
-__global__ void apply_update_m_2d_kernel(
-    scalar_t* __restrict__ param, 
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ row_var_q, const float* __restrict__ row_var_scale,
-    const unsigned char* __restrict__ col_var_q, const float* __restrict__ col_var_scale,
-    const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    const float* __restrict__ row_mean_val_ptr, float d, float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int b = idx / (R * C);
-        int r = (idx / C) % R;
-        int c = idx % C;
-        
-        // Unpack 4-bit m_t
-        unsigned char packed = m_q[idx / 2];
-        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
-        
-        float log_r = (float)row_var_q[b * R + r] * INV_255 * row_var_scale[(b * R + r) / v_block_size] + MIN_LOG;
-        float log_c = (float)col_var_q[b * C + c] * INV_255 * col_var_scale[(b * C + c) / v_block_size] + MIN_LOG;
-        float log_row_mean = log2f(fmaxf(row_mean_val_ptr[b], MIN_VAL));
-        float log_v_ij = log_r + log_c - log_row_mean; 
-        
-        float max_log = fmaxf(log_v_ij, log_eps_sq);
-        max_log = fmaxf(max_log, -53.0f); 
-        float inv_std = exp2f(-0.5f * max_log); 
-        
-        float u_ij = m_val * inv_std; 
-        
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u_ij;
-        param[idx] = static_cast<scalar_t>(p_val);
-    }
-}
-
-void apply_update_m_2d_cuda(
-    torch::Tensor param, 
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor row_var_q, torch::Tensor row_var_scale,
-    torch::Tensor col_var_q, torch::Tensor col_var_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha,
-    torch::Tensor row_mean_val, float d, float log_eps_sq, int R, int C, int numel, int m_block_size, int v_block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_m_2d_cuda", ([&] {
-            apply_update_m_2d_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), 
-                m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-                row_var_q.data_ptr<unsigned char>(), row_var_scale.data_ptr<float>(),
-                col_var_q.data_ptr<unsigned char>(), col_var_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(),
-                row_mean_val.data_ptr<float>(), d, log_eps_sq, R, C, numel, m_block_size, v_block_size
-            );
-        }));
-}
-
-// ==========================================
-// 8. Phase 1 & 2: 1D Compute Norm & Apply Update with M_t (M_t + V_t)
-// ==========================================
-__global__ void compute_update_norm_m_1d_kernel(
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
-    float* __restrict__ total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        // Unpack 4-bit m_t
-        unsigned char packed = m_q[idx / 2];
-        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
-        
-        float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            float v_val = exp2f(fmaxf(log_v, -53.0f));
-            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
-        } else {
-            float max_log = fmaxf(log_v, log_eps_sq);
-            max_log = fmaxf(max_log, -53.0f); 
-            inv_std = exp2f(-0.5f * max_log); 
-        }
-        
-        float u_val = m_val * inv_std;
-        sq += u_val * u_val;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
-    __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
-    }
-}
-
-void compute_update_norm_m_1d_cuda(
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor total_sum_sq, float log_eps_sq, int numel, int m_block_size, int v_block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_m_1d_kernel<<<blocks, threads>>>(
-        m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-        variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-        total_sum_sq.data_ptr<float>(), log_eps_sq, numel, m_block_size, v_block_size,
-        eps_for_denom, use_adam_denom
-    );
-}
-
-template <typename scalar_t>
-__global__ void apply_update_m_1d_kernel(
-    scalar_t* __restrict__ param, 
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ variance_q, const float* __restrict__ variance_scale,
-    const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
-    float d, float log_eps_sq, int numel, int m_block_size, int v_block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        // Unpack 4-bit m_t
-        unsigned char packed = m_q[idx / 2];
-        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
-        
-        float log_v = (float)variance_q[idx] * INV_255 * variance_scale[idx / v_block_size] + MIN_LOG;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            float v_val = exp2f(fmaxf(log_v, -53.0f));
-            inv_std = 1.0f / (sqrtf(v_val) + eps_for_denom);
-        } else {
-            float max_log = fmaxf(log_v, log_eps_sq);
-            max_log = fmaxf(max_log, -53.0f); 
-            inv_std = exp2f(-0.5f * max_log); 
-        }
-        
-        float u_val = m_val * inv_std;
-
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u_val;
-        param[idx] = static_cast<scalar_t>(p_val);
-    }
-}
-
-void apply_update_m_1d_cuda(
-    torch::Tensor param, 
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor variance_q, torch::Tensor variance_scale,
-    torch::Tensor sum_sq, torch::Tensor alpha, float d, float log_eps_sq, int numel, int m_block_size, int v_block_size,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_m_1d_cuda", ([&] {
-            apply_update_m_1d_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), 
-                m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-                variance_q.data_ptr<unsigned char>(), variance_scale.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, log_eps_sq, numel, m_block_size, v_block_size,
-                eps_for_denom, use_adam_denom
-            );
-        }));
-}
-
-// ==========================================
-// 9. Apollo Channel Norms (4-bit m + 8-bit v)
-// ==========================================
-__global__ void compute_apollo_norms_kernel(
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const unsigned char* __restrict__ v_q, const float* __restrict__ v_scale,
-    const float* __restrict__ grad_low,
-    float* __restrict__ norm_update, float* __restrict__ norm_grad,
-    int N, int D, int stride_N, int stride_D,
-    int m_block_size, int v_block_size, float apollo_eps)
-{
-    int row = blockIdx.x;
-    if (row >= N) return;
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-    float sum_u2 = 0.0f;
-    float sum_g2 = 0.0f;
-    for (int i = tid; i < D; i += stride) {
-        int global_idx = row * stride_N + i * stride_D;
-        // 4-bit m
-        unsigned char m_byte = m_q[global_idx / 2];
-        int m_int = (global_idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
-        float m_val = dequant_uniform_4bit(m_int, m_scale[global_idx / m_block_size]);
-        // 8-bit log v
-        unsigned char v_byte = v_q[global_idx];
-        float log_v = (float)v_byte * INV_255 * v_scale[global_idx / v_block_size] + MIN_LOG;
-
-        // Clamp log variance to prevent numerical overflow
-        float max_log = fmaxf(log_v, -53.0f); 
-        float v_val = exp2f(max_log);
-        
-        float u_val = m_val / (sqrtf(v_val) + apollo_eps);
-        float g_val = grad_low[global_idx];
-        sum_u2 += u_val * u_val;
-        sum_g2 += g_val * g_val;
-    }
-    // Warp-level reduce
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
-        sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
-    }
-    // Block-level reduce
-    __shared__ float s_u2[32];
-    __shared__ float s_g2[32];
-    int lane = tid % 32;
-    int wid = tid / 32;
-    int num_warps = blockDim.x / 32;
-    if (lane == 0) {
-        s_u2[wid] = sum_u2;
-        s_g2[wid] = sum_g2;
-    }
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) {
-            sum_u2 = s_u2[lane];
-            sum_g2 = s_g2[lane];
-        } else {
-            sum_u2 = 0.0f;
-            sum_g2 = 0.0f;
-        }
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
-            sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
-        }
-        if (lane == 0) {
-            norm_update[row] = sqrtf(sum_u2);
-            norm_grad[row] = sqrtf(sum_g2);
-        }
-    }
-}
-
-void compute_apollo_norms_cuda(
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor v_q, torch::Tensor v_scale,
-    torch::Tensor grad_low,
-    torch::Tensor norm_update, torch::Tensor norm_grad,
-    int N, int D, int stride_N, int stride_D,
-    int m_block_size, int v_block_size, float apollo_eps)
-{
-    int threads = 256;
-    if (D < 256) threads = 128;
-    if (D < 128) threads = 64;
-    if (D < 64) threads = 32;
-    compute_apollo_norms_kernel<<<N, threads>>>(
-        m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-        v_q.data_ptr<unsigned char>(), v_scale.data_ptr<float>(),
-        grad_low.data_ptr<float>(),
-        norm_update.data_ptr<float>(), norm_grad.data_ptr<float>(),
-        N, D, stride_N, stride_D,
-        m_block_size, v_block_size, apollo_eps
-    );
-}
-
-// ==========================================
-// 10. Dequantize 4-bit (Tensor-wise fallback)
-// ==========================================
-__global__ void dequantize_4bit_kernel(
-    float* __restrict__ output,
-    const unsigned char* __restrict__ q,
-    const float* __restrict__ scale,
-    int numel, int block_size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    unsigned char packed = q[idx / 2];
-    int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-    output[idx] = dequant_uniform_4bit(q_int, scale[idx / block_size]);
-}
-
-void dequantize_4bit_cuda(
-    torch::Tensor output, torch::Tensor q, torch::Tensor scale,
-    int numel, int block_size)
-{
-    int threads = 256;
-    int blocks = (numel + threads - 1) / threads;
-    dequantize_4bit_kernel<<<blocks, threads>>>(
-        output.data_ptr<float>(), q.data_ptr<unsigned char>(),
-        scale.data_ptr<float>(), numel, block_size
-    );
-}
-
-
-// ==========================================
-// 11. Full Precision 1D Variance Update & Norm Compute
+// 9. Full Precision 1D (quantize=False)
+//    No M quantization — no codebook needed.
 // ==========================================
 __global__ void compute_update_norm_1d_full_kernel(
-    float* __restrict__ variance,
-    const float* __restrict__ grad,
-    float* __restrict__ total_sum_sq,
-    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    float one_minus_b = 1.0f - beta;
-    
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float g2 = g * g;
-        float v = one_minus_b * variance[idx] + beta * g2;
-        variance[idx] = v;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
-        } else {
-            inv_std = rsqrtf(fmaxf(v, eps_sq));
-        }
-        float u = g * inv_std;
-        sq += u * u;
+    float* __restrict__ variance, const float* __restrict__ grad, float* __restrict__ total_sum_sq,
+    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq) {
+    float sq=0.0f; int stride=gridDim.x*blockDim.x; float one_minus_b=1.0f-beta;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float g=(isnan(grad[idx])||isinf(grad[idx]))?0.0f:grad[idx];
+        float v=one_minus_b*variance[idx]+beta*(g*g+eps_for_grad_sq); variance[idx]=v;
+        float inv_std=use_adam_denom?1.0f/(sqrtf(v)+eps_for_denom):rsqrtf(fmaxf(v,eps_sq));
+        float u=g*inv_std; sq+=u*u;
     }
-    
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
-    }
+    float total=block_reduce_sum(sq,s_sum,threadIdx.x,blockDim.x/32);
+    if(threadIdx.x==0) atomicAdd(total_sum_sq,total);
 }
 
-void compute_update_norm_1d_full_cuda(
-    torch::Tensor variance, torch::Tensor grad, torch::Tensor total_sum_sq, 
-    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_1d_full_kernel<<<blocks, threads>>>(
-        variance.data_ptr<float>(), grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(),
-        beta, eps_sq, numel, eps_for_denom, use_adam_denom
-    );
+void compute_update_norm_1d_full_cuda(torch::Tensor variance, torch::Tensor grad, torch::Tensor total_sum_sq,
+    float beta, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    compute_update_norm_1d_full_kernel<<<blocks,threads>>>(
+        variance.data_ptr<float>(),grad.data_ptr<float>(),total_sum_sq.data_ptr<float>(),
+        beta,eps_sq,numel,eps_for_denom,use_adam_denom,eps_for_grad_sq);
 }
 
-// ==========================================
-// 12. Full Precision 1D Apply Update
-// ==========================================
 template <typename scalar_t>
 __global__ void apply_update_1d_full_kernel(
-    scalar_t* __restrict__ param,
-    const float* __restrict__ variance,
-    const float* __restrict__ grad,
-    const float* __restrict__ sum_sq_ptr,
-    const float* __restrict__ alpha,
-    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float v = variance[idx];
-        
-        float inv_std;
-        if (use_adam_denom) {
-            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
-        } else {
-            inv_std = rsqrtf(fmaxf(v, eps_sq));
-        }
-        float u = g * inv_std;
-
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u;
-        param[idx] = static_cast<scalar_t>(p_val);
+    scalar_t* __restrict__ param, const float* __restrict__ variance, const float* __restrict__ grad,
+    const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
+    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom) {
+    float sum_sq_val=*sum_sq_ptr, alpha_val=*alpha;
+    float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(sum_sq_val)/(sqrtf((float)numel)*d)):1.0f;
+    float step_size=alpha_val/denom;
+    int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float g=(isnan(grad[idx])||isinf(grad[idx]))?0.0f:grad[idx];
+        float v=variance[idx];
+        float inv_std=use_adam_denom?1.0f/(sqrtf(v)+eps_for_denom):rsqrtf(fmaxf(v,eps_sq));
+        float p=static_cast<float>(param[idx]); param[idx]=static_cast<scalar_t>(p-step_size*g*inv_std);
     }
 }
 
-void apply_update_1d_full_cuda(
-    torch::Tensor param, torch::Tensor variance, torch::Tensor grad,
+void apply_update_1d_full_cuda(torch::Tensor param, torch::Tensor variance, torch::Tensor grad,
     torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_1d_full_cuda", ([&] {
-            apply_update_1d_full_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), variance.data_ptr<float>(), grad.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel,
-                eps_for_denom, use_adam_denom
-            );
+    float eps_for_denom, bool use_adam_denom) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"apply_update_1d_full",([&]{
+            apply_update_1d_full_kernel<scalar_t><<<blocks,threads>>>(
+                param.data_ptr<scalar_t>(),variance.data_ptr<float>(),grad.data_ptr<float>(),
+                sum_sq.data_ptr<float>(),alpha.data_ptr<float>(),d,eps_sq,numel,eps_for_denom,use_adam_denom);
         }));
 }
 
-
-
-// ==========================================
-// 13. Full Precision 1D Variance & Momentum Update + Norm Compute
-// ==========================================
 __global__ void compute_update_norm_1d_full_m_kernel(
-    float* __restrict__ variance,
-    float* __restrict__ m,
-    const float* __restrict__ grad,
+    float* __restrict__ variance, float* __restrict__ m, const float* __restrict__ grad,
     float* __restrict__ total_sum_sq,
-    float beta1, float beta_val, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    float one_minus_b1 = 1.0f - beta1;
-    float one_minus_bv = 1.0f - beta_val;
-    
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float g = (isnan(grad[idx]) || isinf(grad[idx])) ? 0.0f : grad[idx];
-        float g2 = g * g;
-
-        float v = one_minus_bv * variance[idx] + beta_val * g2;
-        variance[idx] = v;
-        
-        float m_new = beta1 * m[idx] + one_minus_b1 * g;
-        m[idx] = m_new;
-        
-        float inv_std;
-        if (use_adam_denom) {
-            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
-        } else {
-            inv_std = rsqrtf(fmaxf(v, eps_sq));
-        }
-        float u = m_new * inv_std;
-        sq += u * u;
+    float beta1, float beta_val, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq) {
+    float sq=0.0f; int stride=gridDim.x*blockDim.x;
+    float one_minus_b1=1.0f-beta1, one_minus_bv=1.0f-beta_val;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float g=(isnan(grad[idx])||isinf(grad[idx]))?0.0f:grad[idx];
+        float v=one_minus_bv*variance[idx]+beta_val*(g*g+eps_for_grad_sq); variance[idx]=v;
+        float m_new=beta1*m[idx]+one_minus_b1*g; m[idx]=m_new;
+        float inv_std=use_adam_denom?1.0f/(sqrtf(v)+eps_for_denom):rsqrtf(fmaxf(v,eps_sq));
+        float u=m_new*inv_std; sq+=u*u;
     }
-    
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(total_sum_sq, sq);
-    }
+    float total=block_reduce_sum(sq,s_sum,threadIdx.x,blockDim.x/32);
+    if(threadIdx.x==0) atomicAdd(total_sum_sq,total);
 }
 
-void compute_update_norm_1d_full_m_cuda(
-    torch::Tensor variance, torch::Tensor m, torch::Tensor grad, torch::Tensor total_sum_sq, 
-    float beta1, float beta_val, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_update_norm_1d_full_m_kernel<<<blocks, threads>>>(
-        variance.data_ptr<float>(), m.data_ptr<float>(), grad.data_ptr<float>(), total_sum_sq.data_ptr<float>(),
-        beta1, beta_val, eps_sq, numel, eps_for_denom, use_adam_denom
-    );
+void compute_update_norm_1d_full_m_cuda(torch::Tensor variance, torch::Tensor m, torch::Tensor grad,
+    torch::Tensor total_sum_sq, float beta1, float beta_val, float eps_sq, int numel,
+    float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    compute_update_norm_1d_full_m_kernel<<<blocks,threads>>>(
+        variance.data_ptr<float>(),m.data_ptr<float>(),grad.data_ptr<float>(),total_sum_sq.data_ptr<float>(),
+        beta1,beta_val,eps_sq,numel,eps_for_denom,use_adam_denom,eps_for_grad_sq);
 }
 
-// ==========================================
-// 14. Full Precision 1D Apply Update with Momentum
-// ==========================================
 template <typename scalar_t>
 __global__ void apply_update_1d_full_m_kernel(
-    scalar_t* __restrict__ param,
-    const float* __restrict__ variance,
-    const float* __restrict__ m,
-    const float* __restrict__ sum_sq_ptr,
-    const float* __restrict__ alpha,
-    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom)
-{
-    float sum_sq_val = *sum_sq_ptr;
-    float alpha_val = *alpha;
-    float denom = fmaxf(1.0f, sqrtf(sum_sq_val) / (sqrtf((float)numel) * d));
-    float step_size = alpha_val / denom;
-
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float v = variance[idx];
-        float m_val = m[idx];
-        
-        float inv_std;
-        if (use_adam_denom) {
-            inv_std = 1.0f / (sqrtf(v) + eps_for_denom);
-        } else {
-            inv_std = rsqrtf(fmaxf(v, eps_sq));
-        }
-        float u = m_val * inv_std;
-
-        float p_val = static_cast<float>(param[idx]);
-        p_val -= step_size * u;
-        param[idx] = static_cast<scalar_t>(p_val);
+    scalar_t* __restrict__ param, const float* __restrict__ variance, const float* __restrict__ m,
+    const float* __restrict__ sum_sq_ptr, const float* __restrict__ alpha,
+    float d, float eps_sq, int numel, float eps_for_denom, bool use_adam_denom) {
+    float sum_sq_val=*sum_sq_ptr, alpha_val=*alpha;
+    float denom=(d>0.0f)?fmaxf(1.0f,sqrtf(sum_sq_val)/(sqrtf((float)numel)*d)):1.0f;
+    float step_size=alpha_val/denom;
+    int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float v=variance[idx], m_val=m[idx];
+        float inv_std=use_adam_denom?1.0f/(sqrtf(v)+eps_for_denom):rsqrtf(fmaxf(v,eps_sq));
+        float p=static_cast<float>(param[idx]); param[idx]=static_cast<scalar_t>(p-step_size*m_val*inv_std);
     }
 }
 
-void apply_update_1d_full_m_cuda(
-    torch::Tensor param, torch::Tensor variance, torch::Tensor m,
+void apply_update_1d_full_m_cuda(torch::Tensor param, torch::Tensor variance, torch::Tensor m,
     torch::Tensor sum_sq, torch::Tensor alpha, float d, float eps_sq, int numel,
-    float eps_for_denom, bool use_adam_denom)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, 
-        param.scalar_type(), "apply_update_1d_full_m_cuda", ([&] {
-            apply_update_1d_full_m_kernel<scalar_t><<<blocks, threads>>>(
-                param.data_ptr<scalar_t>(), variance.data_ptr<float>(), m.data_ptr<float>(),
-                sum_sq.data_ptr<float>(), alpha.data_ptr<float>(), d, eps_sq, numel,
-                eps_for_denom, use_adam_denom
-            );
+    float eps_for_denom, bool use_adam_denom) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"apply_update_1d_full_m",([&]{
+            apply_update_1d_full_m_kernel<scalar_t><<<blocks,threads>>>(
+                param.data_ptr<scalar_t>(),variance.data_ptr<float>(),m.data_ptr<float>(),
+                sum_sq.data_ptr<float>(),alpha.data_ptr<float>(),d,eps_sq,numel,eps_for_denom,use_adam_denom);
         }));
 }
 
+// ==========================================
+// 10. Apollo Kernels
+//     All V/res reads use fp32 buffers (from fused_log_quantize_lerp
+//     fp32_out) to eliminate double-quantization error.
+// ==========================================
+__global__ void compute_apollo_norms_kernel(
+    const void* __restrict__ m_q, const float* __restrict__ m_scale,
+    const float* __restrict__ v_fp32,
+    const float* __restrict__ grad_low,
+    float* __restrict__ norm_update, float* __restrict__ norm_grad,
+    int N, int D, int stride_N, int stride_D,
+    int m_block_size, float apollo_eps, int m_bits, int m_mode) {
+    int row=blockIdx.x; if(row>=N) return;
+    int tid=threadIdx.x, stride=blockDim.x;
+    __shared__ float s_qmap8[256];
+    __shared__ float s_qmap4[16];
+    load_codebook_smem(s_qmap8, s_qmap4, tid, stride);
+    __syncthreads();
 
-// ==========================================
-// 15. CAME: Compute Residual Variance (Row & Col)
-// ==========================================
-__global__ void came_compute_residual_2d_kernel(
-    const unsigned char* __restrict__ m_q, const float* __restrict__ m_scale,
-    const float* __restrict__ u_t,                             
-    float* __restrict__ res_row_sum, float* __restrict__ res_col_sum,
-    float eps_came, int R, int C, int numel, int m_block_size)   
-{
-    int stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        int b = idx / (R * C);
-        int r = (idx / C) % R;
-        int c = idx % C;
-        
-        unsigned char packed = m_q[idx / 2];
-        int q_int = (idx & 1) ? (packed & 0x0F) : (packed >> 4);
-        float m_val = dequant_uniform_4bit(q_int, m_scale[idx / m_block_size]);
-        
-        float u_val = u_t[idx];
-        float diff = u_val - m_val;
-        float res = diff * diff + eps_came;
-        
-        atomicAdd(&res_col_sum[b * C + c], res);
-        
-        int row_idx = b * R + r;
-        int lane = threadIdx.x % 32;
-        
-        for (int offset = 16; offset > 0; offset /= 2) {
-            int other_row_idx = __shfl_down_sync(0xffffffff, row_idx, offset);
-            float other_res = __shfl_down_sync(0xffffffff, res, offset);
-            if (lane + offset < 32 && row_idx == other_row_idx) {
-                res += other_res;
-            }
-        }
-        
-        int prev_row_idx = __shfl_up_sync(0xffffffff, row_idx, 1);
-        bool is_first_in_row = (lane == 0) || (row_idx != prev_row_idx);
-        
-        if (is_first_in_row) {
-            atomicAdd(&res_row_sum[row_idx], res);
-        }
+    float sum_u2=0.0f, sum_g2=0.0f;
+    for (int i=tid;i<D;i+=stride) {
+        int gi=row*stride_N+i*stride_D;
+        float m_val=dequant_m(m_q,gi,m_scale,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+        float v_val=v_fp32[gi];
+        float u_val=m_val/(sqrtf(v_val)+apollo_eps);
+        float g_val=grad_low[gi];
+        sum_u2+=u_val*u_val; sum_g2+=g_val*g_val;
+    }
+    for(int o=16;o>0;o/=2){sum_u2+=__shfl_down_sync(0xffffffff,sum_u2,o);sum_g2+=__shfl_down_sync(0xffffffff,sum_g2,o);}
+    __shared__ float s_u2[32]; __shared__ float s_g2[32];
+    int lane=tid%32, wid=tid/32, nw=blockDim.x/32;
+    if(lane==0){s_u2[wid]=sum_u2;s_g2[wid]=sum_g2;}
+    __syncthreads();
+    if(wid==0){
+        sum_u2=(lane<nw)?s_u2[lane]:0.0f; sum_g2=(lane<nw)?s_g2[lane]:0.0f;
+        for(int o=16;o>0;o/=2){sum_u2+=__shfl_down_sync(0xffffffff,sum_u2,o);sum_g2+=__shfl_down_sync(0xffffffff,sum_g2,o);}
+        if(lane==0){norm_update[row]=sqrtf(sum_u2);norm_grad[row]=sqrtf(sum_g2);}
     }
 }
 
-void came_compute_residual_2d_cuda(
-    torch::Tensor m_q, torch::Tensor m_scale,
-    torch::Tensor u_t, 
-    torch::Tensor res_row_sum, torch::Tensor res_col_sum,
-    float eps_came, int R, int C, int numel, int m_block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    came_compute_residual_2d_kernel<<<blocks, threads>>>(
-        m_q.data_ptr<unsigned char>(), m_scale.data_ptr<float>(),
-        u_t.data_ptr<float>(),
-        res_row_sum.data_ptr<float>(), res_col_sum.data_ptr<float>(),
-        eps_came, R, C, numel, m_block_size
-    );
+void compute_apollo_norms_cuda(torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_fp32, torch::Tensor grad_low,
+    torch::Tensor norm_update, torch::Tensor norm_grad,
+    int N, int D, int stride_N, int stride_D,
+    int m_block_size, float apollo_eps, int m_bits, int m_mode) {
+    int threads=256; if(D<256)threads=128; if(D<128)threads=64; if(D<64)threads=32;
+    compute_apollo_norms_kernel<<<N,threads>>>(
+        m_q.data_ptr(),m_scale.data_ptr<float>(),
+        v_fp32.data_ptr<float>(),
+        grad_low.data_ptr<float>(),
+        norm_update.data_ptr<float>(),norm_grad.data_ptr<float>(),
+        N,D,stride_N,stride_D,m_block_size,apollo_eps,m_bits,m_mode);
 }
 
-
-
-// ==========================================
-// 16. Apollo+CAME Phase 1: Compute RMS for U_t
-// ==========================================
 __global__ void compute_apollo_came_rms_kernel(
     const float* __restrict__ grad_low,
-    const unsigned char* __restrict__ v_q, const float* __restrict__ v_scale,
-    float* __restrict__ sum_u2,
-    float eps_sq, int numel, int v_block_size)
-{
-    float sq = 0.0f;
-    int stride = gridDim.x * blockDim.x;
-    
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float log_v = (float)v_q[idx] * INV_255 * v_scale[idx / v_block_size] + MIN_LOG;
-        float v_val = exp2f(fmaxf(log_v, -53.0f));
-        
-        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
-        float u_t = g_val * rsqrtf(fmaxf(v_val, eps_sq));
-        sq += u_t * u_t;
+    const float* __restrict__ v_fp32,
+    float* __restrict__ sum_u2, float eps_sq, int numel) {
+    float sq=0.0f; int stride=gridDim.x*blockDim.x;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float v_val=v_fp32[idx];
+        float g=(isnan(grad_low[idx])||isinf(grad_low[idx]))?0.0f:grad_low[idx];
+        float u=g*rsqrtf(fmaxf(v_val,eps_sq)); sq+=u*u;
     }
-    
-    for (int offset = 16; offset > 0; offset /= 2) sq += __shfl_down_sync(0xffffffff, sq, offset);
-    int lane = threadIdx.x % 32; int wid = threadIdx.x / 32; int num_warps = blockDim.x / 32;
     __shared__ float s_sum[32];
-    if (lane == 0) s_sum[wid] = sq;
-    __syncthreads();
-    if (wid == 0) {
-        if (lane < num_warps) sq = s_sum[lane];
-        else sq = 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other = __shfl_down_sync(0xffffffff, sq, offset);
-            if (lane + offset < num_warps) sq += other;
-        }
-        if (lane == 0) atomicAdd(sum_u2, sq);
-    }
+    float total=block_reduce_sum(sq,s_sum,threadIdx.x,blockDim.x/32);
+    if(threadIdx.x==0) atomicAdd(sum_u2,total);
 }
 
-void compute_apollo_came_rms_cuda(
-    torch::Tensor grad_low, torch::Tensor v_q, torch::Tensor v_scale,
-    torch::Tensor sum_u2, float eps_sq, int numel, int v_block_size)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    compute_apollo_came_rms_kernel<<<blocks, threads>>>(
-        grad_low.data_ptr<float>(), v_q.data_ptr<unsigned char>(), v_scale.data_ptr<float>(),
-        sum_u2.data_ptr<float>(), eps_sq, numel, v_block_size
-    );
+void compute_apollo_came_rms_cuda(torch::Tensor grad_low, torch::Tensor v_fp32,
+    torch::Tensor sum_u2, float eps_sq, int numel) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    compute_apollo_came_rms_kernel<<<blocks,threads>>>(
+        grad_low.data_ptr<float>(),v_fp32.data_ptr<float>(),
+        sum_u2.data_ptr<float>(),eps_sq,numel);
 }
 
-// ==========================================
-// 17. Apollo+CAME Phase 2: Compute M_new & Res
-// ==========================================
 __global__ void apollo_came_compute_m_res_kernel(
     const float* __restrict__ grad_low,
-    const unsigned char* __restrict__ v_q, const float* __restrict__ v_scale,
-    const unsigned char* __restrict__ m_q_old, const float* __restrict__ m_scale_old,
-    const unsigned char* __restrict__ res_q_old, const float* __restrict__ res_scale_old,
+    const float* __restrict__ v_fp32,
+    const void* __restrict__ m_q_old, const float* __restrict__ m_scale_old,
+    const float* __restrict__ res_fp32_old,
     float* __restrict__ m_temp, float* __restrict__ res_temp,
-    const float* __restrict__ clip_factor_ptr, 
+    const float* __restrict__ clip_factor_ptr,
     float beta1, float beta3, float eps_came, float eps_sq,
-    int v_block_size, int m_block_size, int res_block_size, int numel)
-{
-    float clip_factor = *clip_factor_ptr;
-    int stride = gridDim.x * blockDim.x;
-    const float one_minus_b1 = 1.0f - beta1;
-    const float one_minus_b3 = 1.0f - beta3;
+    int m_block_size, int numel, int m_bits, int m_mode) {
+    float clip_factor=*clip_factor_ptr;
+    int stride=gridDim.x*blockDim.x;
+    __shared__ float s_qmap8[256];
+    __shared__ float s_qmap4[16];
+    load_codebook_smem(s_qmap8, s_qmap4, threadIdx.x, blockDim.x);
+    __syncthreads();
 
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += stride) {
-        float log_v = (float)v_q[idx] * INV_255 * v_scale[idx / v_block_size] + MIN_LOG;
-        float v_val = exp2f(fmaxf(log_v, -53.0f));
-        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
-        float u_t = g_val * rsqrtf(fmaxf(v_val, eps_sq));
-        u_t /= clip_factor;
-
-        unsigned char m_byte = m_q_old[idx / 2];
-        int m_int = (idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
-        float m_old = dequant_uniform_4bit(m_int, m_scale_old[idx / m_block_size]);
-        float m_new = beta1 * m_old + one_minus_b1 * u_t;
-        m_temp[idx] = m_new;
-
-        float diff = u_t - m_new;
-        float res_raw = diff * diff + eps_came;
-        float c_old_log = (float)res_q_old[idx] * INV_255 * res_scale_old[idx / res_block_size] + MIN_LOG;
-        float c_old = exp2f(c_old_log);
-        float c_new = beta3 * c_old + one_minus_b3 * res_raw;
-        res_temp[idx] = fmaxf(c_new, MIN_VAL);
+    float one_minus_b1=1.0f-beta1, one_minus_b3=1.0f-beta3;
+    for (int idx=blockIdx.x*blockDim.x+threadIdx.x;idx<numel;idx+=stride) {
+        float v_val=v_fp32[idx];
+        float g=(isnan(grad_low[idx])||isinf(grad_low[idx]))?0.0f:grad_low[idx];
+        float u_t=g*rsqrtf(fmaxf(v_val,eps_sq))/clip_factor;
+        float m_old=dequant_m(m_q_old,idx,m_scale_old,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+        float m_new=beta1*m_old+one_minus_b1*u_t;
+        m_temp[idx]=m_new;
+        float diff=u_t-m_new;
+        float c_old=res_fp32_old[idx];
+        res_temp[idx]=fmaxf(beta3*c_old+one_minus_b3*(diff*diff+eps_came),MIN_VAL);
     }
 }
 
-void apollo_came_compute_m_res_cuda(
-    torch::Tensor grad_low,
-    torch::Tensor v_q, torch::Tensor v_scale,
+void apollo_came_compute_m_res_cuda(torch::Tensor grad_low, torch::Tensor v_fp32,
     torch::Tensor m_q_old, torch::Tensor m_scale_old,
-    torch::Tensor res_q_old, torch::Tensor res_scale_old,
-    torch::Tensor m_temp, torch::Tensor res_temp,
-    torch::Tensor clip_factor,
+    torch::Tensor res_fp32_old,
+    torch::Tensor m_temp, torch::Tensor res_temp, torch::Tensor clip_factor,
     float beta1, float beta3, float eps_came, float eps_sq,
-    int v_block_size, int m_block_size, int res_block_size, int numel)
-{
-    int threads = 256;
-    int blocks = min(1024, (numel + threads - 1) / threads);
-    apollo_came_compute_m_res_kernel<<<blocks, threads>>>(
-        grad_low.data_ptr<float>(),
-        v_q.data_ptr<unsigned char>(), v_scale.data_ptr<float>(),
-        m_q_old.data_ptr<unsigned char>(), m_scale_old.data_ptr<float>(),
-        res_q_old.data_ptr<unsigned char>(), res_scale_old.data_ptr<float>(),
-        m_temp.data_ptr<float>(), res_temp.data_ptr<float>(),
-        clip_factor.data_ptr<float>(),
-        beta1, beta3, eps_came, eps_sq,
-        v_block_size, m_block_size, res_block_size, numel
-    );
+    int m_block_size, int numel, int m_bits, int m_mode) {
+    int threads=256, blocks=min(1024,(numel+threads-1)/threads);
+    apollo_came_compute_m_res_kernel<<<blocks,threads>>>(
+        grad_low.data_ptr<float>(),v_fp32.data_ptr<float>(),
+        m_q_old.data_ptr(),m_scale_old.data_ptr<float>(),
+        res_fp32_old.data_ptr<float>(),
+        m_temp.data_ptr<float>(),res_temp.data_ptr<float>(),clip_factor.data_ptr<float>(),
+        beta1,beta3,eps_came,eps_sq,m_block_size,numel,m_bits,m_mode);
 }
 
-// ==========================================
-// 18. Apollo+CAME Phase 3: Compute Final Update & Norms
-// ==========================================
 __global__ void apollo_came_compute_update_norms_kernel(
-    const unsigned char* __restrict__ m_q_new, const float* __restrict__ m_scale_new,
-    const unsigned char* __restrict__ res_q_new, const float* __restrict__ res_scale_new,
+    const void* __restrict__ m_q_new, const float* __restrict__ m_scale_new,
+    const float* __restrict__ res_fp32_new,
     const float* __restrict__ grad_low,
     float* __restrict__ norm_update, float* __restrict__ norm_grad,
     float eps_sq, int N, int D, int stride_N, int stride_D, int numel,
-    int m_block_size, int res_block_size)
-{
-    int channel = blockIdx.x;
-    if (channel >= N) return;
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-    
-    float sum_u2 = 0.0f;
-    float sum_g2 = 0.0f;
-    
-    for (int i = tid; i < D; i += stride) {
-        int idx = channel * stride_N + i * stride_D;
-        if (idx >= numel) break;
-        
-        unsigned char m_byte = m_q_new[idx / 2];
-        int m_int = (idx & 1) ? (m_byte & 0x0F) : (m_byte >> 4);
-        float m_val = dequant_uniform_4bit(m_int, m_scale_new[idx / m_block_size]);
-
-        float log_res = (float)res_q_new[idx] * INV_255 * res_scale_new[idx / res_block_size] + MIN_LOG;
-        float res_val = exp2f(fmaxf(log_res, -53.0f));
-
-        float u_final = m_val * rsqrtf(fmaxf(res_val, eps_sq));
-        sum_u2 += u_final * u_final;
-        
-        float g_val = (isnan(grad_low[idx]) || isinf(grad_low[idx])) ? 0.0f : grad_low[idx];
-        sum_g2 += g_val * g_val;
-    }
-    
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
-        sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
-    }
-    __shared__ float s_u2[32];
-    __shared__ float s_g2[32];
-    int lane = tid % 32;
-    int wid = tid / 32;
-    int num_warps = blockDim.x / 32;
-    if (lane == 0) {
-        s_u2[wid] = sum_u2;
-        s_g2[wid] = sum_g2;
-    }
+    int m_block_size, int m_bits, int m_mode) {
+    int channel=blockIdx.x; if(channel>=N) return;
+    int tid=threadIdx.x, stride=blockDim.x;
+    __shared__ float s_qmap8[256];
+    __shared__ float s_qmap4[16];
+    load_codebook_smem(s_qmap8, s_qmap4, tid, stride);
     __syncthreads();
-    
-    if (wid == 0) {
-        if (lane < num_warps) {
-            sum_u2 = s_u2[lane];
-            sum_g2 = s_g2[lane];
-        } else {
-            sum_u2 = 0.0f;
-            sum_g2 = 0.0f;
-        }
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sum_u2 += __shfl_down_sync(0xffffffff, sum_u2, offset);
-            sum_g2 += __shfl_down_sync(0xffffffff, sum_g2, offset);
-        }
-        if (lane == 0) {
-            norm_update[channel] = sqrtf(sum_u2);
-            norm_grad[channel] = sqrtf(sum_g2);
-        }
+
+    float sum_u2=0.0f, sum_g2=0.0f;
+    for (int i=tid;i<D;i+=stride) {
+        int idx=channel*stride_N+i*stride_D; if(idx>=numel) break;
+        float m_val=dequant_m(m_q_new,idx,m_scale_new,m_block_size,m_bits,m_mode,s_qmap8,s_qmap4);
+        float res_val=res_fp32_new[idx];
+        float u_final=m_val*rsqrtf(fmaxf(res_val,eps_sq));
+        sum_u2+=u_final*u_final;
+        float g=(isnan(grad_low[idx])||isinf(grad_low[idx]))?0.0f:grad_low[idx];
+        sum_g2+=g*g;
+    }
+    for(int o=16;o>0;o/=2){sum_u2+=__shfl_down_sync(0xffffffff,sum_u2,o);sum_g2+=__shfl_down_sync(0xffffffff,sum_g2,o);}
+    __shared__ float s_u2[32]; __shared__ float s_g2[32];
+    int lane=tid%32, wid=tid/32, nw=blockDim.x/32;
+    if(lane==0){s_u2[wid]=sum_u2;s_g2[wid]=sum_g2;}
+    __syncthreads();
+    if(wid==0){
+        sum_u2=(lane<nw)?s_u2[lane]:0.0f; sum_g2=(lane<nw)?s_g2[lane]:0.0f;
+        for(int o=16;o>0;o/=2){sum_u2+=__shfl_down_sync(0xffffffff,sum_u2,o);sum_g2+=__shfl_down_sync(0xffffffff,sum_g2,o);}
+        if(lane==0){norm_update[channel]=sqrtf(sum_u2);norm_grad[channel]=sqrtf(sum_g2);}
     }
 }
 
-void apollo_came_compute_update_norms_cuda(
-    torch::Tensor m_q_new, torch::Tensor m_scale_new,
-    torch::Tensor res_q_new, torch::Tensor res_scale_new,
+void apollo_came_compute_update_norms_cuda(torch::Tensor m_q_new, torch::Tensor m_scale_new,
+    torch::Tensor res_fp32_new,
     torch::Tensor grad_low,
     torch::Tensor norm_update, torch::Tensor norm_grad,
     float eps_sq, int N, int D, int stride_N, int stride_D, int numel,
-    int m_block_size, int res_block_size)
-{
-    int threads = 256;
-    if (D < 256) threads = 128;
-    if (D < 128) threads = 64;
-    if (D < 64) threads = 32;
-    apollo_came_compute_update_norms_kernel<<<N, threads>>>(
-        m_q_new.data_ptr<unsigned char>(), m_scale_new.data_ptr<float>(),
-        res_q_new.data_ptr<unsigned char>(), res_scale_new.data_ptr<float>(),
+    int m_block_size, int m_bits, int m_mode) {
+    int threads=256; if(D<256)threads=128; if(D<128)threads=64; if(D<64)threads=32;
+    apollo_came_compute_update_norms_kernel<<<N,threads>>>(
+        m_q_new.data_ptr(),m_scale_new.data_ptr<float>(),
+        res_fp32_new.data_ptr<float>(),
         grad_low.data_ptr<float>(),
-        norm_update.data_ptr<float>(), norm_grad.data_ptr<float>(),
-        eps_sq, N, D, stride_N, stride_D, numel,
-        m_block_size, res_block_size
-    );
+        norm_update.data_ptr<float>(),norm_grad.data_ptr<float>(),
+        eps_sq,N,D,stride_N,stride_D,numel,m_block_size,m_bits,m_mode);
 }
 
+// ==========================================
+// 11. Dequantize Dynamic (state migration)
+// ==========================================
+__global__ void dequantize_dynamic_kernel(
+    float* __restrict__ output, const unsigned char* __restrict__ q,
+    const float* __restrict__ scale, int numel, int block_size, int m_bits) {
+    // Codebook in shared memory
+    __shared__ float s_qmap8[256];
+    __shared__ float s_qmap4[16];
+    load_codebook_smem(s_qmap8, s_qmap4, threadIdx.x, blockDim.x);
+    __syncthreads();
 
+    int idx=blockIdx.x*blockDim.x+threadIdx.x; if(idx>=numel) return;
+    float s=scale[idx/block_size];
+    if (m_bits==8) output[idx]=s_qmap8[q[idx]]*s;
+    else { unsigned char packed=q[idx/2]; int qi=(idx&1)?(packed&0x0F):(packed>>4); output[idx]=s_qmap4[qi]*s; }
+}
+
+void dequantize_dynamic_cuda(torch::Tensor output, torch::Tensor q, torch::Tensor scale,
+    int numel, int block_size, int m_bits) {
+    int threads=256, blocks=(numel+threads-1)/threads;
+    dequantize_dynamic_kernel<<<blocks,threads>>>(
+        output.data_ptr<float>(),q.data_ptr<unsigned char>(),scale.data_ptr<float>(),numel,block_size,m_bits);
+}
+
+// ==========================================
+// 11b. Dequantize Log-Space V (adaptive min_log, zero-point)
+// ==========================================
+__global__ void dequantize_log_nonneg_kernel(
+    float* __restrict__ output, const unsigned char* __restrict__ q,
+    const float* __restrict__ scale, const float* __restrict__ min_log,
+    int numel, int block_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    unsigned char qi = q[idx];
+    if (qi == 0) { output[idx] = 0.0f; return; }
+    int bid = idx / block_size;
+    output[idx] = exp2f((float)(qi - 1) * INV_254 * scale[bid] + min_log[bid]);
+}
+
+void dequantize_log_nonneg_cuda(torch::Tensor output, torch::Tensor q,
+    torch::Tensor scale, torch::Tensor min_log, int numel, int block_size) {
+    int threads = 256, blocks = (numel + threads - 1) / threads;
+    dequantize_log_nonneg_kernel<<<blocks, threads>>>(
+        output.data_ptr<float>(), q.data_ptr<unsigned char>(),
+        scale.data_ptr<float>(), min_log.data_ptr<float>(), numel, block_size);
+}
+
+// ==========================================
+// PYBIND11
+// ==========================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_log_quantize_lerp", &fused_log_quantize_lerp_cuda, "Fused log quantize lerp (CUDA)");
-    m.def("fused_4bit_quantize_lerp", &fused_4bit_quantize_lerp_cuda, "Fused 4-bit packed quantize lerp for m_t (CUDA)");
-    
-    m.def("compute_update_norm_2d", &compute_update_norm_2d_cuda, "Compute update norm 2D (CUDA)");
-    m.def("apply_update_2d", &apply_update_2d_cuda, "Apply update 2D (CUDA)");
-    m.def("compute_update_norm_1d", &compute_update_norm_1d_cuda, "Compute update norm 1D (CUDA)");
-    m.def("apply_update_1d", &apply_update_1d_cuda, "Apply update 1D (CUDA)");
-    
-    m.def("compute_update_norm_m_2d", &compute_update_norm_m_2d_cuda, "Compute update norm with m_t 2D (CUDA)");
-    m.def("apply_update_m_2d", &apply_update_m_2d_cuda, "Apply update with m_t 2D (CUDA)");
-    m.def("compute_update_norm_m_1d", &compute_update_norm_m_1d_cuda, "Compute update norm with m_t 1D (CUDA)");
-    m.def("apply_update_m_1d", &apply_update_m_1d_cuda, "Apply update with m_t 1D (CUDA)");
-
-    m.def("compute_apollo_norms", &compute_apollo_norms_cuda, "Compute Apollo norms from packed 4-bit/8-bit (CUDA)");
-    m.def("dequantize_4bit", &dequantize_4bit_cuda, "Dequantize 4-bit packed tensor (CUDA)");
-
-    m.def("compute_update_norm_1d_full", &compute_update_norm_1d_full_cuda, "Compute update norm 1D full precision (CUDA)");
-    m.def("apply_update_1d_full", &apply_update_1d_full_cuda, "Apply update 1D full precision (CUDA)");
-
-    m.def("compute_update_norm_1d_full_m", &compute_update_norm_1d_full_m_cuda, "Compute update norm 1D full precision with momentum (CUDA)");
-    m.def("apply_update_1d_full_m", &apply_update_1d_full_m_cuda, "Apply update 1D full precision with momentum (CUDA)");
-
-    m.def("came_compute_residual_2d", &came_compute_residual_2d_cuda, "Compute CAME residual row/col sums (CUDA)");
-
-    m.def("compute_apollo_came_rms", &compute_apollo_came_rms_cuda, "Compute Apollo CAME RMS (CUDA)");
-    m.def("apollo_came_compute_m_res", &apollo_came_compute_m_res_cuda, "Apollo CAME compute M and Res (CUDA)");
-    m.def("apollo_came_compute_update_norms", &apollo_came_compute_update_norms_cuda, "Apollo CAME compute update and norms (CUDA)");
+    m.def("set_qmap", &set_qmap_cuda);
+    m.def("fused_log_quantize_lerp", &fused_log_quantize_lerp_cuda);
+    m.def("fused_m_quantize_lerp", &fused_m_quantize_lerp_cuda);
+    m.def("fused_update_1d_noclip", &fused_update_1d_noclip_cuda);
+    m.def("fused_update_1d_norm", &fused_update_1d_norm_cuda);
+    m.def("fused_update_1d_apply", &fused_update_1d_apply_cuda);
+    m.def("fused_update_1d_lag", &fused_update_1d_lag_cuda);
+    m.def("fused_update_1d_vonly_noclip", &fused_update_1d_vonly_noclip_cuda);
+    m.def("fused_update_1d_vonly_norm", &fused_update_1d_vonly_norm_cuda);
+    m.def("fused_update_1d_vonly_apply", &fused_update_1d_vonly_apply_cuda);
+    m.def("fused_update_1d_vonly_lag", &fused_update_1d_vonly_lag_cuda);
+    m.def("fused_update_2d_noclip", &fused_update_2d_noclip_cuda);
+    m.def("fused_update_2d_norm", &fused_update_2d_norm_cuda);
+    m.def("fused_update_2d_apply", &fused_update_2d_apply_cuda);
+    m.def("fused_update_2d_lag", &fused_update_2d_lag_cuda);
+    m.def("compute_ut_rms", &compute_ut_rms_cuda);
+    m.def("fused_came_pass1", &fused_came_pass1_cuda);
+    m.def("fused_came_pass2_norm", &fused_came_pass2_norm_cuda);
+    m.def("fused_came_pass2", &fused_came_pass2_cuda);
+    m.def("compute_update_norm_2d_vonly", &compute_update_norm_2d_vonly_cuda);
+    m.def("apply_update_2d_vonly", &apply_update_2d_vonly_cuda);
+    m.def("compute_update_norm_1d_full", &compute_update_norm_1d_full_cuda);
+    m.def("apply_update_1d_full", &apply_update_1d_full_cuda);
+    m.def("compute_update_norm_1d_full_m", &compute_update_norm_1d_full_m_cuda);
+    m.def("apply_update_1d_full_m", &apply_update_1d_full_m_cuda);
+    m.def("compute_apollo_norms", &compute_apollo_norms_cuda);
+    m.def("compute_apollo_came_rms", &compute_apollo_came_rms_cuda);
+    m.def("apollo_came_compute_m_res", &apollo_came_compute_m_res_cuda);
+    m.def("apollo_came_compute_update_norms", &apollo_came_compute_update_norms_cuda);
+    m.def("dequantize_dynamic", &dequantize_dynamic_cuda);
+    m.def("dequantize_log_nonneg", &dequantize_log_nonneg_cuda);
+    m.def("compute_factored_sums", &compute_factored_sums_cuda);
 }

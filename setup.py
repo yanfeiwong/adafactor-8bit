@@ -9,8 +9,11 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="adafactor8bit",
-    version="0.3.1",
-    description="8-bit Adafactor Optimizer with Fused CUDA Kernels",
+    version="0.4.0",
+    description=(
+        "Memory-efficient PyTorch optimizer with block-wise adaptive "
+        "log-space quantization, fused CUDA kernels, and APOLLO/CAME paths"
+    ),
     author="WANG YAN",
     author_email="yanfeiwong1997@outlook.com",
     url="https://github.com/yanfeiwong/adafactor-8bit",

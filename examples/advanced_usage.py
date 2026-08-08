@@ -2,13 +2,15 @@
 Advanced Usage Example for Adafactor8Bit
 
 This script demonstrates a hybrid grouping strategy for complex architectures 
-(e.g., Vision-Language Models, Diffusion UNets) to achieve stable and efficient training.
+(e.g., Vision-Language Models, Diffusion UNets, LLMs) to achieve stable and efficient training.
 
 Strategies applied:
 1. 1D / Sensitive Parameters: FP32, no weight decay.
 2. Embedding Layers: Element-wise variance (momentum-free Adam style) for fine-grained updates.
-3. 2D Weights: 8-bit quantization with APOLLO low-rank projection.
-4. >2D Weights: 8-bit quantization with full-rank variance to preserve spatial structures.
+3. LM Head: Element-wise variance (Adam style with momentum) to avoid factored distortion.
+4. 2D Weights (APOLLO targets): 8-bit quantization with APOLLO low-rank projection.
+5. 2D Weights (Others): Default Adafactor path (factored), 8-bit quantization.
+6. >2D Weights: 8-bit quantization with full-rank variance to preserve spatial structures.
 """
 import torch
 import torch.nn as nn
@@ -16,7 +18,10 @@ from adafactor8bit import Adafactor8Bit
 
 # Define learning rates
 lr = 1e-3
-lr_adam = 1e-4 # For Embedding layers, we use an Adam-style learning rate
+lr_adam = 1e-4 # For Embedding and N-D layers, we use an Adam-style learning rate
+
+# Only 2D layers whose names contain these keywords will use APOLLO
+apollo_targets = ["attn", "mlp"]
 
 
 class DummyModel(nn.Module):
@@ -28,23 +33,30 @@ class DummyModel(nn.Module):
         
         # Embeddings
         self.token_embed = nn.Embedding(1000, 64)
-        self.pos_embed = nn.Embedding(128, 64) # Position embeddings are dense, routed to 1D/2D logic
+        self.pos_embed = nn.Embedding(128, 64) # Position embeddings are dense, routed to 2D Others
         
-        # 2D Parameters 
+        # 2D APOLLO targets (name must contain a keyword in apollo_targets)
+        self.attn_proj = nn.Linear(64, 64)
+        self.mlp_fc = nn.Linear(64, 64)
+
+        # 2D Others
         self.linear = nn.Linear(64, 10)
+
+        # LM Head (2D, routed to element-wise Adam style)
+        self.lm_head = nn.Linear(16, 10)
         
         # >2D Parameters 
         self.conv = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.head = nn.Linear(16, 10)
 
     def forward(self, x_text, x_img):
         seq_len = x_text.size(1)
         positions = torch.arange(seq_len, device=x_text.device).unsqueeze(0)
         text_feat = self.norm(self.token_embed(x_text) + self.pos_embed(positions)).mean(dim=1)
+        text_feat = self.mlp_fc(self.attn_proj(text_feat))
         text_out = self.linear(text_feat)
         
         img_feat = self.conv(x_img).mean(dim=[2, 3])
-        img_out = self.head(img_feat)
+        img_out = self.lm_head(img_feat)
         
         return text_out + img_out
 
@@ -53,7 +65,7 @@ def get_param_groups(model, lr_adam, weight_decay, apollo_rank=256):
     """
     Precision routing for different parameter dimensions.
     """
-    group_1d, group_embed, group_2d, group_nd = [], [], [], []
+    group_1d, group_embed, group_lm_head, group_apollo, group_2d, group_nd = [], [], [], [], [], []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -65,15 +77,31 @@ def get_param_groups(model, lr_adam, weight_decay, apollo_rank=256):
                         and "position" not in name.lower() 
                         and "pos_embed" not in name.lower()
                         and "time" not in name.lower())
+        is_lm_head = param.ndim == 2 and "lm_head" in name.lower()
+        is_apollo_target = param.ndim == 2 and any(t in name for t in apollo_targets)
         
         if is_1d:
             group_1d.append(param)
         elif is_embedding:
             group_embed.append(param)
+        elif is_lm_head:
+            group_lm_head.append(param)
+        elif is_apollo_target:
+            group_apollo.append(param)
         elif param.ndim == 2:
             group_2d.append(param)
         else:
             group_nd.append(param)
+
+    # Common configuration for Adam-style groups (element-wise, no RMS scaling, no clipping)
+    adam_style = {
+        "factored": False,         # full-rank V
+        "scale_parameter": False,  # no parameter RMS scaling
+        "d": 0,                    # no RMS clipping
+        "beta3": None,             # CAME requires factored=True
+        "apollo_rank": 0,
+        "lr": lr_adam,  
+    }
 
     return [
         # 1. 1D / Sensitive: FP32, No Weight Decay
@@ -84,35 +112,43 @@ def get_param_groups(model, lr_adam, weight_decay, apollo_rank=256):
             "params": group_embed, 
             "weight_decay": 0.0, 
             "quantize": False,
-            "apollo_rank": 0,
-            "factored": False,         # Enable element-wise variance
-            "scale_parameter": False,  # Disable internal RMS scaling
-            "d": 1e9,                  # Disable global Trust-Region clipping
-            "lr": lr_adam              # Override global learning rate
+            "beta1": None,             # Momentum-free
+            **adam_style,
+        },
+
+        # 3. LM Head: Adam-style with momentum (avoid factored distortion)
+        {
+            "params": group_lm_head, 
+            "weight_decay": 0.0, 
+            "quantize": True,
+            "beta1": 0.9,
+            **adam_style,
         },
         
-        # 3. 2D Weights: 8-bit quantization, Weight Decay, APOLLO low-rank projection
+        # 4. 2D Weights (APOLLO targets): 8-bit quantization, APOLLO low-rank projection
+        {
+            "params": group_apollo, 
+            "weight_decay": weight_decay, 
+            "quantize": True, 
+            "apollo_rank": apollo_rank,
+            "beta1": 0.9,              # Remove if minimizing optimizer memory is the priority.
+        },
+
+        # 5. 2D Weights (Others): Default Adafactor path (factored), 8-bit quantization
         {
             "params": group_2d, 
             "weight_decay": weight_decay, 
             "quantize": True, 
-            "apollo_rank": apollo_rank,
-            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
         },
         
-        # 4. >2D Weights: 8-bit quantization, Weight Decay, Full-Rank
+        # 6. >2D Weights: 8-bit quantization, Weight Decay, Full-Rank
+        # Switch to 2D Weights style if minimizing optimizer memory is the priority.
         {
             "params": group_nd, 
             "weight_decay": weight_decay, 
             "quantize": True, 
-            "apollo_rank": 0,
-            "beta1":0.9,               # Remove if minimizing optimizer memory is the priority.
-            "factored": False,         # Disables factorization to preserve spatial structures, enabling finer gradient scaling.
-                                       # Note: This increases state memory for >2D weights, depending on your model architecture.
-                                       # If VRAM is constrained, reverting to factored=True is a safe alternative.
-            "scale_parameter": False,  # Disable internal RMS scaling
-            "d": 1e9,
-            "lr": lr_adam              # Override global learning rate (because internal RMS scaling is disabled). 
+            "beta1": 0.9,
+            **adam_style,
         },
     ]
 
@@ -131,7 +167,6 @@ def main():
         fira_margin=0.01,
     )
 
-
     for step in range(10):
         optimizer.zero_grad()
         
@@ -142,10 +177,6 @@ def main():
         output = model(x_text, x_img)
         loss = nn.MSELoss()(output, target)
         loss.backward()
-        
-        # With Fira Limiter enabled, external gradient clipping is generally 
-        # not required and can be safely removed.
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
         print(f"Step {step:02d} | Loss: {loss.item():.4f}")

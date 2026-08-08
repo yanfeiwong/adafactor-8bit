@@ -17,20 +17,20 @@ class DummyModel(nn.Module):
         self.embed = nn.Embedding(1000, 64)
         self.linear = nn.Linear(64, 128)
         self.norm = nn.LayerNorm(128)
-        self.head = nn.Linear(128, 10)
+        self.lm_head = nn.Linear(128, 10)
 
     def forward(self, x):
         x = self.embed(x)
         x = self.linear(x)
         x = self.norm(x)
-        return self.head(x)
+        return self.lm_head(x)
 
 
 def get_param_groups(model, weight_decay=1e-2):
     """
     Separates model parameters into two groups:
     1. decay: Large 2D weight matrices (Linear/Conv) -> Quantized to 8-bit.
-    2. no_decay: 1D vectors, biases, norms, and embeddings -> Kept in FP32 for stability.
+    2. no_decay: 1D vectors, biases, norms, embeddings, and LM head -> Kept in FP32.
     """
     decay, no_decay = [], []
     for name, param in model.named_parameters():
@@ -38,7 +38,7 @@ def get_param_groups(model, weight_decay=1e-2):
             continue
         
         # Heuristic: Protect 1D tensors, biases, norms, and embeddings
-        if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name:
+        if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name or "lm_head" in name:
             # Note: Grouping embeddings here works well for layers with dense gradient updates. 
             # For massive token embeddings with highly sparse updates, please refer to 
             # `advanced_usage.py` for a more specialized routing strategy 
