@@ -266,8 +266,8 @@ __global__ void fused_log_quantize_lerp_kernel(
                 if (base_idx + 2 < N) fp32_out[base_idx + 2] = u2;
                 if (base_idx + 3 < N) fp32_out[base_idx + 3] = u3;
             }
-            float l0=(u0>0.0f)?log2f(fmaxf(u0,MIN_VAL)):LOG_ZERO, l1=(u1>0.0f)?log2f(fmaxf(u1,MIN_VAL)):LOG_ZERO;
-            float l2=(u2>0.0f)?log2f(fmaxf(u2,MIN_VAL)):LOG_ZERO, l3=(u3>0.0f)?log2f(fmaxf(u3,MIN_VAL)):LOG_ZERO;
+            float l0=(u0>0.0f)?log2f(u0):LOG_ZERO, l1=(u1>0.0f)?log2f(u1):LOG_ZERO;
+            float l2=(u2>0.0f)?log2f(u2):LOG_ZERO, l3=(u3>0.0f)?log2f(u3):LOG_ZERO;
             local_logs[idx*4]=l0; local_logs[idx*4+1]=l1; local_logs[idx*4+2]=l2; local_logs[idx*4+3]=l3;
             thread_max = fmaxf(thread_max, fmaxf(fmaxf(l0,l1),fmaxf(l2,l3)));
             float local_min = LOG_MAX;
@@ -332,8 +332,8 @@ __global__ void fused_log_quantize_lerp_kernel(
                 if (base_idx + 1 < N) fp32_out[base_idx + 1] = u1;
             }
             
-            float l0 = (u0 > 0.0f) ? log2f(fmaxf(u0, MIN_VAL)) : LOG_ZERO;
-            float l1 = (u1 > 0.0f) ? log2f(fmaxf(u1, MIN_VAL)) : LOG_ZERO;
+            float l0 = (u0 > 0.0f) ? log2f(u0) : LOG_ZERO;
+            float l1 = (u1 > 0.0f) ? log2f(u1) : LOG_ZERO;
             
             local_logs[idx*2] = l0; local_logs[idx*2+1] = l1;
             thread_max = fmaxf(thread_max, fmaxf(l0, l1));

@@ -1178,10 +1178,6 @@ class Adafactor8Bit(Optimizer):
             if apollo_rank == 0 and not factored:
                 raise ValueError("CAME (beta3) requires factored=True (2D row/col factorization). It is not supported for 1D full-rank paths.")
 
-        if momentum_only_1d is None:
-            is_adam_mode = (beta2 is not None) and (not relative_step) and (beta3 is None)
-            momentum_only_1d = not is_adam_mode
-
         defaults = dict(
             # Core Optimization
             lr=lr, beta1=beta1, beta2=beta2, beta2_decay=beta2_decay, beta3=beta3, eps_came=eps_came,
@@ -1557,7 +1553,7 @@ class Adafactor8Bit(Optimizer):
                         use_cuda_kernel=group.get("use_cuda_kernel", True),
                         enable_fira_for_adafactor=group.get("enable_fira_for_adafactor", False),
                         fira_margin=group.get("fira_margin", 0.01),
-                        lag_norm=group.get("lag_norm", False), momentum_only_1d=group.get("momentum_only_1d", False), 
+                        lag_norm=group.get("lag_norm", False), momentum_only_1d=group.get("momentum_only_1d", None), 
                         factored=group.get("factored", True),
                         beta3=group.get("beta3"), eps_came=group.get("eps_came", 1e-16),
                         bias_correction=group.get("bias_correction"),
@@ -1576,7 +1572,7 @@ def _update_param_8bit(
     maximize: bool, relative_step: bool, scale_parameter: bool, scale_weight_decay: bool,
     block_size: int, m_block_size: int, use_cuda_kernel: bool,
     enable_fira_for_adafactor: bool = False, fira_margin: float = 0.01,
-    lag_norm: bool = False, momentum_only_1d: bool = False, factored: bool = True,
+    lag_norm: bool = False, momentum_only_1d: Optional[bool] = None, factored: bool = True,
     beta3: Optional[float] = None, eps_came: float = 1e-16,
     bias_correction: Optional[bool] = None,
 ):
@@ -1586,9 +1582,12 @@ def _update_param_8bit(
     log_eps_sq = math.log2(eps_sq)
     _cuda_ready = _load_cuda_module(use_cuda_kernel)
 
-    use_adam_denom = (not factored) and (beta2 is not None) and (not relative_step) and (beta3 is None)
+    use_adam_denom = (not factored) and (beta2 is not None) and (beta3 is None)
     eps_for_denom = eps1 if use_adam_denom else 0.0
     eps_for_grad_sq = eps1 if not use_adam_denom else 0.0
+
+    if momentum_only_1d is None:
+        momentum_only_1d = not use_adam_denom
 
     grad_contig = grad.contiguous()
     if maximize:

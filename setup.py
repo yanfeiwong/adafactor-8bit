@@ -9,7 +9,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="adafactor8bit",
-    version="0.4.1",
+    version="0.4.2",
     description=(
         "Memory-efficient PyTorch optimizer with block-wise adaptive "
         "log-space quantization, fused CUDA kernels, and APOLLO/CAME paths"
