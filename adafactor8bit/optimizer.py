@@ -726,8 +726,9 @@ def _fallback_1d_update(
 def _fallback_2d_update(
     param_work, grad_fp32, state, alpha, d, enable_fira, fira_margin,
     beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-    inv_row, inv_col, curr_block_size, v_quant_type
+    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type
 ):
+    c_quant_type = c_quant_type or v_quant_type
     is_temp_m = quantize and m_quant_type != 'fp32'
 
     if beta3 is not None and beta1 is not None:
@@ -738,7 +739,7 @@ def _fallback_2d_update(
         res_row = res.mean(dim=-1, keepdim=True)
         res_col = res.mean(dim=-2, keepdim=True)
 
-        if quantize and v_quant_type != 'fp32':
+        if quantize and c_quant_type != 'fp32':
             c_row = _deq_v(state, "conf_row")
             c_col = _deq_v(state, "conf_col")
         else:
@@ -746,9 +747,9 @@ def _fallback_2d_update(
             c_col = state["conf_col"]
         c_row.lerp_(res_row, 1.0 - beta3)
         c_col.lerp_(res_col, 1.0 - beta3)
-        if quantize and v_quant_type != 'fp32':
-            _quant_v(state, "conf_row", c_row, curr_block_size, v_quant_type)
-            _quant_v(state, "conf_col", c_col, curr_block_size, v_quant_type)
+        if quantize and c_quant_type != 'fp32':
+            _quant_v(state, "conf_row", c_row, curr_block_size, c_quant_type)
+            _quant_v(state, "conf_col", c_col, curr_block_size, c_quant_type)
 
         c_row_mean = c_row.mean(dim=-2, keepdim=True).clamp(min=eps1)
         inv_row_conf, inv_col_conf = _factored_inv_std(c_row, c_col, c_row_mean)
@@ -778,7 +779,8 @@ def _fallback_2d_update(
 # ==========================================
 # 10. State Migration & CUDA Dispatch
 # ==========================================
-def _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size, m_quant_type, v_quant_type, beta1, beta3, p):
+def _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size, m_quant_type, v_quant_type, c_quant_type, beta1, beta3, p):
+    c_quant_type = c_quant_type or v_quant_type
     if use_quant and not state.get("is_quantized", False):
         if isinstance(state.get("v_low"), Tensor) and state.get("v_low_q") is None and v_quant_type != 'fp32':
             _quant_v(state, "v_low", state["v_low"], curr_block_size, v_quant_type)
@@ -792,12 +794,21 @@ def _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size,
             state.pop("m_low", None)
 
         if v_quant_type != 'fp32':
-            _v_keys = ("row_var", "col_var") + (("conf_row", "conf_col") if beta3 is not None else ())
-            for _k in _v_keys:
+            for _k in ("row_var", "col_var"):
                 if _k in state and f"{_k}_q" not in state:
                     _quant_v(state, _k, state.pop(_k), curr_block_size, v_quant_type)
             if "variance" in state and "variance_q" not in state:
                 _quant_v(state, "variance", state.pop("variance"), curr_block_size, v_quant_type)
+        if c_quant_type != 'fp32' and beta3 is not None:
+            for _k in ("conf_row", "conf_col"):
+                if _k in state and f"{_k}_q" not in state:
+                    _quant_v(state, _k, state.pop(_k), curr_block_size, c_quant_type)
+            # APOLLO CAME states migration
+            if "res_low" in state and state.get("res_low_q") is None:
+                _quant_v(state, "res_low", state.pop("res_low"), curr_block_size, c_quant_type)
+            for _k in ("conf_row_low", "conf_col_low"):
+                if _k in state and f"{_k}_q" not in state:
+                    _quant_v(state, _k, state.pop(_k), curr_block_size, c_quant_type)
                 
         if beta1 is not None and "m_q" not in state and m_quant_type != 'fp32':
             m_block_size_local = state.get("m_block_size", m_curr_block_size)
@@ -821,7 +832,7 @@ def _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size,
             state.pop("m_low_scale", None)
             state.pop("m_block_size", None)
 
-        for _k in ("row_var", "col_var", "conf_row", "conf_col", "variance"):
+        for _k in ("row_var", "col_var", "conf_row", "conf_col", "variance", "res_low", "conf_row_low", "conf_col_low"):
             if f"{_k}_q" in state:
                 state[_k] = _deq_v(state, _k, pop=True)
         
@@ -998,6 +1009,9 @@ class Adafactor8Bit(Optimizer):
             'al16': Adaptive log-space 16-bit. 65535 non-zero levels + 1 reserved zero.
             'fp32': Full precision float32 variance.
             Defaults to 'al8'.
+        c_quant_type (str, optional): Quantization scheme for confidence/residual states.
+            Supports 'al8', 'al16', and 'fp32'. If None, follows `v_quant_type`.
+            Defaults to None.
         min_8bit_size (int): Minimum number of elements to apply quantization. Defaults to 4096.
         use_cuda_kernel (bool): Whether to use custom CUDA kernels. Defaults to True.
             
@@ -1086,6 +1100,7 @@ class Adafactor8Bit(Optimizer):
         m_block_size: int = 256,
         m_quant_type: str = 'uf8',
         v_quant_type: str = 'al8',
+        c_quant_type: Optional[str] = None,
         min_8bit_size: int = 4096,
         use_cuda_kernel: bool = True,
         # --- APOLLO Low-Rank Projection ---
@@ -1155,6 +1170,9 @@ class Adafactor8Bit(Optimizer):
         if v_quant_type not in _VALID_V_QUANT_TYPES:
             raise ValueError(f"v_quant_type must be one of {_VALID_V_QUANT_TYPES}, got '{v_quant_type}'.")
 
+        if c_quant_type is not None and c_quant_type not in _VALID_V_QUANT_TYPES:
+            raise ValueError(f"c_quant_type must be one of {_VALID_V_QUANT_TYPES} or None, got '{c_quant_type}'.")
+
         if quantize and beta1 is not None and m_quant_type != 'fp32':
             if block_size % m_block_size != 0:
                 raise ValueError(
@@ -1186,7 +1204,7 @@ class Adafactor8Bit(Optimizer):
             relative_step=relative_step, scale_parameter=scale_parameter, factored=factored,
             # Quantization Control
             quantize=quantize, block_size=block_size, m_block_size=m_block_size, 
-            m_quant_type=m_quant_type, v_quant_type=v_quant_type,
+            m_quant_type=m_quant_type, v_quant_type=v_quant_type, c_quant_type=c_quant_type,
             min_8bit_size=min_8bit_size, use_cuda_kernel=use_cuda_kernel,
             # APOLLO Low-Rank Projection
             apollo_rank=apollo_rank, apollo_update_proj_gap=apollo_update_proj_gap,
@@ -1211,11 +1229,12 @@ class Adafactor8Bit(Optimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        old_vqt, old_mqt = {}, {}
+        old_vqt, old_mqt, old_cqt = {}, {}, {}
         for idx, st in state_dict.get('state', {}).items():
             if isinstance(st, dict):
                 old_vqt[idx] = st.get('v_quant_type', 'al8')
                 old_mqt[idx] = st.get('m_quant_type', 'uf8')
+                old_cqt[idx] = st.get('c_quant_type', old_vqt[idx])
 
         self._apollo_seed_counter = state_dict.get('_apollo_seed_counter', 0)
         super().load_state_dict(state_dict)
@@ -1227,6 +1246,7 @@ class Adafactor8Bit(Optimizer):
                     st = self.state[p]
                     st["v_quant_type"] = old_vqt.get(param_idx, 'al8')
                     st["m_quant_type"] = old_mqt.get(param_idx, 'uf8')
+                    st["c_quant_type"] = old_cqt.get(param_idx, st["v_quant_type"])
                     s = st.get("step")
                     if torch.is_tensor(s):
                         st["step"] = int(s)
@@ -1261,7 +1281,8 @@ class Adafactor8Bit(Optimizer):
                 if "m_q" in k or "m_low_q" in k:
                     target_dtype = torch.uint8
                 else:
-                    v_qt = st.get("v_quant_type", 'al8')
+                    _is_conf = k.startswith("conf") or k.startswith("res_low")
+                    v_qt = st.get("c_quant_type" if _is_conf else "v_quant_type", 'al8')
                     target_dtype = torch.int16 if v_qt == 'al16' else torch.uint8
             else:
                 target_dtype = cpu_tensor.dtype
@@ -1302,6 +1323,7 @@ class Adafactor8Bit(Optimizer):
         m_block_size = group.get("m_block_size", 256)
         m_quant_type = group.get("m_quant_type", 'uf8')
         v_quant_type = group.get("v_quant_type", 'al8')
+        c_quant_type = group.get("c_quant_type") or v_quant_type
         min_8bit_size = group.get("min_8bit_size", 4096)
         apollo_rank = group.get("apollo_rank", 0)
         apollo_factorize = group.get("apollo_factorize", False)
@@ -1356,8 +1378,9 @@ class Adafactor8Bit(Optimizer):
                         state.pop("m_block_size", None)
                         state.pop("m_quant_type", None)
                 old_vqt = state.get("v_quant_type", 'al8')
-                if old_vqt != v_quant_type and use_quant:
-                    logger.warning(f"Adafactor8Bit: V config changed ('{old_vqt}'->'{v_quant_type}') for param shape {p.shape}. Re-initializing state.")
+                old_cqt = state.get("c_quant_type", old_vqt)
+                if (old_vqt != v_quant_type or old_cqt != c_quant_type) and use_quant:
+                    logger.warning(f"Adafactor8Bit: V/C config changed (V: '{old_vqt}'->'{v_quant_type}', C: '{old_cqt}'->'{c_quant_type}') for param shape {p.shape}. Re-initializing state.")
                     _reset_keep_step(state)
                     needs_init = True
 
@@ -1387,6 +1410,7 @@ class Adafactor8Bit(Optimizer):
                 state["is_quantized"] = use_quant
                 state["block_size"] = block_size
                 state["v_quant_type"] = v_quant_type
+                state["c_quant_type"] = c_quant_type
 
                 if is_sgd_mode:
                     if beta1 is not None:
@@ -1436,8 +1460,8 @@ class Adafactor8Bit(Optimizer):
                             _init_m_or_fp32(state, p.numel(), m_block_size, m_quant_type, p.device, p.shape, use_quant)
                                 
                         if beta3 is not None:
-                            _init_v_or_fp32(state, "conf_row", r_shape, block_size, p.device, v_quant_type, use_quant)
-                            _init_v_or_fp32(state, "conf_col", c_shape, block_size, p.device, v_quant_type, use_quant)
+                            _init_v_or_fp32(state, "conf_row", r_shape, block_size, p.device, c_quant_type, use_quant)
+                            _init_v_or_fp32(state, "conf_col", c_shape, block_size, p.device, c_quant_type, use_quant)
 
                     else:
                         _init_v_or_fp32(state, "variance", p.grad.shape, block_size, p.device, v_quant_type, use_quant)
@@ -1453,7 +1477,8 @@ class Adafactor8Bit(Optimizer):
                                 if state[k].dtype != torch.uint8:
                                     state[k] = state[k].to(torch.uint8)
                             else:
-                                v_qt = state.get("v_quant_type", 'al8')
+                                _is_conf = k.startswith("conf") or k.startswith("res_low")
+                                v_qt = state.get("c_quant_type" if _is_conf else "v_quant_type", 'al8')
                                 expected = torch.int16 if v_qt == 'al16' else torch.uint8
                                 if state[k].dtype != expected:
                                     state[k] = state[k].to(expected)
@@ -1463,7 +1488,7 @@ class Adafactor8Bit(Optimizer):
                 curr_block_size = state.get("block_size", block_size)
                 m_curr_block_size = state.get("m_block_size", m_block_size) if beta1 is not None else 0
 
-                _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size, m_quant_type, v_quant_type, beta1, beta3, p)
+                _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size, m_quant_type, v_quant_type, c_quant_type, beta1, beta3, p)
 
                 if beta1 is not None and "m_q" not in state:
                     m_curr_block_size = state.get("m_block_size", m_block_size)
@@ -1595,6 +1620,7 @@ def _update_param_8bit(
 
     quantize = state.get("is_quantized", False)
     v_quant_type = state.get("v_quant_type", 'al8')
+    c_quant_type = state.get("c_quant_type", v_quant_type)
     v_bits = 16 if v_quant_type == 'al16' else 8
     curr_block_size = state.get("block_size", block_size)
     m_curr_block_size = state.get("m_block_size", m_block_size) if beta1 is not None else 0
@@ -1877,12 +1903,21 @@ def _update_param_8bit(
                     u_col_mean = res_col_sum / R
                     del res_row_sum, res_col_sum
 
-                    _conf_row_fp32 = _rc_buf[_came_base + _rs + _cs:_came_base + _rs + _cs + _rs]
-                    _conf_col_fp32 = _rc_buf[_came_base + _rs + _cs + _rs:]
-                    _fused_v_ema(state, "conf_row", u_row_mean, _conf_row_fp32, beta3_val, curr_block_size, log_floor=log_eps_sq)
-                    _fused_v_ema(state, "conf_col", u_col_mean, _conf_col_fp32, beta3_val, curr_block_size, log_floor=log_eps_sq)
+                    if c_quant_type != 'fp32':
+                        _conf_row_fp32 = _rc_buf[_came_base + _rs + _cs:_came_base + _rs + _cs + _rs]
+                        _conf_col_fp32 = _rc_buf[_came_base + _rs + _cs + _rs:]
+                        _fused_v_ema(state, "conf_row", u_row_mean, _conf_row_fp32, beta3_val, curr_block_size, log_floor=log_eps_sq)
+                        _fused_v_ema(state, "conf_col", u_col_mean, _conf_col_fp32, beta3_val, curr_block_size, log_floor=log_eps_sq)
+                        conf_row_mean = _conf_row_fp32.view(batch_size, R).mean(dim=-1).clamp_(min=eps1)
+                    else:
+                        c_row = state["conf_row"]
+                        c_col = state["conf_col"]
+                        c_row.view(-1).lerp_(u_row_mean, 1.0 - beta3)
+                        c_col.view(-1).lerp_(u_col_mean, 1.0 - beta3)
+                        _conf_row_fp32 = c_row.view(-1)
+                        _conf_col_fp32 = c_col.view(-1)
+                        conf_row_mean = c_row.view(batch_size, R).mean(dim=-1).clamp_(min=eps1)
                     del u_row_mean, u_col_mean
-                    conf_row_mean = _conf_row_fp32.view(batch_size, R).mean(dim=-1).clamp_(min=eps1)
 
                     if enable_fira_for_adafactor:
                         norm_buf = _get_norm_buf(param_work.device)
@@ -1934,7 +1969,7 @@ def _update_param_8bit(
                 inv_row, inv_col = _factored_inv_std(row_var, col_var, row_mean_val)
                 _fallback_2d_update(param_work, grad_fp32, state, alpha, d, enable_fira_for_adafactor, fira_margin,
                                     beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-                                    inv_row, inv_col, curr_block_size, v_quant_type)
+                                    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type)
 
         elif _cuda_ready and beta3 is None and (not quantize or v_quant_type == 'fp32' or beta1 is None):
             # Unified 2D Full Precision Path (Adafactor/AdamW)
@@ -2000,13 +2035,26 @@ def _update_param_8bit(
                 clip_factor,
                 beta1, eps_came, R, C, numel, m_block_size)
 
-            c_row = state["conf_row"]
-            c_col = state["conf_col"]
-            res_row_mean = (res_row_sum.view(c_row.shape) / C).add_(eps_came)
-            res_col_mean = (res_col_sum.view(c_col.shape) / R).add_(eps_came)
-            c_row.lerp_(res_row_mean, 1.0 - beta3)
-            c_col.lerp_(res_col_mean, 1.0 - beta3)
-            c_row_mean = c_row.mean(dim=-2, keepdim=True).clamp(min=eps1)
+            if quantize and c_quant_type != 'fp32':
+                c_row_fp32 = _deq_v(state, "conf_row")
+                c_col_fp32 = _deq_v(state, "conf_col")
+                res_row_mean = (res_row_sum.view(c_row_fp32.shape) / C).add_(eps_came)
+                res_col_mean = (res_col_sum.view(c_col_fp32.shape) / R).add_(eps_came)
+                c_row_fp32.lerp_(res_row_mean, 1.0 - beta3)
+                c_col_fp32.lerp_(res_col_mean, 1.0 - beta3)
+                _quant_v(state, "conf_row", c_row_fp32, curr_block_size, c_quant_type)
+                _quant_v(state, "conf_col", c_col_fp32, curr_block_size, c_quant_type)
+                c_row = _deq_v(state, "conf_row")
+                c_col = _deq_v(state, "conf_col")
+                c_row_mean = c_row.mean(dim=-2, keepdim=True).clamp(min=eps1)
+            else:
+                c_row = state["conf_row"]
+                c_col = state["conf_col"]
+                res_row_mean = (res_row_sum.view(c_row.shape) / C).add_(eps_came)
+                res_col_mean = (res_col_sum.view(c_col.shape) / R).add_(eps_came)
+                c_row.lerp_(res_row_mean, 1.0 - beta3)
+                c_col.lerp_(res_col_mean, 1.0 - beta3)
+                c_row_mean = c_row.mean(dim=-2, keepdim=True).clamp(min=eps1)
 
             if need_norm:
                 norm_buf = _get_norm_buf(param_work.device)
@@ -2031,7 +2079,7 @@ def _update_param_8bit(
             inv_row, inv_col = _factored_inv_std(row_var, col_var, row_mean_val)
             _fallback_2d_update(param_work, grad_fp32, state, alpha, d, enable_fira_for_adafactor, fira_margin,
                                 beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-                                inv_row, inv_col, curr_block_size, v_quant_type)
+                                inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type)
 
         if needs_copy_back:
             param.copy_(param_work)
@@ -2107,6 +2155,7 @@ def _update_param_apollo(
     step = state["step"] + 1
     state["step"] = step
     v_quant_type = state.get("v_quant_type", 'al8')
+    c_quant_type = state.get("c_quant_type", v_quant_type)
     if beta1 is not None:
         m_quant_type = state.get("m_quant_type", 'uf8')
         m_bits = _get_m_bits(m_quant_type)
@@ -2174,16 +2223,16 @@ def _update_param_apollo(
                 res_col = res.mean(dim=-2, keepdim=True)
                 
                 curr_block_size = state.get("block_size", block_size)
-                if quantize and v_quant_type != 'fp32':
+                if quantize and c_quant_type != 'fp32':
                     if state.get("conf_row_low_q") is None:
-                        _init_v_state(state, "conf_row_low", res_row.shape, curr_block_size, grad_low.device, v_quant_type)
-                        _init_v_state(state, "conf_col_low", res_col.shape, curr_block_size, grad_low.device, v_quant_type)
+                        _init_v_state(state, "conf_row_low", res_row.shape, curr_block_size, grad_low.device, c_quant_type)
+                        _init_v_state(state, "conf_col_low", res_col.shape, curr_block_size, grad_low.device, c_quant_type)
                     c_row = _deq_v(state, "conf_row_low")
                     c_col = _deq_v(state, "conf_col_low")
                     c_row.lerp_(res_row, 1.0 - beta3)
                     c_col.lerp_(res_col, 1.0 - beta3)
-                    _quant_v(state, "conf_row_low", c_row, curr_block_size, v_quant_type)
-                    _quant_v(state, "conf_col_low", c_col, curr_block_size, v_quant_type)
+                    _quant_v(state, "conf_row_low", c_row, curr_block_size, c_quant_type)
+                    _quant_v(state, "conf_col_low", c_col, curr_block_size, c_quant_type)
                 else:
                     if "conf_row_low" not in state:
                         state["conf_row_low"] = torch.zeros_like(res_row)
@@ -2251,8 +2300,11 @@ def _update_param_apollo(
                 grad_low_numel = grad_low.numel()
                 m_curr_block_size = state.get("m_block_size", m_block_size)
 
-                if state.get("res_low_q") is None and quantize and v_quant_type != 'fp32':
-                    _init_v_state(state, "res_low", grad_low.shape, curr_block_size, grad_low.device, v_quant_type)
+                if state.get("res_low_q") is None and state.get("res_low") is None:
+                    if quantize and c_quant_type != 'fp32':
+                        _init_v_state(state, "res_low", grad_low.shape, curr_block_size, grad_low.device, c_quant_type)
+                    else:
+                        state["res_low"] = torch.zeros_like(grad_low)
 
                 if quantize and _cuda_ready and m_quant_type != 'fp32' and v_quant_type != 'fp32':
                     if state.get("m_low_q") is None:
@@ -2325,10 +2377,10 @@ def _update_param_apollo(
                     res = U_t.sub(m_low_deq).square_().add_(eps_came)
                     del U_t
                     
-                    if quantize and v_quant_type != 'fp32':
+                    if quantize and c_quant_type != 'fp32':
                         res_deq = _deq_v(state, "res_low")
                         res_deq.lerp_(res, 1.0 - beta3)
-                        _quant_v(state, "res_low", res_deq, curr_block_size, v_quant_type)
+                        _quant_v(state, "res_low", res_deq, curr_block_size, c_quant_type)
                         
                         res_low_deq = _deq_v(state, "res_low")
                     else:
