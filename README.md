@@ -7,7 +7,7 @@
 </p>
 <div align="center">
 
-# Adafactor8Bit: Memory-Efficient Optimizer with Block-wise Adaptive Log-space Quantization
+# Adafactor8Bit: Memory-Efficient Optimizer with Adaptive Log-Space Quantization
 
 **English** | [中文](https://github.com/yanfeiwong/adafactor-8bit/blob/main/README_ZH.md)
 
@@ -15,29 +15,69 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/adafactor8bit.svg)](https://pypi.org/project/adafactor8bit/)
 [![Total Downloads](https://static.pepy.tech/badge/adafactor8bit)](https://pepy.tech/project/adafactor8bit)
-[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor8bit/stargazers)
 
 </div>
 
-A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA kernels and block-wise adaptive log-space quantization of the second moment with a family of update paths—including APOLLO low-rank projection and CAME confidence guidance—reducing optimizer memory while preserving numerical stability.
+A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA kernels with state-specific low-precision storage across Adam-style, factored Adafactor, CAME, and APOLLO paths. Non-negative states can use Adaptive Log-Space (`al8` / `al16`) quantization, while signed momentum and CAME confidence precision are configured independently.
 
+## 📐 Adaptive Log-Space (AL)
+
+> **Adaptive nonzero range** — each block fits its own `[ℓ_min, ℓ_max]` to the observed positive values instead of sharing one fixed global log range.  
+> **Exact-zero preservation** — code zero is reserved exclusively for exact zero, giving `q = 0 ⇔ x = 0`.  
+> **AL8 / AL16** — `al8` provides 255 nonzero codes; `al16` provides 65,535. The markers in the animation are schematic.  
+> **State-specific storage** — signed momentum uses an independent encoding, and CAME confidence states can use a different precision from the second moment.
+
+<p align="center">
+  <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/fig02_al_encoding_readme.gif"
+       alt="Adaptive Log-Space encoding: exact-zero reservation and adaptive block-local nonzero range"
+       width="94%">
+</p>
+
+<p align="center">
+  <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/al_update_error_general_readme.png"
+       alt="Controlled single-step Adam-style update error across diverse V distributions"
+       width="90%">
+</p>
+
+<!-- README-specific Figure 4a derivative goes here:
+     compact AL8 / AL16 / Dyn8 update-error chart, without the fixed-floor panel. -->
 
 ## ⚡ Key Features
 
-- **Blockwise Adaptive Log-Space Quantization**: Quantizes the second moment (variance) in log2 space with a per-block adaptive floor and a reserved zero code, accommodating the non-negative, long-tailed nature of variance estimates.
-- **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, and requantization into single kernels. It utilizes `float4` vectorization to optimize memory bandwidth usage.
-- **Configurable First-Moment**: Stores the optional first moment (`beta1`) using configurable quantization formats (Uniform/Dynamic Map, 4-bit/8-bit) or full FP32 precision, preserving momentum updates while keeping memory overhead minimal.
-- **CAME Confidence Guidance**: Optional Confidence-guided Adaptive Memory Efficient Optimization (CAME) that estimates update confidence from historical momentum and adaptively suppresses unstable update directions.
-- **APOLLO Subspace Projection**: Opt-in random subspace projection that estimates adaptive gradient scaling in a low-rank space, capturing cross-dimensional covariance information while keeping memory overhead low.
+- **Adaptive Log-Space Quantization**: `al8` / `al16` storage for non-negative optimizer states, with per-block adaptive logarithmic ranges and an exact-zero code.
+- **Fused CUDA Kernels**: Combines dequantization, EMA updates, Warp-Shuffle reductions, parameter updates, and requantization in fused CUDA paths where supported, reducing memory traffic and optimizer-step overhead.
+- **Configurable First-Moment**: Stores the optional first moment (`beta1`) using configurable 4-bit / 8-bit formats or full FP32 precision.
+- **CAME Confidence Guidance**: Optional confidence-guided updates with confidence-state precision configurable independently from the second-moment state.
+- **APOLLO Subspace Projection**: Opt-in low-rank projected-gradient path that maintains adaptive statistics in projected space while reducing optimizer-state storage.
 - **Fira Norm-Growth Limiter**: Regulates the relative growth of update norms to suppress destructive gradient spikes, available as an optional stabilizer across update paths.
-- **Zero CPU-GPU Sync**: Eliminates implicit synchronizations (e.g., D2H copies) in the control flow, ensuring the GPU computation pipeline runs without blocking.
-- **Cross-Platform JIT**: Uses Just-In-Time (JIT) compilation for straightforward setup across both Windows and Linux environments.
+- **Zero CPU-GPU Sync**: Avoids implicit CPU-GPU synchronization in the optimizer control flow, keeping the GPU pipeline from blocking.
+- **Cross-Platform JIT**: JIT-compiles the CUDA extension locally on Windows and Linux, with a pure PyTorch fallback when CUDA compilation is unavailable.
 
 ## 📊 Performance
 
-- **Memory Footprint**: Due to Adafactor's factorized second-moment estimation, 8-bit quantization, and configurable first moments, the optimizer typically consumes less memory than `AdamW8Bit`.
-- **Training Speed**: The fused kernel design and reduced synchronization overhead allow it to achieve step times comparable to other mainstream 8-bit optimizers.
-- **Quantization Precision**: The second moment (variance) in Adafactor is strictly non-negative and spans multiple orders of magnitude. By mapping it to `UINT8` in log2 space rather than linear space, the optimizer preserves relative precision for small variances, mitigating the instability that can arise from outlier gradients in standard 8-bit quantization.
+**TinyLlama-1.1B · WikiText-103 · 20K steps · `batch_size=4` · `seq_len=512` · BF16 compute / FP32 model parameters · single NVIDIA RTX 3090 Ti · seed 921.**
+
+| Path | Group | Variant | M | V | C | B<sub>V</sub> | PPL ↓ | Peak ↓ | State ↓ | tok/s ↑ |
+|---|---|---|---|---|---|---:|---:|---:|---:|---:|
+| AdamW | G0 | PyTorch | FP32 | FP32 | – | – | 72.48 | 21046.0 | 8392.7 | 2502 |
+| AdamW | G0 | bnb8 | bnb8 | bnb8 | – | 256 | 73.54 | 10608.6 | 2131.8 | 2640 |
+| **AdamW** | **G0** | **Ours** | **UF8** | **AL8** | **–** | **2048** | **72.90** | **10596.8** | **2119.2** | **2960** |
+| CAME | G0 | Official | FP32 | FP32 | FP32 | – | 86.68 | 13428.5 | 4203.2 | 1866 |
+| CAME | G0 | Ours | UF8 | AL8 | AL8 | 2048 | 90.19 | 9509.0 | 1068.0 | 2432 |
+| CAME | G0 | Ours | UF8 | AL8 | FP32 | 2048 | 88.41 | 9510.0 | 1070.3 | 2423 |
+| **CAME** | **G0** | **Ours** | **UF8** | **AL16** | **AL16** | **2048** | **86.16** | **9510.8** | **1069.8** | **2428** |
+| Adafactor | G0 | HF | – | FP32 | – | – | 77.56 | 8934.7 | 3.6 | 2206 |
+| Adafactor | G0 | Ours | – | AL8 | – | 256 | 78.72 | 8442.6 | 1.2 | 2740 |
+| Adafactor | G0 | Ours | – | AL8 | – | 2048 | 79.36 | 8442.7 | 1.3 | 2734 |
+| **Adafactor** | **G1** | **Ours** | **–** | **AL8*** | **–** | **256** | **78.15** | **8999.2** | **1.4** | **2708** |
+| APOLLO | G0 | Official | FP32 | FP32 | – | – | 74.68 | 11560.2 | 2078.7 | 2331 |
+| APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 10290.9 | 1694.7 | 2077 |
+
+> **Benchmark notes:** Memory is MiB. `M`, `V`, and `C` denote first-moment, second-moment, and CAME confidence-state storage; `B<sub>V</sub>` is the non-negative-state block size (momentum blocks use 256).  
+> `Peak` is PyTorch maximum allocated CUDA memory; `State` is live CUDA tensor storage owned by the optimizer; throughput is Hugging Face Trainer input tokens/s. `bnb8` is the evaluated bitsandbytes 8-bit state encoding; `AL8*` uses G1 protection for selected sensitive tensors while the main factored state remains AL8.
+
+<!-- Add the public paper / citation block here after the arXiv identifier is assigned. -->
 
 ## 📦 Installation
 
@@ -110,6 +150,9 @@ optimizer = Adafactor8Bit(
 ```
 
 ## 🛠️ Advanced Example
+
+<details>
+<summary><strong>Show topology-aware grouping example</strong></summary>
 
 Here we demonstrate a **hybrid grouping** strategy for complex hybrid architectures (e.g., Vision-Language Models, Diffusion UNets) to achieve stable and efficient training.
 
@@ -236,8 +279,12 @@ optimizer = Adafactor8Bit(
 > [!NOTE]
 > For more complete examples, please refer to the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
 
+</details>
 
 ## ⚙️ Advanced Configuration
+
+<details>
+<summary><strong>Show advanced configuration options</strong></summary>
 
 ### Continual Learning (`beta2` & `relative_step`)
 By default, Adafactor's second-moment decay rate dynamically decays with the training step, and the internal learning rate schedule (`relative_step`) scales the learning rate accordingly. 
@@ -266,7 +313,13 @@ By default, Adafactor factorizes the second moment of $\ge$ 2D tensors into row 
 If you are in an environment without a CUDA compiler and want to bypass JIT compilation entirely:
 - Set `use_cuda_kernel=False` to fall back to the pure PyTorch implementation.
 
+</details>
+
 ## 🌌 APOLLO Low-Rank Subspace Projection
+
+<details>
+<summary><strong>Show APOLLO configuration and notes</strong></summary>
+
 Enable the APOLLO path to compute gradient scaling factors in a memory-efficient low-rank subspace. Compared to Adafactor's standard row/column factorization (which assumes spatial independence), APOLLO uses random subspace projection to capture cross-dimensional covariance information while keeping memory overhead low.
 
 - **`apollo_rank`**: The target rank for the projection subspace. The default is `0` (disabled).  
@@ -280,7 +333,12 @@ Enable the APOLLO path to compute gradient scaling factors in a memory-efficient
 - **`apollo_update_proj_gap`**: Steps between projection matrix refreshes. Defaults to `200`.
 - **`apollo_factorize` (Experimental)**: Applies Adafactor-style row/column factorization within the low-rank subspace to further reduce state memory overhead.
 
+</details>
+
 ## 🧊 CAME Confidence-Guided Updates
+
+<details>
+<summary><strong>Show CAME configuration and tuning</strong></summary>
 
 Enable the CAME (Confidence-guided Adaptive Memory Efficient Optimization) path to add a confidence estimation stage after momentum accumulation:
 
@@ -316,7 +374,12 @@ To replicate "vanilla" CAME (stripping Adafactor's native modifications), you ca
 },
 ```
 
+</details>
+
 ## 📈 Learning Rate Guide for Beginners
+
+<details>
+<summary><strong>Show learning-rate guidance</strong></summary>
 
 If you are migrating from optimizers like AdamW, Adafactor's learning rate behavior might feel a bit different. This is mainly due to the `scale_parameter` option.
 
@@ -327,6 +390,8 @@ If you are migrating from optimizers like AdamW, Adafactor's learning rate behav
   Disables RMS scaling, making the update scale more similar to AdamW. Use the learning rates you're familiar with for AdamW and tune as usual. (Note: the second moment is still factorized, so behavior is not identical.)
 
 *These are safe starting points. Always validate on your own task and batch size.*
+
+</details>
 
 ## 📌 Implementation Differences from Reference Optimizers
 
@@ -351,7 +416,7 @@ This project builds upon the foundational work of several researchers and open-s
 - **The PyTorch Team** for providing the foundational optimizer implementation and the C++ Extension toolchain.
 
 ### Technical Review & Discussion
-- **Qwen, ChatGLM, and DeepSeek** (large language models) for valuable technical discussions and code reviews on CUDA low-level optimization, memory safety mechanisms, and cross-platform compilation pipeline design.
+- **Qwen, DeepSeek, ChatGPT, and ChatGLM** for technical discussions and code reviews on CUDA optimization, memory safety, cross-platform compilation, and implementation design.
 
 
 ## 🏛️ License

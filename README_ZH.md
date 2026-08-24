@@ -1,13 +1,13 @@
 <p align="center">
   <a href="https://github.com/yanfeiwong/adafactor-8bit">
-    <img src="assets/banner.png"
+    <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/banner.png"
          alt="Adafactor8Bit"
          width="80%">
   </a>
 </p>
 <div align="center">
 
-# Adafactor8Bit：分块自适应对数量化的显存高效优化器
+# Adafactor8Bit：基于 Adaptive Log-Space 量化的显存高效优化器
 
 [English](./README.md) | **中文**
 
@@ -19,24 +19,65 @@
 
 </div>
 
-这是一个为 PyTorch 打造的可配置、内存高效的优化器。它将融合 CUDA 算子与分块自适应对数空间量化（针对二阶矩）相结合，并提供灵活的一阶动量存储（FP32 / 8-bit / 4-bit），同时支持可选的 APOLLO 与 CAME 更新路径——在降低优化器显存占用的同时，保持数值稳定性。
+这是一个面向 PyTorch 的可配置显存高效优化器，覆盖 Adam-style、factored Adafactor、CAME 与 APOLLO 等更新路径。项目通过融合 CUDA kernel，并针对不同优化器状态分别选择低精度表示：非负状态可使用 Adaptive Log-Space（`al8` / `al16`）量化，一阶动量与 CAME confidence 则可以独立配置精度。
+
+## 📐 Adaptive Log-Space（AL）
+
+> **自适应非零范围** — 每个 block 根据实际观测到的正值独立确定 `[ℓ_min, ℓ_max]`，无需共享一个固定的全局对数范围。  
+> **精确保留零值** — code zero 专门留给精确零值，因此满足 `q = 0 ⇔ x = 0`。  
+> **AL8 / AL16** — `al8` 提供 255 个非零 code，`al16` 提供 65,535 个；动画中的 marker 数量仅作示意。  
+> **状态独立选精度** — 有符号一阶动量使用独立编码，CAME confidence 也可以与二阶矩分别选择存储精度。
+
+<p align="center">
+  <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/fig02_al_encoding_readme_zh.gif"
+       alt="Adaptive Log-Space encoding：精确零值保留与分块自适应非零范围"
+       width="94%">
+</p>
+
+<p align="center">
+  <img src="https://github.com/yanfeiwong/adafactor-8bit/raw/main/assets/al_update_error_general_readme_zh.png"
+       alt="不同 V 分布下的单步 Adam 风格更新误差"
+       width="90%">
+</p>
+
+<!-- 这里后续放 README 专用的 Figure 4a 衍生图：
+     精简的 AL8 / AL16 / Dyn8 update-error 柱状图，不搬 fixed-floor panel。 -->
 
 ## ⚡ 核心特性
 
-- **分块自适应对数空间量化**：在 log2 空间对二阶矩（方差）进行量化，采用分块自适应下限（adaptive floor）并保留零值编码（reserved zero code），以适应方差估计非负且长尾的分布特性。
-- **CUDA 融合算子**：将反量化、EMA 更新、Warp-Shuffle 归约与重新量化整合到单一 Kernel 中，并利用 `float4` 向量化优化显存带宽使用。
-- **灵活的一阶动量**：支持使用可配置的量化格式（Uniform/Dynamic Map，4-bit/8-bit）或全 FP32 精度来存储可选的一阶动量（`beta1`），在保持极低显存开销的同时保留动量更新。
-- **CAME 置信度引导**：可选的置信度引导自适应内存高效优化（CAME），通过历史动量估计更新置信度，并自适应地抑制不稳定的更新方向。
-- **APOLLO 子空间投影**：可选的随机子空间投影路径，在低秩空间内估计自适应梯度缩放，捕获跨维度的协方差信息，同时保持极低的显存开销。
-- **Fira 范数增长限制器**：通过调节更新范数的相对增长来抑制破坏性的梯度尖峰，可作为可选的稳定器应用于各条更新路径。
-- **零同步开销**：重构了控制流，消除了隐式的 CPU-GPU 同步（如 D2H 拷贝），确保 GPU 计算流水线能够无阻塞地异步运行。
-- **跨平台 JIT 编译**：使用即时编译（JIT），在 Windows 和 Linux 环境下均可便捷配置。
+- **Adaptive Log-Space 量化**：为非负优化器状态提供 `al8` / `al16` 存储；每个 block 自适应其非零对数范围，并为精确零值保留独立 code。
+- **CUDA 融合算子**：在支持的路径中，将反量化、EMA 更新、Warp-Shuffle 归约、参数更新与重新量化融合进 CUDA kernel，减少显存访问和 optimizer step 开销。
+- **灵活的一阶动量存储**：可将一阶动量（`beta1`）保存为可配置的 4-bit / 8-bit 格式，或直接使用 FP32。
+- **CAME 置信度引导**：可选用 confidence-guided 更新，并让 confidence state 与二阶矩分别选择存储精度。
+- **APOLLO 子空间投影**：可选低秩投影梯度路径，在投影空间维护自适应统计量，从而减少优化器状态存储。
+- **Fira 范数增长限制器**：限制更新范数的相对增长以抑制破坏性的梯度突增，可作为跨更新路径的可选稳定器。
+- **零 CPU-GPU 同步**：优化器热路径避免隐式 CPU-GPU 同步，尽量减少 GPU pipeline 阻塞。
+- **跨平台 JIT**：在 Windows / Linux 本地即时编译 CUDA 扩展；CUDA 编译不可用时可回退至纯 PyTorch 实现。
 
 ## 📊 性能表现
 
-- **显存占用**：得益于 Adafactor 的分解二阶矩估计、8-bit 量化以及灵活的一阶动量配置，优化器状态的显存占用通常低于 `AdamW8Bit`。
-- **训练速度**：融合算子设计与减少的同步开销，使其能够实现与主流 8-bit 优化器相当的单步（step）耗时。
-- **量化精度**：Adafactor 的二阶矩（方差）严格非负且跨越多个数量级。通过将其映射到 log2 空间的 `UINT8` 而非线性空间，优化器为极小方差保留了相对精度，缓解了标准 8-bit 量化中异常梯度引起的不稳定性。
+**TinyLlama-1.1B · WikiText-103 · 20K steps · `batch_size=4` · `seq_len=512` · BF16 计算 / FP32 模型参数 · 单张 NVIDIA RTX 3090 Ti · seed 921。**
+
+| Path | Group | Variant | M | V | C | B<sub>V</sub> | PPL ↓ | Peak ↓ | State ↓ | tok/s ↑ |
+|---|---|---|---|---|---|---:|---:|---:|---:|---:|
+| AdamW | G0 | PyTorch | FP32 | FP32 | – | – | 72.48 | 21046.0 | 8392.7 | 2502 |
+| AdamW | G0 | bnb8 | bnb8 | bnb8 | – | 256 | 73.54 | 10608.6 | 2131.8 | 2640 |
+| **AdamW** | **G0** | **Ours** | **UF8** | **AL8** | **–** | **2048** | **72.90** | **10596.8** | **2119.2** | **2960** |
+| CAME | G0 | Official | FP32 | FP32 | FP32 | – | 86.68 | 13428.5 | 4203.2 | 1866 |
+| CAME | G0 | Ours | UF8 | AL8 | AL8 | 2048 | 90.19 | 9509.0 | 1068.0 | 2432 |
+| CAME | G0 | Ours | UF8 | AL8 | FP32 | 2048 | 88.41 | 9510.0 | 1070.3 | 2423 |
+| **CAME** | **G0** | **Ours** | **UF8** | **AL16** | **AL16** | **2048** | **86.16** | **9510.8** | **1069.8** | **2428** |
+| Adafactor | G0 | HF | – | FP32 | – | – | 77.56 | 8934.7 | 3.6 | 2206 |
+| Adafactor | G0 | Ours | – | AL8 | – | 256 | 78.72 | 8442.6 | 1.2 | 2740 |
+| Adafactor | G0 | Ours | – | AL8 | – | 2048 | 79.36 | 8442.7 | 1.3 | 2734 |
+| **Adafactor** | **G1** | **Ours** | **–** | **AL8*** | **–** | **256** | **78.15** | **8999.2** | **1.4** | **2708** |
+| APOLLO | G0 | Official | FP32 | FP32 | – | – | 74.68 | 11560.2 | 2078.7 | 2331 |
+| APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 10290.9 | 1694.7 | 2077 |
+
+> **Benchmark 说明：** 显存单位为 MiB。`M`、`V`、`C` 分别表示一阶动量、二阶矩和 CAME confidence state 的存储格式；`B<sub>V</sub>` 是非负状态的 block size（momentum block 使用 256）。  
+> `Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。
+
+<!-- arXiv 正式公开后，在这里加入论文 / Citation 区块。 -->
 
 ## 📦 安装
 
@@ -105,6 +146,9 @@ optimizer = Adafactor8Bit(
 ```
 
 ## 🛠️ 进阶示例
+
+<details>
+<summary><strong>展开拓扑感知分组示例</strong></summary>
 
 这里我们展示针对复杂混合架构模型（例如 Vision-Language Models, Diffusion UNets 等），如何通过**混合分组**策略来尽可能实现稳定高效的训练。
 
@@ -233,8 +277,12 @@ optimizer = Adafactor8Bit(
 > [!NOTE]
 > 更多完整示例，请查阅[示例文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
 
+</details>
 
 ## ⚙️ 高级配置
+
+<details>
+<summary><strong>展开高级配置选项</strong></summary>
 
 ### 持续学习 (`beta2` 与 `relative_step`)
 默认情况下，Adafactor 的二阶矩衰减率会随着训练步数动态衰减，内部学习率调度 (`relative_step`) 也会相应地缩放学习率。
@@ -263,7 +311,13 @@ optimizer = Adafactor8Bit(
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
 - 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
 
+</details>
+
 ## 🌌 APOLLO 低秩子空间投影
+
+<details>
+<summary><strong>展开 APOLLO 配置与说明</strong></summary>
+
 启用 APOLLO 路径，在极低显存占用的低秩子空间内计算梯度缩放因子。与 Adafactor 标准的行列分解（假设空间独立）相比，APOLLO 利用随机子空间投影捕获跨维度的协方差信息，在保持极低显存开销的同时，往往能带来更好的泛化效果。
 
 - **`apollo_rank`**: 投影子空间的目标秩。默认为 `0`（禁用）。
@@ -277,7 +331,12 @@ optimizer = Adafactor8Bit(
 - **`apollo_update_proj_gap`**：投影矩阵刷新的步数间隔。默认为 `200`。
 - **`apollo_factorize` (实验性功能)**：在低秩子空间内应用 Adafactor 风格的行列分解，以进一步降低状态显存开销。
 
+</details>
+
 ## 🧊 CAME 置信度引导更新
+
+<details>
+<summary><strong>展开 CAME 配置与调参说明</strong></summary>
 
 启用 CAME（置信度引导的自适应内存高效优化）路径，在动量累积后增加置信度估计阶段：
 
@@ -312,7 +371,12 @@ optimizer = Adafactor8Bit(
 },
 ```
 
+</details>
+
 ## 📈 学习率建议（从 AdamW 迁移）
+
+<details>
+<summary><strong>展开学习率建议</strong></summary>
 
 如果你是从 AdamW 等优化器迁移过来的，可能会发现 Adafactor 的学习率表现有些不同。这主要与 `scale_parameter` 选项有关。
 
@@ -323,6 +387,8 @@ optimizer = Adafactor8Bit(
   关闭 RMS 缩放后，更新步长的量级会更接近 AdamW。此时可以使用你熟悉的 AdamW 学习率，并按常规方式进行调参。（注：由于二阶矩依然采用分解估计，其实际行为与 AdamW 并不完全相同。）
 
 *以上仅为安全的初始配置参考；请务必在你自己的任务和 batch size 下进行验证。*
+
+</details>
 
 ## 📌 与参考优化器的实现差异
 
@@ -347,7 +413,7 @@ optimizer = Adafactor8Bit(
 - **PyTorch 团队** 提供的基础 Optimizer 实现与 C++ Extension 工具链。
 
 ### 技术审查与探讨
-- 大语言模型 **Qwen**、**ChatGLM** 与 **DeepSeek** 在 CUDA 底层优化、内存安全防御机制以及跨平台编译链路设计上提供的深度技术探讨与代码审查。
+- 大语言模型 **Qwen**、**DeepSeek**、**ChatGPT** 与 **ChatGLM** 参与了 CUDA 底层优化、内存安全、跨平台编译与实现设计等方面的技术讨论和代码审查。
 
 ## 🏛️ License
 
