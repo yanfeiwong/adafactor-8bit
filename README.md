@@ -80,7 +80,8 @@ A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA ke
 *`Peak` is PyTorch maximum allocated CUDA memory; `State` is live CUDA tensor storage owned by the optimizer; throughput is Hugging Face Trainer input tokens/s. `bnb8` is the evaluated bitsandbytes 8-bit state encoding; `AL8*` uses G1 protection for selected sensitive tensors while the main factored state remains AL8.*
 
 > [!NOTE]
-> **Explore the experiment artifacts:** [Theory & ablation notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [Benchmark report](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard records](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [State traces](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [Experiment scripts](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
+> **Explore the experiment artifacts:**  
+> [Theory & ablation notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [Benchmark report](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard records](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [State traces](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [Experiment scripts](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
 
 ## 📦 Installation
 

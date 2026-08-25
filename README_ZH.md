@@ -80,7 +80,8 @@
 *`Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。*
 
 > [!NOTE]
-> **查看实验资料：** [理论与消融 Notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [基准报告](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard 记录](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [状态追踪](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [实验脚本](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
+> **查看实验资料：**  
+> [理论与消融 Notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [基准报告](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard 记录](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [状态追踪](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [实验脚本](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
 
 ## 📦 安装
 
