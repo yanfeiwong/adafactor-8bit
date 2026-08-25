@@ -16,7 +16,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/adafactor8bit.svg)](https://pypi.org/project/adafactor8bit/)
 [![Total Downloads](https://static.pepy.tech/badge/adafactor8bit)](https://pepy.tech/project/adafactor8bit)
 [![arXiv](https://img.shields.io/badge/arXiv-2608.22322-b31b1b.svg)](https://arxiv.org/abs/2608.22322)
-[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor8bit/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
 
 </div>
 
@@ -24,9 +24,7 @@ A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA ke
 
 ## 📄 Paper
 
-**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322)
-
-<!-- Append artifact and experimental-data repository links to the resource line once public. -->
+**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322) · [Artifacts](https://github.com/yanfeiwong/al-quantization)
 
 ## 📐 Adaptive Log-Space (AL)
 
@@ -78,8 +76,11 @@ A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA ke
 | APOLLO | G0 | Official | FP32 | FP32 | – | – | 74.68 | 11560.2 | 2078.7 | 2331 |
 | APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 10290.9 | 1694.7 | 2077 |
 
-> **Benchmark notes:** Memory is MiB. `M`, `V`, and `C` denote first-moment, second-moment, and CAME confidence-state storage; `B<sub>V</sub>` is the non-negative-state block size (momentum blocks use 256).  
-> `Peak` is PyTorch maximum allocated CUDA memory; `State` is live CUDA tensor storage owned by the optimizer; throughput is Hugging Face Trainer input tokens/s. `bnb8` is the evaluated bitsandbytes 8-bit state encoding; `AL8*` uses G1 protection for selected sensitive tensors while the main factored state remains AL8.
+*Benchmark notes — Memory is MiB. `M`, `V`, and `C` denote first-moment, second-moment, and CAME confidence-state storage; `B<sub>V</sub>` is the non-negative-state block size (momentum blocks use 256).*  
+*`Peak` is PyTorch maximum allocated CUDA memory; `State` is live CUDA tensor storage owned by the optimizer; throughput is Hugging Face Trainer input tokens/s. `bnb8` is the evaluated bitsandbytes 8-bit state encoding; `AL8*` uses G1 protection for selected sensitive tensors while the main factored state remains AL8.*
+
+> [!NOTE]
+> **Explore the experiment artifacts:** [Theory & ablation notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [Benchmark report](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard records](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [State traces](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [Experiment scripts](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
 
 ## 📦 Installation
 
@@ -278,8 +279,7 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-> [!NOTE]
-> For more complete examples, please refer to the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
+For more complete examples, please refer to the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
 
 </details>
 

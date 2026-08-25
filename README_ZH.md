@@ -24,9 +24,7 @@
 
 ## 📄 论文
 
-**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322)
-
-<!-- artifact 与实验数据仓库公开后会出现在这里，可能会加两个小Icon... -->
+**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322) · [复现资料](https://github.com/yanfeiwong/al-quantization)
 
 ## 📐 Adaptive Log-Space（AL）
 
@@ -78,8 +76,11 @@
 | APOLLO | G0 | Official | FP32 | FP32 | – | – | 74.68 | 11560.2 | 2078.7 | 2331 |
 | APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 10290.9 | 1694.7 | 2077 |
 
-> **Benchmark 说明：** 显存单位为 MiB。`M`、`V`、`C` 分别表示一阶动量、二阶矩和 CAME confidence state 的存储格式；`B<sub>V</sub>` 是非负状态的 block size（momentum block 使用 256）。  
-> `Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。
+*Benchmark 说明——显存单位为 MiB。`M`、`V`、`C` 分别表示一阶动量、二阶矩和 CAME confidence state 的存储格式；`B<sub>V</sub>` 是非负状态的 block size（momentum block 使用 256）。*  
+*`Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。*
+
+> [!NOTE]
+> **查看实验资料：** [理论与消融 Notebook](https://github.com/yanfeiwong/al-quantization/blob/main/theory_and_ablation_final.ipynb) · [基准报告](https://github.com/yanfeiwong/al-quantization/blob/main/reports_md/tb_analysis_report.md) · [TensorBoard 记录](https://github.com/yanfeiwong/al-quantization/tree/main/benchmarks) · [状态追踪](https://github.com/yanfeiwong/al-quantization/tree/main/state_traces) · [实验脚本](https://github.com/yanfeiwong/al-quantization/tree/main/scripts)
 
 ## 📦 安装
 
@@ -276,8 +277,7 @@ optimizer = Adafactor8Bit(
 
 ```
 
-> [!NOTE]
-> 更多完整示例，请查阅[示例文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
+更多完整示例，请查阅[示例文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
 
 </details>
 
