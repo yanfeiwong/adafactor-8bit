@@ -15,11 +15,18 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/adafactor8bit.svg)](https://pypi.org/project/adafactor8bit/)
 [![Total Downloads](https://static.pepy.tech/badge/adafactor8bit)](https://pepy.tech/project/adafactor8bit)
+[![arXiv](https://img.shields.io/badge/arXiv-2608.22322-b31b1b.svg)](https://arxiv.org/abs/2608.22322)
 [![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor-8bit/stargazers)
 
 </div>
 
 这是一个面向 PyTorch 的可配置显存高效优化器，覆盖 Adam-style、factored Adafactor、CAME 与 APOLLO 等更新路径。项目通过融合 CUDA kernel，并针对不同优化器状态分别选择低精度表示：非负状态可使用 Adaptive Log-Space（`al8` / `al16`）量化，一阶动量与 CAME confidence 则可以独立配置精度。
+
+## 📄 论文
+
+**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322)
+
+<!-- artifact 与实验数据仓库公开后会出现在这里，可能会加两个小Icon... -->
 
 ## 📐 Adaptive Log-Space（AL）
 
@@ -39,9 +46,6 @@
        alt="不同 V 分布下的单步 Adam 风格更新误差"
        width="90%">
 </p>
-
-<!-- 这里后续放 README 专用的 Figure 4a 衍生图：
-     精简的 AL8 / AL16 / Dyn8 update-error 柱状图，不搬 fixed-floor panel。 -->
 
 ## ⚡ 核心特性
 
@@ -76,8 +80,6 @@
 
 > **Benchmark 说明：** 显存单位为 MiB。`M`、`V`、`C` 分别表示一阶动量、二阶矩和 CAME confidence state 的存储格式；`B<sub>V</sub>` 是非负状态的 block size（momentum block 使用 256）。  
 > `Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。
-
-<!-- arXiv 正式公开后，在这里加入论文 / Citation 区块。 -->
 
 ## 📦 安装
 
@@ -414,6 +416,20 @@ optimizer = Adafactor8Bit(
 
 ### 技术审查与探讨
 - 大语言模型 **Qwen**、**DeepSeek**、**ChatGPT** 与 **ChatGLM** 参与了 CUDA 底层优化、内存安全、跨平台编译与实现设计等方面的技术讨论和代码审查。
+
+## 📝 引用
+
+```bibtex
+@misc{wang2026beyond,
+  title         = {Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers},
+  author        = {Yan Wang},
+  year          = {2026},
+  eprint        = {2608.22322},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2608.22322}
+}
+```
 
 ## 🏛️ License
 

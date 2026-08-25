@@ -15,11 +15,18 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/adafactor8bit.svg)](https://pypi.org/project/adafactor8bit/)
 [![Total Downloads](https://static.pepy.tech/badge/adafactor8bit)](https://pepy.tech/project/adafactor8bit)
+[![arXiv](https://img.shields.io/badge/arXiv-2608.22322-b31b1b.svg)](https://arxiv.org/abs/2608.22322)
 [![GitHub Stars](https://img.shields.io/github/stars/yanfeiwong/adafactor-8bit?style=social)](https://github.com/yanfeiwong/adafactor8bit/stargazers)
 
 </div>
 
 A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA kernels with state-specific low-precision storage across Adam-style, factored Adafactor, CAME, and APOLLO paths. Non-negative states can use Adaptive Log-Space (`al8` / `al16`) quantization, while signed momentum and CAME confidence precision are configured independently.
+
+## 📄 Paper
+
+**[Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers](https://arxiv.org/abs/2608.22322)** · [PDF](https://arxiv.org/pdf/2608.22322)
+
+<!-- Append artifact and experimental-data repository links to the resource line once public. -->
 
 ## 📐 Adaptive Log-Space (AL)
 
@@ -39,9 +46,6 @@ A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA ke
        alt="Controlled single-step Adam-style update error across diverse V distributions"
        width="90%">
 </p>
-
-<!-- README-specific Figure 4a derivative goes here:
-     compact AL8 / AL16 / Dyn8 update-error chart, without the fixed-floor panel. -->
 
 ## ⚡ Key Features
 
@@ -76,8 +80,6 @@ A configurable memory-efficient optimizer for PyTorch. It combines fused CUDA ke
 
 > **Benchmark notes:** Memory is MiB. `M`, `V`, and `C` denote first-moment, second-moment, and CAME confidence-state storage; `B<sub>V</sub>` is the non-negative-state block size (momentum blocks use 256).  
 > `Peak` is PyTorch maximum allocated CUDA memory; `State` is live CUDA tensor storage owned by the optimizer; throughput is Hugging Face Trainer input tokens/s. `bnb8` is the evaluated bitsandbytes 8-bit state encoding; `AL8*` uses G1 protection for selected sensitive tensors while the main factored state remains AL8.
-
-<!-- Add the public paper / citation block here after the arXiv identifier is assigned. -->
 
 ## 📦 Installation
 
@@ -418,6 +420,19 @@ This project builds upon the foundational work of several researchers and open-s
 ### Technical Review & Discussion
 - **Qwen, DeepSeek, ChatGPT, and ChatGLM** for technical discussions and code reviews on CUDA optimization, memory safety, cross-platform compilation, and implementation design.
 
+## 📝 Citation
+
+```bibtex
+@misc{wang2026beyond,
+  title         = {Beyond Dense Adam States: Adaptive Log-Space Quantization for Memory-Efficient Optimizers},
+  author        = {Yan Wang},
+  year          = {2026},
+  eprint        = {2608.22322},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2608.22322}
+}
+```
 
 ## 🏛️ License
 
