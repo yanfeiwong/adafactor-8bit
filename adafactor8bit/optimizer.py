@@ -810,7 +810,7 @@ def _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size,
                 if _k in state and f"{_k}_q" not in state:
                     _quant_v(state, _k, state.pop(_k), curr_block_size, c_quant_type)
                 
-        if beta1 is not None and "m_q" not in state and m_quant_type != 'fp32':
+        if beta1 is not None and "m_q" not in state and m_quant_type != 'fp32' and "apollo_seed" not in state:
             m_block_size_local = state.get("m_block_size", m_curr_block_size)
             if "m" in state:
                 state["m_q"], state["m_scale"] = _m_quantize(state["m"], m_quant_type, m_block_size_local)
@@ -1229,6 +1229,18 @@ class Adafactor8Bit(Optimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        # APOLLO uses projected momentum (m_low/m_low_q), so discard obsolete
+        # full-size momentum before Optimizer.load_state_dict moves it to the parameter device.
+        state_dict = state_dict.copy()
+        state_dict["state"] = {
+            idx: (
+                {k: v for k, v in st.items() if k not in ("m", "m_q", "m_scale")}
+                if isinstance(st, dict) and "apollo_seed" in st
+                else st
+            )
+            for idx, st in state_dict.get("state", {}).items()
+        }
+
         old_vqt, old_mqt, old_cqt = {}, {}, {}
         for idx, st in state_dict.get('state', {}).items():
             if isinstance(st, dict):
@@ -1379,8 +1391,9 @@ class Adafactor8Bit(Optimizer):
                         state.pop("m_quant_type", None)
                 old_vqt = state.get("v_quant_type", 'al8')
                 old_cqt = state.get("c_quant_type", old_vqt)
-                if (old_vqt != v_quant_type or old_cqt != c_quant_type) and use_quant:
-                    logger.warning(f"Adafactor8Bit: V/C config changed (V: '{old_vqt}'->'{v_quant_type}', C: '{old_cqt}'->'{c_quant_type}') for param shape {p.shape}. Re-initializing state.")
+                old_bs = state.get("block_size", block_size)
+                if (old_vqt != v_quant_type or old_cqt != c_quant_type or old_bs != block_size) and use_quant:
+                    logger.warning(f"Adafactor8Bit: V/C/Block config changed (V: '{old_vqt}'->'{v_quant_type}', C: '{old_cqt}'->'{c_quant_type}', BS: {old_bs}->{block_size}) for param shape {p.shape}. Re-initializing state.")
                     _reset_keep_step(state)
                     needs_init = True
 
@@ -1390,12 +1403,16 @@ class Adafactor8Bit(Optimizer):
                     _reset_keep_step(state)
                     needs_init = True
                 elif use_apollo and is_apollo_state:
+                    old_beta3 = state.get("beta3")
+                    came_toggled = (old_beta3 is None) != (beta3 is None)
                     if (state.get("apollo_rank") != apollo_rank or 
                         state.get("apollo_factorize", False) != apollo_factorize or
-                        state.get("beta3") != beta3):
+                        came_toggled):
                         logger.warning(f"Adafactor8Bit: Apollo/CAME config changed for param shape {p.shape}. Re-initializing state.")
                         _reset_keep_step(state)
                         needs_init = True
+                    else:
+                        state["beta3"] = beta3
                 elif not is_sgd_mode:
                     state_is_factored = ("row_var" in state or "row_var_q" in state)
                     
@@ -1490,7 +1507,46 @@ class Adafactor8Bit(Optimizer):
 
                 _migrate_quantize_flag(state, use_quant, curr_block_size, m_curr_block_size, m_quant_type, v_quant_type, c_quant_type, beta1, beta3, p)
 
-                if beta1 is not None and "m_q" not in state:
+                if not use_apollo:
+                    if beta3 is None:
+                        # Disabling CAME invalidates confidence history.
+                        # Re-enabling it later should start from fresh state.
+                        for prefix in ("conf_row", "conf_col"):
+                            state.pop(prefix, None)
+                            for suffix in ("q", "scale", "min_log", "shape", "pad"):
+                                state.pop(f"{prefix}_{suffix}", None)
+
+                    elif expected_is_factored:
+                        shape = p.grad.shape
+                        R = shape[-2]
+                        C = shape[-1]
+                        batch_shape = shape[:-2]
+                        r_shape = list(batch_shape) + [R, 1]
+                        c_shape = list(batch_shape) + [1, C]
+
+                        row_missing = (
+                            "conf_row" not in state
+                            and "conf_row_q" not in state
+                        )
+                        col_missing = (
+                            "conf_col" not in state
+                            and "conf_col_q" not in state
+                        )
+
+                        if row_missing:
+                            _init_v_or_fp32(
+                                state, "conf_row", r_shape,
+                                curr_block_size, p.device,
+                                c_quant_type, use_quant
+                            )
+                        if col_missing:
+                            _init_v_or_fp32(
+                                state, "conf_col", c_shape,
+                                curr_block_size, p.device,
+                                c_quant_type, use_quant
+                            )
+
+                if beta1 is not None and "m_q" not in state and not use_apollo:
                     m_curr_block_size = state.get("m_block_size", m_block_size)
                     if use_quant and m_quant_type != 'fp32':
                         if "m" in state:
