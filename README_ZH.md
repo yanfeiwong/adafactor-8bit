@@ -74,10 +74,11 @@
 | Adafactor | G0 | Ours | – | AL8 | – | 2048 | 79.36 | 8442.7 | 1.3 | 2734 |
 | **Adafactor** | **G1** | **Ours** | **–** | **AL8*** | **–** | **256** | **78.15** | **8999.2** | **1.4** | **2708** |
 | APOLLO | G0 | Official | FP32 | FP32 | – | – | 74.68 | 11560.2 | 2078.7 | 2331 |
-| APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 10290.9 | 1694.7 | 2077 |
+| APOLLO | G0 | Ours | UF8 | AL8 | – | 2048 | 75.24 | 9338.2 | 756.3 | 2077 |
 
 *Benchmark 说明——显存单位为 MiB。`M`、`V`、`C` 分别表示一阶动量、二阶矩和 CAME confidence state 的存储格式；`B<sub>V</sub>` 是非负状态的 block size（momentum block 使用 256）。*  
 *`Peak` 为 PyTorch 记录的 maximum allocated CUDA memory；`State` 为优化器自身持有的 CUDA tensor 存储量；吞吐为 Hugging Face Trainer 记录的输入 tokens/s。`bnb8` 表示实验中的 bitsandbytes 8-bit state encoding；`AL8*` 表示 G1 会额外保护部分敏感参数，主体分解状态仍使用 AL8。*
+*APOLLO 的显存字段来自对应的 1K v0.4.4 补充测量；PPL 与吞吐仍来自 20K v0.4.3 训练。*
 
 > [!NOTE]
 > **查看实验资料：**  
