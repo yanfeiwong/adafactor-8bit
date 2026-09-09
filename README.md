@@ -119,40 +119,24 @@ from adafactor8bit import Adafactor8Bit
 optimizer = Adafactor8Bit(model.parameters(), lr=1e-3)
 ```
 
-> [!TIP]
-> Passing `model.parameters()` directly works for a quick test. In production, `param_groups` are recommended to protect sensitive layers (Norms, Biases) from quantization and weight decay. For **sparse token embeddings** (large vocabularies + small batch sizes), please refer to the [Advanced Example](#-advanced-example) to avoid cold-start instability.
+For other optimizer presets, use `build_param_groups()` to get started with automatic grouping. Available presets include **AdamW, Adafactor, RMSprop, CAME, APOLLO, and SGD**.
 
+For example, to use AdamW:
 
 ```python
-from adafactor8bit import Adafactor8Bit
+from adafactor8bit import build_param_groups
 
-def get_param_groups(model, weight_decay=1e-2):
-    decay, no_decay = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad: continue
-        
-        # Protect 1D tensors, biases, norms, embeddings, and LM head
-        if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name or "lm_head" in name:
-            no_decay.append(param)
-        else:
-            decay.append(param)
-            
-    return [
-        {"params": decay, "weight_decay": weight_decay, "quantize": True},
-        {"params": no_decay, "weight_decay": 0.0, "quantize": False}
-    ]
-
-model = MyModel().cuda()
-optimizer = Adafactor8Bit(
-    get_param_groups(model), 
-    lr=1e-3, 
-    # For continual learning or when using an external LR scheduler
-    relative_step=False,     # Disable internal LR scheduling
-    beta2=0.999,             # Lock EMA window to prevent "blunting" over steps
+groups = build_param_groups(
+    model,
+    preset="adamw",
+    grouping="auto",
 )
-
-# Training loop...
+AdamW_optimizer = Adafactor8Bit(groups, lr=1e-4, weight_decay=1e-2)
 ```
+
+The default automatic grouping gives normalization parameters and biases unquantized states with no weight decay. You can customize individual groups as needed.
+
+For more complete examples, including preset selection and grouping options, see the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
 
 ## 🛠️ Advanced Example
 
@@ -281,7 +265,8 @@ optimizer = Adafactor8Bit(
 # Training loop...
 ```
 
-For more complete examples, please refer to the [examples folder](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples).
+Prefer an external configuration? See [optimizer_from_config.py](examples/optimizer_from_config.py) and [custom_policy.json](examples/custom_policy.json).
+
 
 </details>
 
@@ -316,6 +301,10 @@ By default, Adafactor factorizes the second moment of $\ge$ 2D tensors into row 
 ### No-Compiler Environments (`use_cuda_kernel=False`)
 If you are in an environment without a CUDA compiler and want to bypass JIT compilation entirely:
 - Set `use_cuda_kernel=False` to fall back to the pure PyTorch implementation.
+
+### BF16 Master Weight Training
+
+BF16 parameters use half the storage of FP32 parameters. Set `stochastic_round_writeback=True` to help small updates accumulate over training. See [bf16_master_weight_training.py](examples/bf16_master_weight_training.py) for a complete example.
 
 </details>
 

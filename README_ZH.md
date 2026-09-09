@@ -109,7 +109,7 @@ pip install git+https://github.com/yanfeiwong/adafactor-8bit.git
 
 ## 🚀 快速开始
 
-就像使用标准优化器那样简单。
+用法与标准 PyTorch 优化器一样简单。
 
 ```python
 from adafactor8bit import Adafactor8Bit
@@ -117,38 +117,24 @@ from adafactor8bit import Adafactor8Bit
 optimizer = Adafactor8Bit(model.parameters(), lr=1e-3)
 ```
 
-> [!TIP]
-> 直接传入 `model.parameters()` 可快速跑通。生产环境建议使用 `param_groups` 保护敏感层（Norms、Biases）。对于**稀疏 Token Embedding**（大词表 + 小 batch），请参阅[进阶示例](#-进阶示例)以规避冷启动不稳定性。
+使用其他优化器预设时，可以通过 `build_param_groups()` 自动分组并快速开始。可选预设包括 **AdamW、Adafactor、RMSprop、CAME、APOLLO 和 SGD**。
+
+例如，使用 AdamW：
 
 ```python
-from adafactor8bit import Adafactor8Bit
+from adafactor8bit import build_param_groups
 
-def get_param_groups(model, weight_decay=1e-2):
-    decay, no_decay = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad: continue
-        # 保护 1D 张量、bias、norm、embedding 和 lm_head
-        if param.ndim <= 1 or "bias" in name or "norm" in name or "embed" in name or "lm_head" in name:
-            no_decay.append(param)
-        else:
-            decay.append(param)
-            
-    return [
-        {"params": decay, "weight_decay": weight_decay, "quantize": True},
-        {"params": no_decay, "weight_decay": 0.0, "quantize": False}
-    ]
-
-model = MyModel().cuda()
-optimizer = Adafactor8Bit(
-    get_param_groups(model), 
-    lr=1e-3, 
-    # 如果希望长期连续训练或者搭配外部学习率调度
-    relative_step=False,     # 禁用内部 LR 调度，使用外部传入的固定 LR
-    beta2=0.999,             # 锁定 EMA 窗口，适合长期连续微调
+groups = build_param_groups(
+    model,
+    preset="adamw",
+    grouping="auto",
 )
-
-# Training loop...
+AdamW_optimizer = Adafactor8Bit(groups, lr=1e-4, weight_decay=1e-2)
 ```
+
+默认自动分组为归一化参数和 bias 使用未量化状态，并关闭其权重衰减。你可以按需调整各组设置。
+
+更多完整示例，包括预设选择与分组选项，请参见 [examples 文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
 
 ## 🛠️ 进阶示例
 
@@ -279,7 +265,8 @@ optimizer = Adafactor8Bit(
 
 ```
 
-更多完整示例，请查阅[示例文件夹](https://github.com/yanfeiwong/adafactor-8bit/tree/main/examples)。
+想把配置放在独立文件中？参见 [optimizer_from_config.py](examples/optimizer_from_config.py) 和 [custom_policy.json](examples/custom_policy.json)。
+
 
 </details>
 
@@ -314,6 +301,10 @@ optimizer = Adafactor8Bit(
 ### 无编译器环境 (`use_cuda_kernel=False`)
 如果您处于没有 CUDA 编译器的环境中，并希望完全绕过 JIT 编译：
 - 设置 `use_cuda_kernel=False` 即可回退到纯 PyTorch 实现。
+
+### BF16 master 权重训练
+
+BF16 参数存储占用是 FP32 的一半。设置 `stochastic_round_writeback=True`，让微小更新有机会在长期训练中累积。完整示例见 [bf16_master_weight_training.py](examples/bf16_master_weight_training.py)。
 
 </details>
 

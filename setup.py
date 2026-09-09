@@ -9,7 +9,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="adafactor8bit",
-    version="0.4.4",
+    version="0.4.5",
     description=(
         "Memory-efficient PyTorch optimizer with block-wise adaptive "
         "log-space quantization, fused CUDA kernels, and APOLLO/CAME paths"
@@ -17,7 +17,7 @@ setup(
     author="WANG YAN",
     author_email="yanfeiwong1997@outlook.com",
     url="https://github.com/yanfeiwong/adafactor-8bit",
-    packages=find_packages(),
+    packages=find_packages(include=["adafactor8bit", "adafactor8bit.*"]),
     include_package_data=True,
     package_data={"adafactor8bit": ["*.cu"]}, 
     install_requires=[

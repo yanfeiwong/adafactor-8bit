@@ -42,6 +42,121 @@ __device__ __forceinline__ float load_grad(const T* g, int idx) {
     return (isnan(v) || isinf(v)) ? 0.0f : v;
 }
 
+__device__ __forceinline__ uint32_t splitmix64(uint64_t* state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return (uint32_t)(z >> 32);
+}
+
+__device__ __forceinline__ uint32_t sr_rng(uint64_t seed, uint64_t step, uint64_t idx) {
+    uint64_t counter = seed * 0x9E3779B97F4A7C15ULL
+                     + step * 0xD1B54A32D192ED03ULL
+                     + idx;
+    return splitmix64(&counter);
+}
+
+__device__ __forceinline__ float uint32_to_uniform(uint32_t x) {
+    return (float)(x >> 8) * (1.0f / 16777216.0f);
+}
+
+__device__ __forceinline__ uint32_t sr_fp32_to_bf16_bits(uint32_t x_bits, float u) {
+    const uint32_t BF16_MASK = 0xFFFF0000u;
+    const uint32_t LOW_MASK  = 0x0000FFFFu;
+    const uint32_t EXP_MASK  = 0x7F800000u;
+    const uint32_t MANT_MASK = 0x007FFFFFu;
+    const uint32_t LSB       = 0x00010000u;
+
+    bool is_nan = ((x_bits & EXP_MASK) == EXP_MASK) && ((x_bits & MANT_MASK) != 0u);
+    uint32_t lo_bits = x_bits & BF16_MASK;
+    bool has_rem = ((x_bits & LOW_MASK) != 0u) && !is_nan;
+
+    uint32_t hi_bits = lo_bits + LSB;
+    bool lo_is_inf = (lo_bits & EXP_MASK) == EXP_MASK;
+    bool hi_is_inf = ((hi_bits & EXP_MASK) == EXP_MASK) && ((hi_bits & MANT_MASK) == 0u);
+    bool can_up = has_rem && !lo_is_inf && !hi_is_inf;
+
+    float prob = can_up ? ((float)(x_bits & LOW_MASK) * (1.0f / 65536.0f)) : 0.0f;
+    uint32_t result = (can_up && u < prob) ? hi_bits : lo_bits;
+    if (is_nan) result = (x_bits & 0x80000000u) | 0x7FC00000u;
+    return result;
+}
+
+__device__ __forceinline__ unsigned short fp16_next_up_bits(unsigned short h) {
+    if (h == 0x7C00u) return h;
+    if (h == 0x8000u) return 0x0001u;
+    return (h & 0x8000u) ? (unsigned short)(h - 1u) : (unsigned short)(h + 1u);
+}
+
+__device__ __forceinline__ unsigned short fp16_next_down_bits(unsigned short h) {
+    if (h == 0xFC00u) return h;
+    if (h == 0x0000u) return 0x8001u;
+    return (h & 0x8000u) ? (unsigned short)(h + 1u) : (unsigned short)(h - 1u);
+}
+
+__device__ __forceinline__ unsigned short sr_fp32_to_fp16_bits(float x, float u) {
+    uint32_t x_bits = __float_as_uint(x);
+    unsigned short sign = (x_bits & 0x80000000u) ? 0x8000u : 0x0000u;
+    uint32_t exp = x_bits & 0x7F800000u;
+    uint32_t mant = x_bits & 0x007FFFFFu;
+
+    if (exp == 0x7F800000u) {
+        return mant ? (unsigned short)(sign | 0x7E00u)
+                    : (unsigned short)(sign | 0x7C00u);
+    }
+    if (fabsf(x) > 65504.0f) return (unsigned short)(sign | 0x7BFFu);
+
+    __half nearest = __float2half_rn(x);
+    unsigned short q_bits = __half_as_ushort(nearest);
+    float q = __half2float(nearest);
+    if (q == x) return q_bits;
+
+    unsigned short lo_bits, hi_bits;
+    if (q < x) {
+        lo_bits = q_bits;
+        hi_bits = fp16_next_up_bits(q_bits);
+    } else {
+        hi_bits = q_bits;
+        lo_bits = fp16_next_down_bits(q_bits);
+    }
+
+    float lo = __half2float(__ushort_as_half(lo_bits));
+    float hi = __half2float(__ushort_as_half(hi_bits));
+    float prob = (x - lo) / (hi - lo);
+    return (u < prob) ? hi_bits : lo_bits;
+}
+
+template <typename T>
+__device__ __forceinline__ void stochastic_store(
+    T* param, int idx, float value, uint64_t sr_seed, uint64_t sr_step) {
+    float u = uint32_to_uniform(sr_rng(sr_seed, sr_step, (uint64_t)idx));
+    if constexpr (std::is_same_v<T, at::BFloat16>) {
+        uint32_t bf16_bits = sr_fp32_to_bf16_bits(__float_as_uint(value), u);
+        reinterpret_cast<__nv_bfloat16*>(param)[idx] =
+            __ushort_as_bfloat16((unsigned short)(bf16_bits >> 16));
+    } else if constexpr (std::is_same_v<T, at::Half>) {
+        unsigned short fp16_bits = sr_fp32_to_fp16_bits(value, u);
+        reinterpret_cast<__half*>(param)[idx] = __ushort_as_half(fp16_bits);
+    } else {
+        param[idx] = static_cast<T>(value);
+    }
+}
+
+template <typename T, bool STOCHASTIC>
+__device__ __forceinline__ void write_param_update(
+    T* param, int idx, float step_scale, float update,
+    const float* decay_ptr, uint64_t sr_seed, uint64_t sr_step) {
+    float p = static_cast<float>(param[idx]);
+    if constexpr (STOCHASTIC) {
+        float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+        float new_p = p * decay - step_scale * update;
+        stochastic_store(param, idx, new_p, sr_seed, sr_step);
+    } else {
+        param[idx] = static_cast<T>(p - step_scale * update);
+    }
+}
+
 __device__ __forceinline__ void load_codebook_smem(float* s_qmap8, float* s_qmap4, int tid, int nthreads) {
     for (int i = tid; i < 256; i += nthreads) s_qmap8[i] = d_qmap_8[i];
     if (tid < 16) s_qmap4[tid] = d_qmap_4[tid];
@@ -472,7 +587,7 @@ void fused_m_quantize_lerp_cuda(torch::Tensor q, torch::Tensor scale, torch::Ten
 // ==========================================
 // 4. Fused 1D Update (V-EMA fused, exact v for update)
 // ==========================================
-template <typename T, int MODE, int V_BITS>
+template <typename T, int MODE, int V_BITS, bool STOCHASTIC = false>
 __global__ void fused_update_1d_kernel(
     T* __restrict__ param, const T* __restrict__ grad,
     void* __restrict__ m_q, float* __restrict__ m_scale,
@@ -482,7 +597,8 @@ __global__ void fused_update_1d_kernel(
     float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
     float log_eps_sq, float eps_for_grad_sq,
     int numel, float sqrt_numel, int block_size, int m_block_size, int m_bits, int m_mode,
-    const float* __restrict__ prev_norm_ptr, float d, bool momentum_only) {
+    const float* __restrict__ prev_norm_ptr, float d, bool momentum_only,
+    const float* __restrict__ decay_ptr, uint64_t sr_seed, uint64_t sr_step) {
     int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
     int start=block_id*block_size;
     extern __shared__ float shared_mem[];
@@ -583,7 +699,7 @@ __global__ void fused_update_1d_kernel(
             }
 
             if constexpr (MODE==MODE_NORM) { local_sq+=momentum_only?(g0*inv_std0)*(g0*inv_std0):u0*u0; }
-            else { float p=static_cast<float>(param[idx0]); param[idx0]=static_cast<T>(p-step_scale*u0); }
+            else { write_param_update<T, STOCHASTIC>(param, idx0, step_scale, u0, decay_ptr, sr_seed, sr_step); }
             if constexpr (MODE==MODE_LAG) { local_sq+=momentum_only?(g0*inv_std0)*(g0*inv_std0):u0*u0; }
             thread_max_m=fmaxf(thread_max_m,fabsf(m_new_0));
             thread_max_vlog=fmaxf(thread_max_vlog,vlog_0);
@@ -627,7 +743,7 @@ __global__ void fused_update_1d_kernel(
             }
 
             if constexpr (MODE==MODE_NORM) { local_sq+=momentum_only?(g1*inv_std1)*(g1*inv_std1):u1*u1; }
-            else { float p=static_cast<float>(param[idx0+1]); param[idx0+1]=static_cast<T>(p-step_scale*u1); }
+            else { write_param_update<T, STOCHASTIC>(param, idx0+1, step_scale, u1, decay_ptr, sr_seed, sr_step); }
             if constexpr (MODE==MODE_LAG) { local_sq+=momentum_only?(g1*inv_std1)*(g1*inv_std1):u1*u1; }
             thread_max_m=fmaxf(thread_max_m,fabsf(m_new_1));
             thread_max_vlog=fmaxf(thread_max_vlog,vlog_1);
@@ -719,8 +835,8 @@ void fused_update_1d_noclip_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_noclip",([&]{
-        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_NOCLIP,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only);
-        else LAUNCH_1D(scalar_t,MODE_NOCLIP,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only);
+        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_NOCLIP,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,nullptr,0,0);
+        else LAUNCH_1D(scalar_t,MODE_NOCLIP,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,nullptr,0,0);
     }));
 }
 
@@ -740,8 +856,8 @@ void fused_update_1d_norm_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, grad.scalar_type(),"fused_update_1d_norm",([&]{
-        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_NORM,8)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only);
-        else LAUNCH_1D(scalar_t,MODE_NORM,16)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only);
+        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_NORM,8)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,nullptr,0,0);
+        else LAUNCH_1D(scalar_t,MODE_NORM,16)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,nullptr,0,0);
     }));
 }
 
@@ -761,8 +877,8 @@ void fused_update_1d_apply_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_apply",([&]{
-        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_APPLY,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only);
-        else LAUNCH_1D(scalar_t,MODE_APPLY,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only);
+        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_APPLY,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only,nullptr,0,0);
+        else LAUNCH_1D(scalar_t,MODE_APPLY,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only,nullptr,0,0);
     }));
 }
 
@@ -782,16 +898,100 @@ void fused_update_1d_lag_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_lag",([&]{
-        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_LAG,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only);
-        else LAUNCH_1D(scalar_t,MODE_LAG,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only);
+        if (v_bits == 8) LAUNCH_1D(scalar_t,MODE_LAG,8)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only,nullptr,0,0);
+        else LAUNCH_1D(scalar_t,MODE_LAG,16)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only,nullptr,0,0);
     }));
 }
+
+void fused_update_1d_noclip_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode, int v_bits, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    if (v_bits == 8) {
+        TORCH_CHECK(v_q.scalar_type() == at::kByte, "v_bits=8 requires torch.uint8 V");
+    } else {
+        TORCH_CHECK(v_q.scalar_type() == at::kShort, "v_bits=16 requires torch.int16 V");
+    }
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    size_t smem=(2*block_size+2*num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_noclip_sr",([&]{
+        if (v_bits == 8) fused_update_1d_kernel<scalar_t,MODE_NOCLIP,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_kernel<scalar_t,MODE_NOCLIP,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,0.0f,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_apply_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor v_buf, torch::Tensor norm_buf, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode, float d, int v_bits, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    if (v_bits == 8) {
+        TORCH_CHECK(v_q.scalar_type() == at::kByte, "v_bits=8 requires torch.uint8 V");
+    } else {
+        TORCH_CHECK(v_q.scalar_type() == at::kShort, "v_bits=16 requires torch.int16 V");
+    }
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    size_t smem=(block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_apply_sr",([&]{
+        if (v_bits == 8) fused_update_1d_kernel<scalar_t,MODE_APPLY,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_kernel<scalar_t,MODE_APPLY,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,nullptr,d,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_lag_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int m_block_size, int m_bits, int m_mode, float d, int v_bits, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    if (v_bits == 8) {
+        TORCH_CHECK(v_q.scalar_type() == at::kByte, "v_bits=8 requires torch.uint8 V");
+    } else {
+        TORCH_CHECK(v_q.scalar_type() == at::kShort, "v_bits=16 requires torch.int16 V");
+    }
+    int threads=calc_threads(block_size,m_bits), num_warps=threads/32;
+    size_t smem=(2*block_size+2*num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_lag_sr",([&]{
+        if (v_bits == 8) fused_update_1d_kernel<scalar_t,MODE_LAG,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_kernel<scalar_t,MODE_LAG,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,momentum_only,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
 #undef LAUNCH_1D
 
 // ==========================================
 // 5. Fused 1D V-only Update (beta1=None, V-EMA fused)
 // ==========================================
-template <typename T, int MODE, int V_BITS>
+template <typename T, int MODE, int V_BITS, bool STOCHASTIC = false>
 __global__ void fused_update_1d_vonly_kernel(
     T* __restrict__ param, const T* __restrict__ grad,
     void* __restrict__ v_q_void, float* __restrict__ v_scale, float* __restrict__ v_min_log,
@@ -800,7 +1000,8 @@ __global__ void fused_update_1d_vonly_kernel(
     float beta_val, float eps_for_denom, bool use_adam_denom,
     float log_eps_sq, float eps_for_grad_sq,
     int numel, float sqrt_numel, int block_size,
-    const float* __restrict__ prev_norm_ptr, float d) {
+    const float* __restrict__ prev_norm_ptr, float d,
+    const float* __restrict__ decay_ptr, uint64_t sr_seed, uint64_t sr_step) {
     int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
     int start=block_id*block_size;
     extern __shared__ float shared_mem[];
@@ -858,7 +1059,7 @@ __global__ void fused_update_1d_vonly_kernel(
         }
         float u=g*inv_std;
         if constexpr (MODE==MODE_NORM) { local_sq+=u*u; }
-        else { float p=static_cast<float>(param[gi]); param[gi]=static_cast<T>(p-step_scale*u); }
+        else { write_param_update<T, STOCHASTIC>(param, gi, step_scale, u, decay_ptr, sr_seed, sr_step); }
         if constexpr (MODE==MODE_LAG) { local_sq+=u*u; }
     }
 
@@ -909,8 +1110,8 @@ void fused_update_1d_vonly_noclip_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_vonly_noclip",([&]{
-        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f);
-        else fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f);
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,nullptr,0,0);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -930,8 +1131,8 @@ void fused_update_1d_vonly_norm_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, grad.scalar_type(),"fused_update_1d_vonly_norm",([&]{
-        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_NORM,8><<<blocks,threads,smem>>>(nullptr,grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f);
-        else fused_update_1d_vonly_kernel<scalar_t,MODE_NORM,16><<<blocks,threads,smem>>>(nullptr,grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f);
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_NORM,8><<<blocks,threads,smem>>>(nullptr,grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,nullptr,0,0);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_NORM,16><<<blocks,threads,smem>>>(nullptr,grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -951,8 +1152,8 @@ void fused_update_1d_vonly_apply_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_vonly_apply",([&]{
-        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d);
-        else fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d);
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d,nullptr,0,0);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d,nullptr,0,0);
     }));
 }
 
@@ -973,22 +1174,95 @@ void fused_update_1d_vonly_lag_cuda(
     int blocks=(numel+block_size-1)/block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_1d_vonly_lag",([&]{
-        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d);
-        else fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d);
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,8><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d,nullptr,0,0);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,16><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d,nullptr,0,0);
+    }));
+}
+
+
+void fused_update_1d_vonly_noclip_sr_cuda(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, int v_bits) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_noclip_sr",([&]{
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_NOCLIP,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,nullptr,alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,0.0f,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_vonly_apply_sr_cuda(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor v_buf, torch::Tensor norm_buf, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, float d, int v_bits) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    size_t smem=num_warps*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_apply_sr",([&]{
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_APPLY,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),v_buf.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,nullptr,d,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_vonly_lag_sr_cuda(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor v_q, torch::Tensor v_scale, torch::Tensor v_min_log,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta_val, float eps_for_denom, bool use_adam_denom,
+    float log_eps_sq, float eps_for_grad_sq, int numel, int block_size, float d, int v_bits) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=min(256,max(32,block_size/4)); threads=(threads/32)*32;
+    int num_warps=threads/32;
+    size_t smem=(block_size+2*num_warps)*sizeof(float);
+    int blocks=(numel+block_size-1)/block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_vonly_lag_sr",([&]{
+        if (v_bits == 8) fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,8,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
+        else fused_update_1d_vonly_kernel<scalar_t,MODE_LAG,16,true><<<blocks,threads,smem>>>(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),v_q.data_ptr(),v_scale.data_ptr<float>(),v_min_log.data_ptr<float>(),nullptr,norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta_val,eps_for_denom,use_adam_denom,log_eps_sq,eps_for_grad_sq,numel,sqrt_numel,block_size,prev_norm.data_ptr<float>(),d,decay_ptr,(uint64_t)sr_seed,(uint64_t)sr_step);
     }));
 }
 
 // ==========================================
 // 6. Fused 1D Full Precision Update (fp32 V, optional fp32 M)
 // ==========================================
-template <typename T, int MODE, bool HAS_M>
+template <typename T, int MODE, bool HAS_M, bool STOCHASTIC = false>
 __global__ void fused_update_1d_full_kernel(
     T* __restrict__ param, const T* __restrict__ grad,
     float* __restrict__ variance, float* __restrict__ m,
     float* __restrict__ norm_buf, const float* __restrict__ alpha,
     float beta1, float beta_val, float eps_sq, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq,
     int numel, float sqrt_numel,
-    const float* __restrict__ prev_norm_ptr, float d, bool momentum_only) {
+    const float* __restrict__ prev_norm_ptr, float d, bool momentum_only,
+    const float* __restrict__ decay_ptr, uint64_t sr_seed, uint64_t sr_step) {
 
     extern __shared__ float shared_mem[];
     int tid = threadIdx.x;
@@ -1084,8 +1358,7 @@ __global__ void fused_update_1d_full_kernel(
         }
 
         if constexpr (MODE != MODE_NORM) {
-            float p = static_cast<float>(param[idx]);
-            param[idx] = static_cast<T>(p - step_scale * u);
+            write_param_update<T, STOCHASTIC>(param, idx, step_scale, u, decay_ptr, sr_seed, sr_step);
         }
     }
 
@@ -1105,11 +1378,11 @@ void fused_update_1d_full_noclip_cuda(
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     if (m_ptr) {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_noclip_m", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, true><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, true><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only,nullptr,0,0);
         }));
     } else {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_noclip", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, false><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, false><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only,nullptr,0,0);
         }));
     }
 }
@@ -1125,11 +1398,11 @@ void fused_update_1d_full_norm_cuda(
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     if (m_ptr) {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad.scalar_type(), "fused_update_1d_full_norm_m", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_NORM, true><<<blocks, threads, smem>>>(nullptr, grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), nullptr, beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_NORM, true><<<blocks, threads, smem>>>(nullptr, grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), nullptr, beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only,nullptr,0,0);
         }));
     } else {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad.scalar_type(), "fused_update_1d_full_norm", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_NORM, false><<<blocks, threads, smem>>>(nullptr, grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), nullptr, beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_NORM, false><<<blocks, threads, smem>>>(nullptr, grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), nullptr, beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only,nullptr,0,0);
         }));
     }
 }
@@ -1145,11 +1418,11 @@ void fused_update_1d_full_apply_cuda(
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     if (m_ptr) {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_apply_m", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_APPLY, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_APPLY, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only,nullptr,0,0);
         }));
     } else {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_apply", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_APPLY, false><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_APPLY, false><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only,nullptr,0,0);
         }));
     }
 }
@@ -1165,13 +1438,77 @@ void fused_update_1d_full_lag_cuda(
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     if (m_ptr) {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_lag_m", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_LAG, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_LAG, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only,nullptr,0,0);
         }));
     } else {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, param.scalar_type(), "fused_update_1d_full_lag", ([&] {
-            fused_update_1d_full_kernel<scalar_t, MODE_LAG, false><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only);
+            fused_update_1d_full_kernel<scalar_t, MODE_LAG, false><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only,nullptr,0,0);
         }));
     }
+}
+
+
+void fused_update_1d_full_noclip_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor variance, c10::optional<torch::Tensor> m,
+    torch::Tensor alpha, torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_sq, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq,
+    int numel, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads = 256, blocks = (numel + threads - 1) / threads;
+    float sqrt_numel = sqrtf((float)numel);
+    float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_full_noclip_sr",([&]{
+        if (m_ptr) fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, true, true><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+        else fused_update_1d_full_kernel<scalar_t, MODE_NOCLIP, false, true><<<blocks, threads>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, nullptr, alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, 0.0f, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_full_apply_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor variance, c10::optional<torch::Tensor> m,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_sq, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq,
+    int numel, float d, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads = 256, num_warps = threads / 32, blocks = (numel + threads - 1) / threads;
+    size_t smem = num_warps * sizeof(float);
+    float sqrt_numel = sqrtf((float)numel);
+    float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_full_apply_sr",([&]{
+        if (m_ptr) fused_update_1d_full_kernel<scalar_t, MODE_APPLY, true, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+        else fused_update_1d_full_kernel<scalar_t, MODE_APPLY, false, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, nullptr, d, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+    }));
+}
+
+void fused_update_1d_full_lag_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor variance, c10::optional<torch::Tensor> m,
+    torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, float beta_val, float eps_sq, float eps_for_denom, bool use_adam_denom, float eps_for_grad_sq,
+    int numel, float d, bool momentum_only) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads = 256, num_warps = threads / 32, blocks = (numel + threads - 1) / threads;
+    size_t smem = num_warps * sizeof(float);
+    float sqrt_numel = sqrtf((float)numel);
+    float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_1d_full_lag_sr",([&]{
+        if (m_ptr) fused_update_1d_full_kernel<scalar_t, MODE_LAG, true, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), m_ptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+        else fused_update_1d_full_kernel<scalar_t, MODE_LAG, false, true><<<blocks, threads, smem>>>(param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), variance.data_ptr<float>(), nullptr, norm_buf.data_ptr<float>(), alpha.data_ptr<float>(), beta1, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, numel, sqrt_numel, prev_norm.data_ptr<float>(), d, momentum_only, decay_ptr, (uint64_t)sr_seed, (uint64_t)sr_step);
+    }));
 }
 
 // ==========================================
@@ -1179,7 +1516,7 @@ void fused_update_1d_full_lag_cuda(
 //    QUANTIZED_M=true: uses shared memory, codebook, sub-block reduce.
 //    QUANTIZED_M=false: uses global memory for M, zero shared memory overhead.
 // ==========================================
-template <typename T, int MODE, bool QUANTIZED_M>
+template <typename T, int MODE, bool QUANTIZED_M, bool STOCHASTIC=false>
 __global__ void fused_update_2d_kernel(
     T* __restrict__ param, const T* __restrict__ grad,
     void* __restrict__ m_ptr, float* __restrict__ m_scale,
@@ -1188,7 +1525,9 @@ __global__ void fused_update_2d_kernel(
     float* __restrict__ norm_buf, const float* __restrict__ alpha,
     float beta1, int R, int C, int numel, float sqrt_numel,
     int m_block_size, int m_bits, int m_mode,
-    const float* __restrict__ prev_norm_ptr, float d) {
+    const float* __restrict__ prev_norm_ptr, float d,
+    const float* __restrict__ decay_ptr,
+    uint64_t sr_seed, uint64_t sr_step) {
     
     int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
     int start=block_id*m_block_size;
@@ -1249,8 +1588,8 @@ __global__ void fused_update_2d_kernel(
             
             if constexpr (MODE==MODE_NORM) { local_sq+=u0*u0; }
             else { 
-                float p=static_cast<float>(param[idx0]); 
-                param[idx0]=static_cast<T>(p-step_scale*u0); 
+                write_param_update<T, STOCHASTIC>(
+                    param, idx0, step_scale, u0, decay_ptr, sr_seed, sr_step); 
                 if constexpr (!QUANTIZED_M) {
                     if (m_ptr != nullptr) ((float*)m_ptr)[idx0] = m_new_0;
                 }
@@ -1272,7 +1611,10 @@ __global__ void fused_update_2d_kernel(
                 float inv_std1=sqrtf(fmaxf(row_mean_val_ptr[b1],MIN_VAL))*rsqrtf(fmaxf(row_fp32[r_idx1],MIN_VAL))*rsqrtf(fmaxf(col_fp32[c_idx1],MIN_VAL));
                 float u1=m_new_1*inv_std1;
                 if constexpr (MODE==MODE_NORM) { local_sq+=u1*u1; }
-                else { float p=static_cast<float>(param[idx1]); param[idx1]=static_cast<T>(p-step_scale*u1); }
+                else {
+                    write_param_update<T, STOCHASTIC>(
+                        param, idx1, step_scale, u1, decay_ptr, sr_seed, sr_step);
+                }
                 if constexpr (MODE==MODE_LAG) { local_sq+=u1*u1; }
                 thread_max=fmaxf(thread_max,fabsf(m_new_1));
             }
@@ -1301,7 +1643,7 @@ __global__ void fused_update_2d_kernel(
     }
 }
 
-#define LAUNCH_2D(T,M,Q) fused_update_2d_kernel<T,M,Q><<<blocks,threads,smem>>>
+#define LAUNCH_2D(T,M,Q,S) fused_update_2d_kernel<T,M,Q,S><<<blocks,threads,smem>>>
 
 void fused_update_2d_noclip_cuda(
     torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
@@ -1313,7 +1655,7 @@ void fused_update_2d_noclip_cuda(
     int blocks=(numel+m_block_size-1)/m_block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_noclip",([&]{
-        LAUNCH_2D(scalar_t,MODE_NOCLIP,true)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        LAUNCH_2D(scalar_t,MODE_NOCLIP,true,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -1327,7 +1669,7 @@ void fused_update_2d_norm_cuda(
     int blocks=(numel+m_block_size-1)/m_block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, grad.scalar_type(),"fused_update_2d_norm",([&]{
-        LAUNCH_2D(scalar_t,MODE_NORM,true)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f);
+        LAUNCH_2D(scalar_t,MODE_NORM,true,false)(nullptr,grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -1341,7 +1683,7 @@ void fused_update_2d_apply_cuda(
     int blocks=(numel+m_block_size-1)/m_block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_apply",([&]{
-        LAUNCH_2D(scalar_t,MODE_APPLY,true)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,d);
+        LAUNCH_2D(scalar_t,MODE_APPLY,true,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,d,nullptr,0,0);
     }));
 }
 
@@ -1355,7 +1697,86 @@ void fused_update_2d_lag_cuda(
     int blocks=(numel+m_block_size-1)/m_block_size;
     float sqrt_numel=sqrtf((float)numel);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_lag",([&]{
-        LAUNCH_2D(scalar_t,MODE_LAG,true)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d);
+        LAUNCH_2D(scalar_t,MODE_LAG,true,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_q.data_ptr(),m_scale.data_ptr<float>(),row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,nullptr,0,0);
+    }));
+}
+
+
+void fused_update_2d_noclip_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_noclip_sr",([&]{
+        LAUNCH_2D(scalar_t,MODE_NOCLIP,true,true)(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+            m_q.data_ptr(),m_scale.data_ptr<float>(),
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+            row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),
+            beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,0.0f,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_2d_apply_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode, float d) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_apply_sr",([&]{
+        LAUNCH_2D(scalar_t,MODE_APPLY,true,true)(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+            m_q.data_ptr(),m_scale.data_ptr<float>(),
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+            row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+            beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,nullptr,d,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_2d_lag_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode, float d) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_lag_sr",([&]{
+        LAUNCH_2D(scalar_t,MODE_LAG,true,true)(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+            m_q.data_ptr(),m_scale.data_ptr<float>(),
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+            row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),
+            beta1,R,C,numel,sqrt_numel,m_block_size,m_bits,m_mode,prev_norm.data_ptr<float>(),d,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
     }));
 }
 
@@ -1370,7 +1791,7 @@ void fused_update_2d_full_noclip_cuda(
     float sqrt_numel=sqrtf((float)numel);
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_full_noclip",([&]{
-        LAUNCH_2D(scalar_t,MODE_NOCLIP,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,0.0f);
+        LAUNCH_2D(scalar_t,MODE_NOCLIP,false,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),nullptr,alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -1385,7 +1806,7 @@ void fused_update_2d_full_norm_cuda(
     float sqrt_numel=sqrtf((float)numel);
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, grad.scalar_type(),"fused_update_2d_full_norm",([&]{
-        LAUNCH_2D(scalar_t,MODE_NORM,false)(nullptr,grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,0.0f);
+        LAUNCH_2D(scalar_t,MODE_NORM,false,false)(nullptr,grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),nullptr,beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,0.0f,nullptr,0,0);
     }));
 }
 
@@ -1400,7 +1821,7 @@ void fused_update_2d_full_apply_cuda(
     float sqrt_numel=sqrtf((float)numel);
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_full_apply",([&]{
-        LAUNCH_2D(scalar_t,MODE_APPLY,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,d);
+        LAUNCH_2D(scalar_t,MODE_APPLY,false,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,d,nullptr,0,0);
     }));
 }
 
@@ -1415,9 +1836,83 @@ void fused_update_2d_full_lag_cuda(
     float sqrt_numel=sqrtf((float)numel);
     float* m_ptr = m.has_value() ? m.value().data_ptr<float>() : nullptr;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16, param.scalar_type(),"fused_update_2d_full_lag",([&]{
-        LAUNCH_2D(scalar_t,MODE_LAG,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,prev_norm.data_ptr<float>(),d);
+        LAUNCH_2D(scalar_t,MODE_LAG,false,false)(param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,prev_norm.data_ptr<float>(),d,nullptr,0,0);
     }));
 }
+
+void fused_update_2d_full_noclip_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, c10::optional<torch::Tensor> m,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=256, blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    float* m_ptr=m.has_value()?m.value().data_ptr<float>():nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_full_noclip_sr",([&]{
+        fused_update_2d_kernel<scalar_t,MODE_NOCLIP,false,true><<<blocks,threads>>>(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),
+            nullptr,alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,0.0f,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_2d_full_apply_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, c10::optional<torch::Tensor> m,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, float d) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=256,num_warps=threads/32;
+    size_t smem=num_warps*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    float* m_ptr=m.has_value()?m.value().data_ptr<float>():nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_full_apply_sr",([&]{
+        fused_update_2d_kernel<scalar_t,MODE_APPLY,false,true><<<blocks,threads,smem>>>(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),
+            norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,nullptr,d,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
+void fused_update_2d_full_lag_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, c10::optional<torch::Tensor> m,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val, torch::Tensor norm_buf, torch::Tensor alpha, torch::Tensor prev_norm,
+    torch::Tensor decay, int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, float d) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "SR writeback requires matching FP16/BF16 param and grad");
+    int threads=256,num_warps=threads/32;
+    size_t smem=num_warps*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    float sqrt_numel=sqrtf((float)numel);
+    float* m_ptr=m.has_value()?m.value().data_ptr<float>():nullptr;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_update_2d_full_lag_sr",([&]{
+        fused_update_2d_kernel<scalar_t,MODE_LAG,false,true><<<blocks,threads,smem>>>(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),m_ptr,nullptr,
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),row_mean_val.data_ptr<float>(),
+            norm_buf.data_ptr<float>(),alpha.data_ptr<float>(),beta1,R,C,numel,sqrt_numel,m_block_size,0,0,
+            prev_norm.data_ptr<float>(),d,decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
 #undef LAUNCH_2D
 
 // ==========================================
@@ -1595,7 +2090,7 @@ __global__ void fused_came_pass1_kernel(
     }
 }
 
-template <typename T, int MODE, bool QUANTIZED_M>
+template <typename T, int MODE, bool QUANTIZED_M, bool STOCHASTIC=false>
 __global__ void fused_came_pass2_kernel(
     T* __restrict__ param, const T* __restrict__ grad,
     void* __restrict__ m_ptr, float* __restrict__ m_scale,
@@ -1606,7 +2101,9 @@ __global__ void fused_came_pass2_kernel(
     const float* __restrict__ clip_factor_ptr,
     const float* __restrict__ alpha, float* __restrict__ norm_buf,
     float beta1,
-    int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    int R, int C, int numel, int m_block_size, int m_bits, int m_mode,
+    const float* __restrict__ decay_ptr=nullptr,
+    uint64_t sr_seed=0, uint64_t sr_step=0) {
     
     int block_id=blockIdx.x, tid=threadIdx.x, num_warps=blockDim.x/32;
     int start=block_id*m_block_size;
@@ -1664,7 +2161,10 @@ __global__ void fused_came_pass2_kernel(
             
             float u_final=m_val_0*inv_row*inv_col_c;
             if constexpr (MODE==MODE_NORM) { local_sq+=u_final*u_final; }
-            else { float p=static_cast<float>(param[idx0]); param[idx0]=static_cast<T>(p-alpha_val*u_final); }
+            else {
+                write_param_update<T, STOCHASTIC>(
+                    param, idx0, alpha_val, u_final, decay_ptr, sr_seed, sr_step);
+            }
             
             if constexpr (QUANTIZED_M) {
                 thread_max=fmaxf(thread_max,fabsf(m_val_0));
@@ -1687,7 +2187,10 @@ __global__ void fused_came_pass2_kernel(
                 float inv_col_c=rsqrtf(fmaxf(conf_col_fp32[c_idx],MIN_VAL));
                 float u_final=m_val_1*inv_row*inv_col_c;
                 if constexpr (MODE==MODE_NORM) { local_sq+=u_final*u_final; }
-                else { float p=static_cast<float>(param[idx1]); param[idx1]=static_cast<T>(p-alpha_val*u_final); }
+                else {
+                    write_param_update<T, STOCHASTIC>(
+                        param, idx1, alpha_val, u_final, decay_ptr, sr_seed, sr_step);
+                }
                 thread_max=fmaxf(thread_max,fabsf(m_val_1));
             }
             if constexpr (MODE==MODE_APPLY) {
@@ -1783,6 +2286,38 @@ void fused_came_pass2_cuda(
     }));
 }
 
+
+void fused_came_pass2_sr_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor m_q, torch::Tensor m_scale,
+    torch::Tensor row_fp32, torch::Tensor col_fp32,
+    torch::Tensor row_mean_val,
+    torch::Tensor conf_row_fp32, torch::Tensor conf_col_fp32,
+    torch::Tensor conf_row_mean,
+    torch::Tensor clip_factor, torch::Tensor alpha, torch::Tensor decay,
+    int64_t sr_seed, int64_t sr_step,
+    float beta1, int R, int C, int numel, int m_block_size, int m_bits, int m_mode) {
+    TORCH_CHECK(
+        (param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16)
+        && grad.scalar_type() == param.scalar_type(),
+        "CAME SR writeback requires matching FP16/BF16 param and grad");
+    int threads=calc_threads(m_block_size,m_bits), num_warps=threads/32;
+    size_t smem=(m_block_size+num_warps+SMEM_QMAP)*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_came_pass2_sr",([&]{
+        fused_came_pass2_kernel<scalar_t,MODE_APPLY,true,true><<<blocks,threads,smem>>>(
+            param.data_ptr<scalar_t>(),grad.data_ptr<scalar_t>(),
+            m_q.data_ptr(),m_scale.data_ptr<float>(),
+            row_fp32.data_ptr<float>(),col_fp32.data_ptr<float>(),
+            row_mean_val.data_ptr<float>(),
+            conf_row_fp32.data_ptr<float>(),conf_col_fp32.data_ptr<float>(),
+            conf_row_mean.data_ptr<float>(),
+            clip_factor.data_ptr<float>(),alpha.data_ptr<float>(),nullptr,
+            beta1,R,C,numel,m_block_size,m_bits,m_mode,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
+}
+
 void fused_came_full_pass1_cuda(
     torch::Tensor grad, torch::Tensor m,
     torch::Tensor row_fp32, torch::Tensor col_fp32,
@@ -1838,6 +2373,32 @@ void fused_came_full_pass2_cuda(
                 0.0f,R,C,numel,m_block_size,0,0);
         }));
     }
+}
+
+
+void fused_came_full_pass2_sr_cuda(
+    torch::Tensor param, torch::Tensor m,
+    torch::Tensor conf_row_fp32, torch::Tensor conf_col_fp32,
+    torch::Tensor conf_row_mean, torch::Tensor alpha, torch::Tensor decay,
+    int64_t sr_seed, int64_t sr_step,
+    int R, int C, int numel, int m_block_size) {
+    TORCH_CHECK(param.scalar_type() == at::kHalf || param.scalar_type() == at::kBFloat16,
+                "CAME SR writeback requires an FP16/BF16 parameter");
+    int threads=256, num_warps=threads/32;
+    size_t smem=num_warps*sizeof(float);
+    int blocks=(numel+m_block_size-1)/m_block_size;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,
+        param.scalar_type(),"fused_came_full_pass2_sr",([&]{
+        fused_came_pass2_kernel<scalar_t,MODE_NOCLIP,false,true><<<blocks,threads,smem>>>(
+            param.data_ptr<scalar_t>(),nullptr,
+            m.data_ptr<float>(),nullptr,
+            nullptr,nullptr,nullptr,
+            conf_row_fp32.data_ptr<float>(),conf_col_fp32.data_ptr<float>(),
+            conf_row_mean.data_ptr<float>(),
+            nullptr,alpha.data_ptr<float>(),nullptr,
+            0.0f,R,C,numel,m_block_size,0,0,
+            decay.data_ptr<float>(),(uint64_t)sr_seed,(uint64_t)sr_step);
+    }));
 }
 
 // ==========================================
@@ -2068,7 +2629,375 @@ void dequantize_log_nonneg_cuda(torch::Tensor output, torch::Tensor q,
 }
 
 // ==========================================
-// PYBIND11
+// 12. APOLLO Parameter Writeback
+// ==========================================
+
+__device__ __forceinline__ float apollo_write_scale(
+    const float* final_scale, int row, int col, int side_right, int is_channel) {
+    if (!is_channel) return final_scale[0];
+    return side_right ? final_scale[row] : final_scale[col];
+}
+
+template <typename T>
+__device__ __forceinline__ float apollo_lowp_to_float(T x);
+
+template <>
+__device__ __forceinline__ float apollo_lowp_to_float<__nv_bfloat16>(__nv_bfloat16 x) {
+    return __bfloat162float(x);
+}
+
+template <>
+__device__ __forceinline__ float apollo_lowp_to_float<__half>(__half x) {
+    return __half2float(x);
+}
+
+template <typename T>
+__device__ __forceinline__ T apollo_float_to_lowp_rn(float x);
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 apollo_float_to_lowp_rn<__nv_bfloat16>(float x) {
+    return __float2bfloat16_rn(x);
+}
+
+template <>
+__device__ __forceinline__ __half apollo_float_to_lowp_rn<__half>(float x) {
+    return __float2half_rn(x);
+}
+
+template <typename T>
+__device__ __forceinline__ float apollo_load_native_grad(
+    const T* grad, int idx, int maximize) {
+    float g = apollo_lowp_to_float<T>(grad[idx]);
+    if (!isfinite(g)) g = 0.0f;
+    return maximize ? -g : g;
+}
+
+template <typename T>
+__global__ void apollo_apply_lowp_det_native_kernel(
+    T* __restrict__ param,
+    const T* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel, int maximize,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float update_scale = update_scale_ptr[0];
+    float g = apollo_load_native_grad<T>(grad, idx, maximize);
+
+    float old_w = apollo_lowp_to_float<T>(param[idx]);
+    T decayed_lowp = apollo_float_to_lowp_rn<T>(old_w * decay);
+    float decayed = apollo_lowp_to_float<T>(decayed_lowp);
+    param[idx] = apollo_float_to_lowp_rn<T>(
+        decayed + update_scale * g * scale);
+}
+
+// Decay and update use separate BF16 rounding boundaries.
+__global__ void apollo_apply_bf16_det_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const float* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float update_scale = update_scale_ptr[0];
+
+    float old_w = __bfloat162float(param[idx]);
+    __nv_bfloat16 decayed_bf16 = __float2bfloat16_rn(old_w * decay);
+    float decayed = __bfloat162float(decayed_bf16);
+    float update = update_scale * grad[idx];
+    update *= scale;
+    param[idx] = __float2bfloat16_rn(decayed + update);
+}
+
+__global__ void apollo_apply_bf16_sr_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const float* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel,
+    uint64_t sr_seed, uint64_t sr_step,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float update_scale = update_scale_ptr[0];
+
+    float new_w = __bfloat162float(param[idx]) * decay
+                + grad[idx] * scale * update_scale;
+
+    uint32_t bits = __float_as_uint(new_w);
+    float u = uint32_to_uniform(sr_rng(sr_seed, sr_step, (uint64_t)idx));
+    uint32_t bf16_bits = sr_fp32_to_bf16_bits(bits, u);
+    param[idx] = __ushort_as_bfloat16((unsigned short)(bf16_bits >> 16));
+}
+
+__global__ void apollo_apply_fp16_sr_kernel(
+    __half* __restrict__ param,
+    const float* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel,
+    uint64_t sr_seed, uint64_t sr_step,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float update_scale = update_scale_ptr[0];
+
+    float new_w = __half2float(param[idx]) * decay
+                + grad[idx] * scale * update_scale;
+
+    float u = uint32_to_uniform(sr_rng(sr_seed, sr_step, (uint64_t)idx));
+    param[idx] = __ushort_as_half(sr_fp32_to_fp16_bits(new_w, u));
+}
+
+__global__ void apollo_apply_bf16_sr_native_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const __nv_bfloat16* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel, int maximize,
+    uint64_t sr_seed, uint64_t sr_step,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float g = apollo_load_native_grad<__nv_bfloat16>(grad, idx, maximize);
+    float new_w = __bfloat162float(param[idx]) * decay
+                + g * scale * update_scale_ptr[0];
+    float u = uint32_to_uniform(sr_rng(sr_seed, sr_step, (uint64_t)idx));
+    uint32_t bits = __float_as_uint(new_w);
+    uint32_t bf16_bits = sr_fp32_to_bf16_bits(bits, u);
+    param[idx] = __ushort_as_bfloat16((unsigned short)(bf16_bits >> 16));
+}
+
+__global__ void apollo_apply_fp16_sr_native_kernel(
+    __half* __restrict__ param,
+    const __half* __restrict__ grad,
+    const float* __restrict__ final_scale,
+    const float* __restrict__ decay_ptr,
+    const float* __restrict__ update_scale_ptr,
+    int side_right, int is_channel, int maximize,
+    uint64_t sr_seed, uint64_t sr_step,
+    int R, int C)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= R || col >= C) return;
+    int idx = row * C + col;
+    float scale = apollo_write_scale(final_scale, row, col, side_right, is_channel);
+    float decay = decay_ptr ? decay_ptr[0] : 1.0f;
+    float g = apollo_load_native_grad<__half>(grad, idx, maximize);
+    float new_w = __half2float(param[idx]) * decay
+                + g * scale * update_scale_ptr[0];
+    float u = uint32_to_uniform(sr_rng(sr_seed, sr_step, (uint64_t)idx));
+    param[idx] = __ushort_as_half(sr_fp32_to_fp16_bits(new_w, u));
+}
+
+void apollo_apply_bf16_det_cuda(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor final_scale,
+    torch::Tensor decay,
+    torch::Tensor update_scale,
+    int side_right, int is_channel)
+{
+    TORCH_CHECK(param.scalar_type() == at::kBFloat16, "param must be bfloat16");
+    TORCH_CHECK(grad.scalar_type() == at::kFloat, "grad must be float32");
+    TORCH_CHECK(final_scale.scalar_type() == at::kFloat, "final_scale must be float32");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2, "param must be 2D");
+
+    int R = param.size(0);
+    int C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+
+    apollo_apply_bf16_det_kernel<<<grid, block>>>(
+        reinterpret_cast<__nv_bfloat16*>(param.data_ptr()),
+        grad.data_ptr<float>(), final_scale.data_ptr<float>(), decay_ptr,
+        update_scale.data_ptr<float>(), side_right, is_channel, R, C);
+}
+
+void apollo_apply_bf16_sr_cuda(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor final_scale,
+    torch::Tensor decay,
+    torch::Tensor update_scale,
+    int side_right, int is_channel,
+    int64_t sr_seed, int64_t sr_step)
+{
+    TORCH_CHECK(param.scalar_type() == at::kBFloat16, "param must be bfloat16 for SR writeback");
+    TORCH_CHECK(grad.scalar_type() == at::kFloat, "grad must be float32");
+    TORCH_CHECK(final_scale.scalar_type() == at::kFloat, "final_scale must be float32");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2, "param must be 2D");
+
+    int R = param.size(0);
+    int C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+
+    apollo_apply_bf16_sr_kernel<<<grid, block>>>(
+        reinterpret_cast<__nv_bfloat16*>(param.data_ptr()),
+        grad.data_ptr<float>(), final_scale.data_ptr<float>(), decay_ptr,
+        update_scale.data_ptr<float>(), side_right, is_channel,
+        (uint64_t)sr_seed, (uint64_t)sr_step, R, C);
+}
+
+void apollo_apply_fp16_sr_cuda(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor final_scale,
+    torch::Tensor decay,
+    torch::Tensor update_scale,
+    int side_right, int is_channel,
+    int64_t sr_seed, int64_t sr_step)
+{
+    TORCH_CHECK(param.scalar_type() == at::kHalf, "param must be float16 for SR writeback");
+    TORCH_CHECK(grad.scalar_type() == at::kFloat, "grad must be float32");
+    TORCH_CHECK(final_scale.scalar_type() == at::kFloat, "final_scale must be float32");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2, "param must be 2D");
+
+    int R = param.size(0);
+    int C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+
+    apollo_apply_fp16_sr_kernel<<<grid, block>>>(
+        reinterpret_cast<__half*>(param.data_ptr()),
+        grad.data_ptr<float>(), final_scale.data_ptr<float>(), decay_ptr,
+        update_scale.data_ptr<float>(), side_right, is_channel,
+        (uint64_t)sr_seed, (uint64_t)sr_step, R, C);
+}
+
+template <typename T>
+void apollo_apply_lowp_det_native_cuda_impl(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor final_scale,
+    torch::Tensor decay, torch::Tensor update_scale,
+    int side_right, int is_channel, int maximize)
+{
+    TORCH_CHECK(final_scale.scalar_type() == at::kFloat, "final_scale must be float32");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2 && grad.dim() == 2, "param and grad must be 2D");
+    TORCH_CHECK(param.sizes() == grad.sizes(), "param and grad shape mismatch");
+    int R = param.size(0), C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+    apollo_apply_lowp_det_native_kernel<T><<<grid, block>>>(
+        reinterpret_cast<T*>(param.data_ptr()), reinterpret_cast<const T*>(grad.data_ptr()),
+        final_scale.data_ptr<float>(), decay_ptr, update_scale.data_ptr<float>(),
+        side_right, is_channel, maximize, R, C);
+}
+
+void apollo_apply_bf16_det_native_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor final_scale,
+    torch::Tensor decay, torch::Tensor update_scale,
+    int side_right, int is_channel, int maximize)
+{
+    TORCH_CHECK(param.scalar_type() == at::kBFloat16 && grad.scalar_type() == at::kBFloat16,
+                "BF16 native writeback requires BF16 param and grad");
+    apollo_apply_lowp_det_native_cuda_impl<__nv_bfloat16>(
+        param, grad, final_scale, decay, update_scale, side_right, is_channel, maximize);
+}
+
+void apollo_apply_fp16_det_native_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor final_scale,
+    torch::Tensor decay, torch::Tensor update_scale,
+    int side_right, int is_channel, int maximize)
+{
+    TORCH_CHECK(param.scalar_type() == at::kHalf && grad.scalar_type() == at::kHalf,
+                "FP16 native writeback requires FP16 param and grad");
+    apollo_apply_lowp_det_native_cuda_impl<__half>(
+        param, grad, final_scale, decay, update_scale, side_right, is_channel, maximize);
+}
+
+void apollo_apply_bf16_sr_native_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor final_scale,
+    torch::Tensor decay, torch::Tensor update_scale,
+    int side_right, int is_channel, int maximize,
+    int64_t sr_seed, int64_t sr_step)
+{
+    TORCH_CHECK(param.scalar_type() == at::kBFloat16 && grad.scalar_type() == at::kBFloat16,
+                "BF16 native SR writeback requires BF16 param and grad");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2 && grad.dim() == 2 && param.sizes() == grad.sizes(),
+                "param and grad must be matching 2D tensors");
+    int R = param.size(0), C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+    apollo_apply_bf16_sr_native_kernel<<<grid, block>>>(
+        reinterpret_cast<__nv_bfloat16*>(param.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr()),
+        final_scale.data_ptr<float>(), decay_ptr, update_scale.data_ptr<float>(),
+        side_right, is_channel, maximize, (uint64_t)sr_seed, (uint64_t)sr_step, R, C);
+}
+
+void apollo_apply_fp16_sr_native_cuda(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor final_scale,
+    torch::Tensor decay, torch::Tensor update_scale,
+    int side_right, int is_channel, int maximize,
+    int64_t sr_seed, int64_t sr_step)
+{
+    TORCH_CHECK(param.scalar_type() == at::kHalf && grad.scalar_type() == at::kHalf,
+                "FP16 native SR writeback requires FP16 param and grad");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "param and grad must be contiguous");
+    TORCH_CHECK(param.dim() == 2 && grad.dim() == 2 && param.sizes() == grad.sizes(),
+                "param and grad must be matching 2D tensors");
+    int R = param.size(0), C = param.size(1);
+    const float* decay_ptr = decay.numel() ? decay.data_ptr<float>() : nullptr;
+    dim3 block(32, 8);
+    dim3 grid((C + block.x - 1) / block.x, (R + block.y - 1) / block.y);
+    apollo_apply_fp16_sr_native_kernel<<<grid, block>>>(
+        reinterpret_cast<__half*>(param.data_ptr()),
+        reinterpret_cast<const __half*>(grad.data_ptr()),
+        final_scale.data_ptr<float>(), decay_ptr, update_scale.data_ptr<float>(),
+        side_right, is_channel, maximize, (uint64_t)sr_seed, (uint64_t)sr_step, R, C);
+}
+
+// ==========================================
+// 13. Python Bindings
 // ==========================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_qmap", &set_qmap_cuda);
@@ -2078,33 +3007,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_update_1d_norm", &fused_update_1d_norm_cuda);
     m.def("fused_update_1d_apply", &fused_update_1d_apply_cuda);
     m.def("fused_update_1d_lag", &fused_update_1d_lag_cuda);
+    m.def("fused_update_1d_noclip_sr", &fused_update_1d_noclip_sr_cuda);
+    m.def("fused_update_1d_apply_sr", &fused_update_1d_apply_sr_cuda);
+    m.def("fused_update_1d_lag_sr", &fused_update_1d_lag_sr_cuda);
     m.def("fused_update_1d_vonly_noclip", &fused_update_1d_vonly_noclip_cuda);
     m.def("fused_update_1d_vonly_norm", &fused_update_1d_vonly_norm_cuda);
     m.def("fused_update_1d_vonly_apply", &fused_update_1d_vonly_apply_cuda);
     m.def("fused_update_1d_vonly_lag", &fused_update_1d_vonly_lag_cuda);
+    m.def("fused_update_1d_vonly_noclip_sr", &fused_update_1d_vonly_noclip_sr_cuda);
+    m.def("fused_update_1d_vonly_apply_sr", &fused_update_1d_vonly_apply_sr_cuda);
+    m.def("fused_update_1d_vonly_lag_sr", &fused_update_1d_vonly_lag_sr_cuda);
     m.def("fused_update_1d_full_noclip", &fused_update_1d_full_noclip_cuda);
     m.def("fused_update_1d_full_norm", &fused_update_1d_full_norm_cuda);
     m.def("fused_update_1d_full_apply", &fused_update_1d_full_apply_cuda);
     m.def("fused_update_1d_full_lag", &fused_update_1d_full_lag_cuda);
+    m.def("fused_update_1d_full_noclip_sr", &fused_update_1d_full_noclip_sr_cuda);
+    m.def("fused_update_1d_full_apply_sr", &fused_update_1d_full_apply_sr_cuda);
+    m.def("fused_update_1d_full_lag_sr", &fused_update_1d_full_lag_sr_cuda);
     m.def("fused_update_2d_noclip", &fused_update_2d_noclip_cuda);
     m.def("fused_update_2d_norm", &fused_update_2d_norm_cuda);
     m.def("fused_update_2d_apply", &fused_update_2d_apply_cuda);
     m.def("fused_update_2d_lag", &fused_update_2d_lag_cuda);
+    m.def("fused_update_2d_noclip_sr", &fused_update_2d_noclip_sr_cuda);
+    m.def("fused_update_2d_apply_sr", &fused_update_2d_apply_sr_cuda);
+    m.def("fused_update_2d_lag_sr", &fused_update_2d_lag_sr_cuda);
     m.def("fused_update_2d_full_noclip", &fused_update_2d_full_noclip_cuda);
     m.def("fused_update_2d_full_norm", &fused_update_2d_full_norm_cuda);
     m.def("fused_update_2d_full_apply", &fused_update_2d_full_apply_cuda);
     m.def("fused_update_2d_full_lag", &fused_update_2d_full_lag_cuda);
+    m.def("fused_update_2d_full_noclip_sr", &fused_update_2d_full_noclip_sr_cuda);
+    m.def("fused_update_2d_full_apply_sr", &fused_update_2d_full_apply_sr_cuda);
+    m.def("fused_update_2d_full_lag_sr", &fused_update_2d_full_lag_sr_cuda);
     m.def("compute_factored_sums", &compute_factored_sums_cuda);
     m.def("compute_ut_rms", &compute_ut_rms_cuda);
     m.def("fused_came_pass1", &fused_came_pass1_cuda);
     m.def("fused_came_pass2_norm", &fused_came_pass2_norm_cuda);
     m.def("fused_came_pass2", &fused_came_pass2_cuda);
+    m.def("fused_came_pass2_sr", &fused_came_pass2_sr_cuda);
     m.def("fused_came_full_pass1", &fused_came_full_pass1_cuda);
     m.def("fused_came_full_pass2", &fused_came_full_pass2_cuda);
+    m.def("fused_came_full_pass2_sr", &fused_came_full_pass2_sr_cuda);
     m.def("compute_apollo_norms", &compute_apollo_norms_cuda);
     m.def("compute_apollo_came_rms", &compute_apollo_came_rms_cuda);
     m.def("apollo_came_compute_m_res", &apollo_came_compute_m_res_cuda);
     m.def("apollo_came_compute_update_norms", &apollo_came_compute_update_norms_cuda);
     m.def("dequantize_dynamic", &dequantize_dynamic_cuda);
     m.def("dequantize_log_nonneg", &dequantize_log_nonneg_cuda);
+    m.def("apollo_apply_bf16_det", &apollo_apply_bf16_det_cuda);
+    m.def("apollo_apply_bf16_sr", &apollo_apply_bf16_sr_cuda);
+    m.def("apollo_apply_fp16_sr", &apollo_apply_fp16_sr_cuda);
+    m.def("apollo_apply_bf16_det_native", &apollo_apply_bf16_det_native_cuda);
+    m.def("apollo_apply_fp16_det_native", &apollo_apply_fp16_det_native_cuda);
+    m.def("apollo_apply_bf16_sr_native", &apollo_apply_bf16_sr_native_cuda);
+    m.def("apollo_apply_fp16_sr_native", &apollo_apply_fp16_sr_native_cuda);
 }

@@ -34,6 +34,7 @@ _ADV_DEFAULT = 0xF
 _V_BUF_CACHE = {}
 _M_BUF_CACHE = {}
 _NORM_BUF_CACHE = {}
+_APOLLO_NORM_PAIR_CACHE = {}
 _ONE_CACHE = {}
 _RC_BUF_CACHE = {}
 _RHO_CACHE = {}
@@ -155,6 +156,143 @@ def next_seed(seed: int, adv: int = _ADV_DEFAULT) -> int:
 
 
 # ==========================================
+# 3.5 Stochastic Rounding
+# ==========================================
+
+def _stochastic_round_bf16_pytorch(fp32_tensor: Tensor, seed: Optional[int] = None,
+                                    step: Optional[int] = None,
+                                    generator: Optional[torch.Generator] = None) -> Tensor:
+    """Stochastically round FP32 values to the adjacent BF16 lattice points.
+
+    Finite overflow saturates at BF16 max-finite. NaNs remain NaNs, and
+    ``seed`` + ``step`` define a local reproducible RNG stream when provided.
+    """
+    x = fp32_tensor
+    orig_shape = x.shape
+    x_flat = x.flatten()
+    x_bits = x_flat.view(torch.int32).to(torch.int64)
+
+    BF16_MASK  = 0xFFFF0000   # keep high 16 bits
+    LOW_MASK   = 0x0000FFFF
+    EXP_MASK   = 0x7F800000
+    MANT_MASK  = 0x007FFFFF   # full 23-bit FP32 mantissa
+    LSB        = 0x00010000
+
+    x_lo_bits = x_bits & BF16_MASK
+    x_lo = x_lo_bits.to(torch.int32).view(torch.float32)
+
+    is_inf = (x_bits & EXP_MASK) == EXP_MASK
+    is_nan = is_inf & ((x_bits & MANT_MASK) != 0)
+    has_remainder = ((x_bits & LOW_MASK) != 0) & ~is_nan
+    x_lo_is_inf = (x_lo_bits & EXP_MASK) == EXP_MASK
+    tentative_hi = x_lo_bits + LSB
+    hi_would_be_inf = ((tentative_hi & EXP_MASK) == EXP_MASK) & ((tentative_hi & MANT_MASK) == 0)
+    can_round_up = has_remainder & ~x_lo_is_inf & ~hi_would_be_inf
+
+    x_hi_bits = torch.where(can_round_up, tentative_hi, x_lo_bits)
+    x_hi = x_hi_bits.to(torch.int32).view(torch.float32)
+
+    span = (x_hi - x_lo)
+    prob = torch.zeros_like(x_flat)
+    nonzero_span = span != 0
+    prob = torch.where(nonzero_span, (x_flat - x_lo) / span, prob)
+
+    if generator is not None:
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32, generator=generator)
+    elif seed is not None and step is not None:
+        local_gen = torch.Generator(device=x_flat.device)
+        combined_seed = (int(seed) * 0x9E3779B97F4A7C15 + int(step) * 0xD1B54A32D192ED03) & ((1 << 63) - 1)
+        local_gen.manual_seed(combined_seed)
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32, generator=local_gen)
+    else:
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32)
+
+    round_up = (rand < prob) & can_round_up
+    result_bits = torch.where(round_up, x_hi_bits, x_lo_bits)
+    # Keep low-payload FP32 NaNs from truncating to BF16 Inf.
+    SIGN_MASK = 0x80000000
+    CANONICAL_NAN = 0x7FC00000
+    nan_result = (x_bits & SIGN_MASK) | CANONICAL_NAN
+    result_bits = torch.where(is_nan, nan_result, result_bits)
+
+    result_bf16_bits = (result_bits >> 16).to(torch.int16)
+    return result_bf16_bits.view(torch.bfloat16).view(orig_shape)
+
+
+def _stochastic_round_fp16_pytorch(fp32_tensor: Tensor, seed: Optional[int] = None,
+                                    step: Optional[int] = None,
+                                    generator: Optional[torch.Generator] = None) -> Tensor:
+    """Stochastically round FP32 values to adjacent FP16 values.
+
+    Finite overflow saturates at signed FP16 max-finite. NaNs are preserved as
+    signed quiet NaNs. ``seed`` + ``step`` define a local reproducible stream.
+    """
+    x = fp32_tensor.to(torch.float32)
+    orig_shape = x.shape
+    x_flat = x.flatten()
+
+    nearest = x_flat.to(torch.float16)
+    nearest_f = nearest.to(torch.float32)
+    bits = nearest.view(torch.int16).to(torch.int32) & 0xFFFF
+
+    finite = torch.isfinite(x_flat)
+    is_nan = torch.isnan(x_flat)
+    is_inf = torch.isinf(x_flat)
+    overflow = finite & (x_flat.abs() > 65504.0)
+    exact = finite & ~overflow & (nearest_f == x_flat)
+
+    sign = (bits & 0x8000) != 0
+    next_up = torch.where(sign, bits - 1, bits + 1)
+    next_down = torch.where(sign, bits + 1, bits - 1)
+    # Keep the numerical neighbor relation correct at signed zero.
+    next_up = torch.where(bits == 0x8000, torch.ones_like(bits), next_up)
+    next_down = torch.where(bits == 0x0000, torch.full_like(bits, 0x8001), next_down)
+
+    lo_bits = torch.where(nearest_f < x_flat, bits, next_down)
+    hi_bits = torch.where(nearest_f < x_flat, next_up, bits)
+    lo_bits = torch.where(exact, bits, lo_bits)
+    hi_bits = torch.where(exact, bits, hi_bits)
+
+    lo = lo_bits.to(torch.int16).view(torch.float16).to(torch.float32)
+    hi = hi_bits.to(torch.int16).view(torch.float16).to(torch.float32)
+    span = hi - lo
+    stochastic = finite & ~overflow & ~exact & (span != 0)
+    prob = torch.where(stochastic, (x_flat - lo) / span, torch.zeros_like(x_flat))
+
+    if generator is not None:
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32, generator=generator)
+    elif seed is not None and step is not None:
+        local_gen = torch.Generator(device=x_flat.device)
+        combined_seed = (int(seed) * 0x9E3779B97F4A7C15 + int(step) * 0xD1B54A32D192ED03) & ((1 << 63) - 1)
+        local_gen.manual_seed(combined_seed)
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32, generator=local_gen)
+    else:
+        rand = torch.rand(x_flat.shape, device=x_flat.device, dtype=torch.float32)
+
+    result_bits = torch.where((rand < prob) & stochastic, hi_bits, lo_bits)
+    result_bits = torch.where(exact, bits, result_bits)
+
+    sign_bits = torch.where(torch.signbit(x_flat), torch.full_like(bits, 0x8000), torch.zeros_like(bits))
+    max_finite_bits = sign_bits | 0x7BFF
+    inf_bits = sign_bits | 0x7C00
+    nan_bits = sign_bits | 0x7E00
+    result_bits = torch.where(overflow, max_finite_bits, result_bits)
+    result_bits = torch.where(is_inf, inf_bits, result_bits)
+    result_bits = torch.where(is_nan, nan_bits, result_bits)
+
+    return result_bits.to(torch.int16).view(torch.float16).view(orig_shape)
+
+
+def _stochastic_round_lowp_pytorch(fp32_tensor: Tensor, dtype: torch.dtype,
+                                     seed: Optional[int] = None, step: Optional[int] = None) -> Tensor:
+    if dtype == torch.bfloat16:
+        return _stochastic_round_bf16_pytorch(fp32_tensor, seed=seed, step=step)
+    if dtype == torch.float16:
+        return _stochastic_round_fp16_pytorch(fp32_tensor, seed=seed, step=step)
+    raise TypeError(f"stochastic rounding writeback requires BF16/FP16, got {dtype}")
+
+
+# ==========================================
 # 4. Adaptive Log-Space V Quantization
 #    q=0 -> V=0, q=1..255 -> V = 2^((q-1)*scale/254 + min_log)
 # ==========================================
@@ -241,8 +379,11 @@ def _quant_v(state: Dict[str, Any], prefix: str, tensor: Tensor, block_size: int
 
 def _reset_keep_step(state: Dict[str, Any]):
     step = state.get("step", 0)
+    sr_seed = state.get("sr_seed")
     state.clear()
     state["step"] = step
+    if sr_seed is not None:
+        state["sr_seed"] = sr_seed
 
 
 def _init_v_state(state: Dict[str, Any], prefix: str, shape, block_size: int, device, v_quant_type: str = 'al8'):
@@ -487,6 +628,16 @@ def _get_norm_buf(device: torch.device) -> Tensor:
     return buf
 
 
+def _get_apollo_norm_pair(device: torch.device, n: int):
+    key = str(device)
+    buf = _APOLLO_NORM_PAIR_CACHE.get(key)
+    needed = 2 * n
+    if buf is None or buf.numel() < needed:
+        buf = torch.empty(needed, device=device, dtype=torch.float32)
+        _APOLLO_NORM_PAIR_CACHE[key] = buf
+    return buf[:n], buf[n:needed]
+
+
 def _get_one(device: torch.device) -> Tensor:
     key = str(device)
     t = _ONE_CACHE.get(key)
@@ -679,12 +830,21 @@ def _safe_rms_denom(update: Tensor, d: float, device: torch.device) -> Tensor:
 
 
 def _apply_update_pytorch(param_work: Tensor, update: Tensor, alpha: Tensor,
-                          state: Dict[str, Any], d: float, enable_fira: bool, fira_margin: float):
+                          state: Dict[str, Any], d: float, enable_fira: bool, fira_margin: float,
+                          sr_ctx=None):
     if enable_fira:
         update, denom = _apply_fira_pytorch(state, update, fira_margin, d)
     else:
         denom = _safe_rms_denom(update, d, param_work.device)
-    param_work.add_(update, alpha=-alpha / denom)
+    if sr_ctx is None:
+        param_work.add_(update, alpha=-alpha / denom)
+        return
+    decay_factor, sr_seed, sr_step = sr_ctx
+    param_fp32 = param_work.float()
+    param_fp32.mul_(decay_factor)
+    param_fp32.add_(update, alpha=-alpha / denom)
+    param_work.copy_(_stochastic_round_lowp_pytorch(
+        param_fp32, param_work.dtype, seed=sr_seed, step=sr_step))
 
 
 # --- Fallback paths (pure PyTorch) ---
@@ -692,7 +852,7 @@ def _apply_update_pytorch(param_work: Tensor, update: Tensor, alpha: Tensor,
 def _fallback_1d_update(
     param_work, grad_fp32, variance, state, alpha, d, enable_fira, fira_margin,
     beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, 
-    use_adam_denom, eps_for_denom, eps_sq
+    use_adam_denom, eps_for_denom, eps_sq, sr_ctx=None
 ):
     is_temp_m = quantize and m_quant_type != 'fp32'
 
@@ -704,7 +864,7 @@ def _fallback_1d_update(
                 rms_u = torch.linalg.vector_norm(u_t) / math.sqrt(u_t.numel())
                 u_t.div_(torch.clamp(rms_u / d, min=1.0))
             m_temp = _get_updated_m(state, u_t, beta1, m_quant_type, m_curr_block_size, quantize)
-            _apply_update_pytorch(param_work, m_temp, alpha, state, 0, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, m_temp, alpha, state, 0, enable_fira, fira_margin, sr_ctx)
         else:
             m_temp = _get_updated_m(state, grad_fp32, beta1, m_quant_type, m_curr_block_size, quantize)
             if use_adam_denom:
@@ -713,20 +873,20 @@ def _fallback_1d_update(
                 inv_std = variance.clamp(min=eps_sq).rsqrt()
             
             update = m_temp.mul_(inv_std) if is_temp_m else m_temp * inv_std
-            _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin, sr_ctx)
     else:
         if use_adam_denom:
             update = grad_fp32 / (variance.sqrt() + eps_for_denom)
         else:
             inv_std = variance.clamp(min=eps_sq).rsqrt()
             update = grad_fp32 * inv_std
-        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin)
+        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin, sr_ctx)
 
 
 def _fallback_2d_update(
     param_work, grad_fp32, state, alpha, d, enable_fira, fira_margin,
     beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type
+    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type, sr_ctx=None
 ):
     c_quant_type = c_quant_type or v_quant_type
     is_temp_m = quantize and m_quant_type != 'fp32'
@@ -756,24 +916,24 @@ def _fallback_2d_update(
         
         if is_temp_m:
             M_t.mul_(inv_row_conf).mul_(inv_col_conf)
-            _apply_update_pytorch(param_work, M_t, alpha, state, 0, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, M_t, alpha, state, 0, enable_fira, fira_margin, sr_ctx)
         else:
             update = M_t.mul(inv_row_conf).mul_(inv_col_conf)
-            _apply_update_pytorch(param_work, update, alpha, state, 0, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, update, alpha, state, 0, enable_fira, fira_margin, sr_ctx)
 
     elif beta1 is not None:
         m_temp = _get_updated_m(state, grad_fp32, beta1, m_quant_type, m_curr_block_size, quantize)
         if is_temp_m:
             m_temp.mul_(inv_row).mul_(inv_col)
-            _apply_update_pytorch(param_work, m_temp, alpha, state, d, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, m_temp, alpha, state, d, enable_fira, fira_margin, sr_ctx)
         else:
             update = m_temp.mul(inv_row).mul_(inv_col)
-            _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin)
+            _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin, sr_ctx)
 
     else:
         update = grad_fp32 * inv_row
         update.mul_(inv_col)
-        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin)
+        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira, fira_margin, sr_ctx)
 
 
 # ==========================================
@@ -887,11 +1047,24 @@ def _dispatch_1d_cuda(state, param_flat, grad_flat, m_q_flat, m_scale_flat,
                       beta1, beta_val, eps_for_denom, use_adam_denom, 
                       log_eps_sq, eps_for_grad_sq, numel, curr_block_size, 
                       m_curr_block_size, m_bits, m_mode, d, v_bits, 
-                      enable_fira, fira_margin, lag_norm, has_m, momentum_only_1d):
+                      enable_fira, fira_margin, lag_norm, has_m, momentum_only_1d, sr_ctx=None):
     device = param_flat.device
-    
+    if sr_ctx is not None:
+        decay_factor, sr_seed, sr_step = sr_ctx
+
     def l_noclip(a):
-        if has_m:
+        if sr_ctx is not None:
+            if has_m:
+                _CUDA_MODULE.fused_update_1d_noclip_sr(
+                    param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, a,
+                    decay_factor, sr_seed, sr_step, beta1, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, m_curr_block_size, m_bits, m_mode, v_bits, momentum_only_1d)
+            else:
+                _CUDA_MODULE.fused_update_1d_vonly_noclip_sr(
+                    param_flat, grad_flat, v_q_flat, v_scale_flat, v_min_log_flat, a,
+                    decay_factor, sr_seed, sr_step, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, v_bits)
+        elif has_m:
             _CUDA_MODULE.fused_update_1d_noclip(
                 param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, a,
                 beta1, beta_val, eps_for_denom, use_adam_denom, log_eps_sq, eps_for_grad_sq,
@@ -902,7 +1075,18 @@ def _dispatch_1d_cuda(state, param_flat, grad_flat, m_q_flat, m_scale_flat,
                 beta_val, eps_for_denom, use_adam_denom, log_eps_sq, eps_for_grad_sq, numel, curr_block_size, v_bits)
 
     def l_lag(nb, a, pn):
-        if has_m:
+        if sr_ctx is not None:
+            if has_m:
+                _CUDA_MODULE.fused_update_1d_lag_sr(
+                    param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, nb, a, pn,
+                    decay_factor, sr_seed, sr_step, beta1, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, m_curr_block_size, m_bits, m_mode, d, v_bits, momentum_only_1d)
+            else:
+                _CUDA_MODULE.fused_update_1d_vonly_lag_sr(
+                    param_flat, grad_flat, v_q_flat, v_scale_flat, v_min_log_flat, nb, a, pn,
+                    decay_factor, sr_seed, sr_step, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, d, v_bits)
+        elif has_m:
             _CUDA_MODULE.fused_update_1d_lag(
                 param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, nb, a, pn,
                 beta1, beta_val, eps_for_denom, use_adam_denom, log_eps_sq, eps_for_grad_sq,
@@ -926,7 +1110,18 @@ def _dispatch_1d_cuda(state, param_flat, grad_flat, m_q_flat, m_scale_flat,
 
     def l_apply(nb, a):
         v_buf = _get_v_buf(device, numel)
-        if has_m:
+        if sr_ctx is not None:
+            if has_m:
+                _CUDA_MODULE.fused_update_1d_apply_sr(
+                    param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, v_buf, nb, a,
+                    decay_factor, sr_seed, sr_step, beta1, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, m_curr_block_size, m_bits, m_mode, d, v_bits, momentum_only_1d)
+            else:
+                _CUDA_MODULE.fused_update_1d_vonly_apply_sr(
+                    param_flat, grad_flat, v_q_flat, v_scale_flat, v_min_log_flat, v_buf, nb, a,
+                    decay_factor, sr_seed, sr_step, beta_val, eps_for_denom, use_adam_denom,
+                    log_eps_sq, eps_for_grad_sq, numel, curr_block_size, d, v_bits)
+        elif has_m:
             _CUDA_MODULE.fused_update_1d_apply(
                 param_flat, grad_flat, m_q_flat, m_scale_flat, v_q_flat, v_scale_flat, v_min_log_flat, v_buf, nb, a,
                 beta1, beta_val, eps_for_denom, use_adam_denom, log_eps_sq, eps_for_grad_sq,
@@ -1014,7 +1209,9 @@ class Adafactor8Bit(Optimizer):
             Defaults to None.
         min_8bit_size (int): Minimum number of elements to apply quantization. Defaults to 4096.
         use_cuda_kernel (bool): Whether to use custom CUDA kernels. Defaults to True.
-            
+        stochastic_round_writeback (bool): If True, uses stochastic rounding when writing
+            updated BF16/FP16 parameters. Defaults to False.
+
         **APOLLO Low-Rank Projection**
 
         apollo_rank (int): Rank for APOLLO (An Optimizer for Memory-Efficient Large-Scale Training) 
@@ -1045,8 +1242,10 @@ class Adafactor8Bit(Optimizer):
 
         scale_weight_decay (bool): If `True` (default), weight decay is coupled with the 
             parameter's RMS scale. If `False`, decoupled (AdamW-style).
-        enable_fira_for_adafactor (bool): If `True`, enables Fira Limiter to prevent gradient 
-            explosion by smoothing update norms. Defaults to False.
+        enable_fira_for_adafactor (bool): If True, enables the Fira Norm-Growth Limiter
+            on all non-APOLLO paths, including Adafactor, CAME, Adam-style, and SGD
+            updates. The historical parameter name is retained for compatibility.
+            Defaults to False.
         fira_margin (float): The tolerance margin for Fira Limiter (e.g., 0.01 for 1%). 
             Shared with Apollo path. Defaults to 0.01.
         lag_norm (bool): If True and d > 0, uses the previous step's update norm for RMS 
@@ -1103,6 +1302,7 @@ class Adafactor8Bit(Optimizer):
         c_quant_type: Optional[str] = None,
         min_8bit_size: int = 4096,
         use_cuda_kernel: bool = True,
+        stochastic_round_writeback: bool = False,
         # --- APOLLO Low-Rank Projection ---
         apollo_rank: int = 0,
         apollo_update_proj_gap: int = 200,
@@ -1206,6 +1406,7 @@ class Adafactor8Bit(Optimizer):
             quantize=quantize, block_size=block_size, m_block_size=m_block_size, 
             m_quant_type=m_quant_type, v_quant_type=v_quant_type, c_quant_type=c_quant_type,
             min_8bit_size=min_8bit_size, use_cuda_kernel=use_cuda_kernel,
+            stochastic_round_writeback=stochastic_round_writeback,
             # APOLLO Low-Rank Projection
             apollo_rank=apollo_rank, apollo_update_proj_gap=apollo_update_proj_gap,
             apollo_scale_type=apollo_scale_type, apollo_scale=apollo_scale, 
@@ -1222,10 +1423,12 @@ class Adafactor8Bit(Optimizer):
         super().__init__(params, defaults)
 
         self._apollo_seed_counter = 1
+        self._sr_seed_counter = 1
 
     def state_dict(self):
         state_dict = super().state_dict()
         state_dict['_apollo_seed_counter'] = self._apollo_seed_counter
+        state_dict['_sr_seed_counter'] = self._sr_seed_counter
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -1242,14 +1445,63 @@ class Adafactor8Bit(Optimizer):
         }
 
         old_vqt, old_mqt, old_cqt = {}, {}, {}
+        saved_tensor_state = {}
         for idx, st in state_dict.get('state', {}).items():
             if isinstance(st, dict):
                 old_vqt[idx] = st.get('v_quant_type', 'al8')
                 old_mqt[idx] = st.get('m_quant_type', 'uf8')
                 old_cqt[idx] = st.get('c_quant_type', old_vqt[idx])
+                # Optimizer.load_state_dict casts floating state tensors to the
+                # parameter dtype. This optimizer intentionally keeps state in
+                # FP32 or integer quantized formats, independent of parameter dtype.
+                saved_tensor_state[idx] = {
+                    k: v for k, v in st.items()
+                    if torch.is_tensor(v) and k != "step"
+                }
+        saved_param_ids = [
+            idx
+            for group in state_dict.get("param_groups", [])
+            for idx in group.get("params", [])
+        ]
 
         self._apollo_seed_counter = state_dict.get('_apollo_seed_counter', 0)
+        self._sr_seed_counter = state_dict.get('_sr_seed_counter', 0)
+
+        # Checkpoints without stochastic_round_writeback inherit the current policy;
+        # checkpoints that store it explicitly keep their saved value.
+        current_sr_policy = [g.get("stochastic_round_writeback", False) for g in self.param_groups]
+        saved_groups = state_dict.get("param_groups", [])
+        sr_missing_in_saved = [
+            ("stochastic_round_writeback" not in sg) if isinstance(sg, dict) else True
+            for sg in saved_groups
+        ]
+
         super().load_state_dict(state_dict)
+
+        # Backfill only groups whose saved checkpoint had no SR policy.
+        if len(self.param_groups) == len(sr_missing_in_saved):
+            for group, missing, policy in zip(self.param_groups, sr_missing_in_saved, current_sr_policy):
+                if missing:
+                    group["stochastic_round_writeback"] = policy
+
+        # Restore the checkpoint's exact tensor-state representation after the
+        # base loader has mapped saved parameter IDs to the current parameters.
+        # Parameter tensors may be BF16/FP16; optimizer state is not implicitly
+        # allowed to inherit that dtype.
+        current_params = [
+            p
+            for group in self.param_groups
+            for p in group["params"]
+        ]
+        if len(saved_param_ids) == len(current_params):
+            id_map = dict(zip(saved_param_ids, current_params))
+            for saved_id, tensors in saved_tensor_state.items():
+                p = id_map.get(saved_id)
+                if p is None or p not in self.state:
+                    continue
+                st = self.state[p]
+                for k, v in tensors.items():
+                    st[k] = v.detach().to(device=p.device, dtype=v.dtype, copy=True).contiguous()
 
         param_idx = 0
         for group in self.param_groups:
@@ -1595,9 +1847,16 @@ class Adafactor8Bit(Optimizer):
                 _ensure_qmap(params_with_grad[0].device)
 
             apollo_rank = group.get("apollo_rank", 0)
+            stochastic_round_writeback = group.get("stochastic_round_writeback", False)
 
             for i in range(len(params_with_grad)):
-                if apollo_rank > 0 and 'apollo_seed' in states[i]:
+                use_apollo = apollo_rank > 0 and 'apollo_seed' in states[i]
+                if (stochastic_round_writeback and params_with_grad[i].dtype in (torch.bfloat16, torch.float16)
+                        and "sr_seed" not in states[i]):
+                    states[i]["sr_seed"] = self._sr_seed_counter
+                    self._sr_seed_counter += 1
+
+                if use_apollo:
                     _update_param_apollo(
                         params_with_grad[i], grads[i], states[i],
                         d=group["d"], lr=group["lr"], beta1=group.get("beta1"),
@@ -1619,6 +1878,7 @@ class Adafactor8Bit(Optimizer):
                         fira_margin=group.get("fira_margin", 0.01),
                         eps_came=group.get("eps_came", 1e-16),
                         beta3=group.get("beta3"), bias_correction=group.get("bias_correction"),
+                        stochastic_round_writeback=stochastic_round_writeback,
                     )
                 else:
                     _update_param_8bit(
@@ -1638,6 +1898,7 @@ class Adafactor8Bit(Optimizer):
                         factored=group.get("factored", True),
                         beta3=group.get("beta3"), eps_came=group.get("eps_came", 1e-16),
                         bias_correction=group.get("bias_correction"),
+                        stochastic_round_writeback=stochastic_round_writeback,
                     )
         return loss
 
@@ -1656,7 +1917,10 @@ def _update_param_8bit(
     lag_norm: bool = False, momentum_only_1d: Optional[bool] = None, factored: bool = True,
     beta3: Optional[float] = None, eps_came: float = 1e-16,
     bias_correction: Optional[bool] = None,
+    stochastic_round_writeback: bool = False,
 ):
+    is_sgd = (beta2 is None) and (beta2_decay is None)
+    is_full_rank = (grad.dim() < 2) or (not factored) or is_sgd
     if eps1 is None:
         eps1 = 1e-30
     eps_sq = max(eps1 * eps1, _LOG_QUANT_FLOOR)
@@ -1709,7 +1973,6 @@ def _update_param_8bit(
 
     step = state["step"] + 1
     state["step"] = step
-    is_sgd = (beta2 is None) and (beta2_decay is None)
 
     if is_sgd:
         beta_val = 0.0
@@ -1731,15 +1994,19 @@ def _update_param_8bit(
             else:
                 alpha = alpha / bc1
 
+    sr_lowp = stochastic_round_writeback and param_work.dtype in (torch.bfloat16, torch.float16)
+    decay_factor = _get_one(param_work.device) if sr_lowp else None
     if weight_decay != 0:
         wd_multiplier = alpha if scale_weight_decay else rho_t
-        param_work.mul_(1.0 - (wd_multiplier * weight_decay))
+        if sr_lowp:
+            decay_factor = 1.0 - (wd_multiplier * weight_decay)
+        else:
+            param_work.mul_(1.0 - (wd_multiplier * weight_decay))
+    sr_ctx = (decay_factor, int(state.get("sr_seed", 0)), step) if sr_lowp else None
 
     # ================================================================
     # SGD path
     # ================================================================
-    is_full_rank = (grad_contig.dim() < 2) or (not factored) or is_sgd
-
     if is_sgd:
         grad_fp32 = _get_safe_grad_fp32()
         if beta1 is not None:
@@ -1763,7 +2030,7 @@ def _update_param_8bit(
         else:
             update = grad_fp32
 
-        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira_for_adafactor, fira_margin)
+        _apply_update_pytorch(param_work, update, alpha, state, d, enable_fira_for_adafactor, fira_margin, sr_ctx)
         if needs_copy_back:
             param.copy_(param_work)
         return
@@ -1779,7 +2046,7 @@ def _update_param_8bit(
                          square_input=True, eps=eps_for_grad_sq, log_floor=log_eps_sq)
             variance = _v_fp32.view(grad_fp32.shape)
             _fallback_1d_update(param_work, grad_fp32, variance, state, alpha, d, enable_fira_for_adafactor, fira_margin,
-                                beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq)
+                                beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq, sr_ctx)
             if needs_copy_back:
                 param.copy_(param_work)
             return
@@ -1801,7 +2068,7 @@ def _update_param_8bit(
                         alpha, beta1, beta_val, eps_for_denom, use_adam_denom,
                         log_eps_sq, eps_for_grad_sq, numel, curr_block_size,
                         m_curr_block_size, m_bits, m_mode, d, v_bits,
-                        enable_fira_for_adafactor, fira_margin, lag_norm, has_m=True, momentum_only_1d=momentum_only_1d)
+                        enable_fira_for_adafactor, fira_margin, lag_norm, has_m=True, momentum_only_1d=momentum_only_1d, sr_ctx=sr_ctx)
                 else:
                     _dispatch_1d_cuda(
                         state, param_work.view(-1), grad_flat, None, None,
@@ -1809,7 +2076,7 @@ def _update_param_8bit(
                         alpha, None, beta_val, eps_for_denom, use_adam_denom,
                         log_eps_sq, eps_for_grad_sq, numel, curr_block_size,
                         0, 0, 0, d, v_bits,
-                        enable_fira_for_adafactor, fira_margin, lag_norm, has_m=False, momentum_only_1d=momentum_only_1d)
+                        enable_fira_for_adafactor, fira_margin, lag_norm, has_m=False, momentum_only_1d=momentum_only_1d, sr_ctx=sr_ctx)
             else:
                 grad_fp32 = _get_safe_grad_fp32()
                 grad_sq = grad_fp32.square().add_(eps_for_grad_sq)
@@ -1818,7 +2085,7 @@ def _update_param_8bit(
                 del grad_sq
                 _quant_v(state, "variance", variance, curr_block_size, v_quant_type)
                 _fallback_1d_update(param_work, grad_fp32, variance, state, alpha, d, enable_fira_for_adafactor, fira_margin,
-                                    beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq)
+                                    beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq, sr_ctx)
 
         # --- Full precision path (quantize=False or v_quant_type='fp32') ---
         else:
@@ -1840,24 +2107,43 @@ def _update_param_8bit(
                     m_flat = m_flat.view(-1)
 
                 b1_val = beta1 if beta1 is not None else 0.0
-                p_flat, g_flat, v_flat = param_work.view(-1), grad_fp32.view(-1), var_flat.view(-1)
+                p_flat, v_flat = param_work.view(-1), var_flat.view(-1)
+                g_flat = grad_contig.view(-1)
 
                 def l_noclip(a):
-                    _CUDA_MODULE.fused_update_1d_full_noclip(
-                        p_flat, g_flat, v_flat, m_flat, a,
-                        b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, momentum_only_1d)
+                    if sr_ctx is not None:
+                        decay_factor, sr_seed, sr_step = sr_ctx
+                        _CUDA_MODULE.fused_update_1d_full_noclip_sr(
+                            p_flat, g_flat, v_flat, m_flat, a, decay_factor, sr_seed, sr_step,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, momentum_only_1d)
+                    else:
+                        _CUDA_MODULE.fused_update_1d_full_noclip(
+                            p_flat, g_flat, v_flat, m_flat, a,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, momentum_only_1d)
                 def l_lag(nb, a, pn):
-                    _CUDA_MODULE.fused_update_1d_full_lag(
-                        p_flat, g_flat, v_flat, m_flat, nb, a, pn,
-                        b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
+                    if sr_ctx is not None:
+                        decay_factor, sr_seed, sr_step = sr_ctx
+                        _CUDA_MODULE.fused_update_1d_full_lag_sr(
+                            p_flat, g_flat, v_flat, m_flat, nb, a, pn, decay_factor, sr_seed, sr_step,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
+                    else:
+                        _CUDA_MODULE.fused_update_1d_full_lag(
+                            p_flat, g_flat, v_flat, m_flat, nb, a, pn,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
                 def l_norm(nb):
                     _CUDA_MODULE.fused_update_1d_full_norm(
                         g_flat, v_flat, m_flat, nb,
                         b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, momentum_only_1d)
                 def l_apply(nb, a):
-                    _CUDA_MODULE.fused_update_1d_full_apply(
-                        p_flat, g_flat, v_flat, m_flat, nb, a,
-                        b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
+                    if sr_ctx is not None:
+                        decay_factor, sr_seed, sr_step = sr_ctx
+                        _CUDA_MODULE.fused_update_1d_full_apply_sr(
+                            p_flat, g_flat, v_flat, m_flat, nb, a, decay_factor, sr_seed, sr_step,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
+                    else:
+                        _CUDA_MODULE.fused_update_1d_full_apply(
+                            p_flat, g_flat, v_flat, m_flat, nb, a,
+                            b1_val, beta_val, eps_sq, eps_for_denom, use_adam_denom, eps_for_grad_sq, N, d, momentum_only_1d)
 
                 _dispatch_cuda_clip(state, param_work.device, alpha, d, enable_fira_for_adafactor, fira_margin, lag_norm,
                                     l_noclip, l_lag, l_norm, l_apply)
@@ -1867,7 +2153,7 @@ def _update_param_8bit(
                 if eps_for_grad_sq > 0.0:
                     variance.add_(beta_val * eps_for_grad_sq)
                 _fallback_1d_update(param_work, grad_fp32, variance, state, alpha, d, enable_fira_for_adafactor, fira_margin,
-                                    beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq)
+                                    beta1, m_quant_type, m_curr_block_size, quantize, momentum_only_1d, use_adam_denom, eps_for_denom, eps_sq, sr_ctx)
 
         if needs_copy_back:
             param.copy_(param_work)
@@ -1884,13 +2170,17 @@ def _update_param_8bit(
         C = shape[-1]
         numel = grad_contig.numel()
         batch_size = math.prod(shape[:-2]) if len(shape) > 2 else 1
-        if _cuda_ready and quantize and v_quant_type != 'fp32':
+        use_cuda_rc = _cuda_ready and quantize and (
+            v_quant_type != 'fp32'
+            or (sr_ctx is not None and beta3 is not None and beta1 is not None and m_quant_type != 'fp32')
+        )
+        if use_cuda_rc:
             _rc_buf, _row_sum, _col_sum, _row_fp32, _col_fp32, _came_base, _rs, _cs = \
                 _prepare_rc_workspace(param_work.device, batch_size, R, C, beta3 is not None)
             _CUDA_MODULE.compute_factored_sums(
                 grad_contig.view(-1), _row_sum, _col_sum, R, C, numel)
-            row_mean = (_row_sum.view(batch_size, R, 1) / C).add_(eps1)
-            col_mean = (_col_sum.view(batch_size, 1, C) / R).add_(eps1)
+            row_mean = (_row_sum.view(shape[:-2] + (R, 1)) / C).add_(eps1)
+            col_mean = (_col_sum.view(shape[:-2] + (1, C)) / R).add_(eps1)
         else:
             grad_fp32 = _get_safe_grad_fp32()
             g_sq = grad_fp32.square()
@@ -1928,18 +2218,20 @@ def _update_param_8bit(
         del row_mean, col_mean
 
         if quantize and beta1 is not None and m_quant_type != 'fp32':
-            if _cuda_ready and v_quant_type != 'fp32':
+            if _cuda_ready and (v_quant_type != 'fp32' or sr_ctx is not None):
                 grad_flat_2d = grad_contig.reshape(-1)
                 m_q_flat = state["m_q"].view(-1)
                 m_scale_flat = state["m_scale"].view(-1)
                 param_flat = param_work.reshape(-1)
                 row_mean_val_flat = row_mean_val
+                row_cuda = _row_fp32 if v_quant_type != 'fp32' else row_var.view(-1)
+                col_cuda = _col_fp32 if v_quant_type != 'fp32' else col_var.view(-1)
 
                 if beta3 is not None:
                     ut_sq_sum = _get_norm_buf(param_work.device)
                     _CUDA_MODULE.compute_ut_rms(
                         grad_flat_2d,
-                        _row_fp32, _col_fp32,
+                        row_cuda, col_cuda,
                         row_mean_val_flat, ut_sq_sum,
                         R, C, numel)
                     clip_factor = torch.clamp(torch.sqrt(ut_sq_sum / numel) / d, min=1.0) if d > 0 else _get_one(param_work.device)
@@ -1948,7 +2240,7 @@ def _update_param_8bit(
                     res_col_sum = _rc_buf[_came_base + _rs:_came_base + _rs + _cs].zero_()
                     _CUDA_MODULE.fused_came_pass1(
                         grad_flat_2d, m_q_flat, m_scale_flat,
-                        _row_fp32, _col_fp32,
+                        row_cuda, col_cuda,
                         row_mean_val_flat,
                         res_row_sum, res_col_sum, clip_factor,
                         beta1, eps_came,
@@ -1979,7 +2271,7 @@ def _update_param_8bit(
                         norm_buf = _get_norm_buf(param_work.device)
                         _CUDA_MODULE.fused_came_pass2_norm(
                             grad_flat_2d, m_q_flat, m_scale_flat,
-                            _row_fp32, _col_fp32,
+                            row_cuda, col_cuda,
                             row_mean_val_flat,
                             _conf_row_fp32, _conf_col_fp32,
                             conf_row_mean,
@@ -1988,34 +2280,78 @@ def _update_param_8bit(
                             R, C, numel, m_curr_block_size, m_bits, m_mode)
                         alpha, norm_buf = _apply_fira_cuda(state, norm_buf, alpha, fira_margin)
 
-                    _CUDA_MODULE.fused_came_pass2(
-                        param_flat, grad_flat_2d,
-                        m_q_flat, m_scale_flat,
-                        _row_fp32, _col_fp32,
-                        row_mean_val_flat,
-                        _conf_row_fp32, _conf_col_fp32,
-                        conf_row_mean,
-                        clip_factor, alpha,
-                        beta1,
-                        R, C, numel, m_curr_block_size, m_bits, m_mode)
+                    if sr_ctx is not None:
+                        decay_factor, sr_seed, sr_step = sr_ctx
+                        _CUDA_MODULE.fused_came_pass2_sr(
+                            param_flat, grad_flat_2d,
+                            m_q_flat, m_scale_flat,
+                            row_cuda, col_cuda,
+                            row_mean_val_flat,
+                            _conf_row_fp32, _conf_col_fp32,
+                            conf_row_mean,
+                            clip_factor, alpha, decay_factor, sr_seed, sr_step,
+                            beta1,
+                            R, C, numel, m_curr_block_size, m_bits, m_mode)
+                    else:
+                        _CUDA_MODULE.fused_came_pass2(
+                            param_flat, grad_flat_2d,
+                            m_q_flat, m_scale_flat,
+                            row_cuda, col_cuda,
+                            row_mean_val_flat,
+                            _conf_row_fp32, _conf_col_fp32,
+                            conf_row_mean,
+                            clip_factor, alpha,
+                            beta1,
+                            R, C, numel, m_curr_block_size, m_bits, m_mode)
 
                 else:
                     def l_noclip(a):
-                        _CUDA_MODULE.fused_update_2d_noclip(
-                            param_flat, grad_flat_2d, m_q_flat, m_scale_flat, _row_fp32, _col_fp32, row_mean_val_flat, a,
-                            beta1, R, C, numel, m_curr_block_size, m_bits, m_mode)
+                        if sr_ctx is not None:
+                            decay_factor, sr_seed, sr_step = sr_ctx
+                            _CUDA_MODULE.fused_update_2d_noclip_sr(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, a,
+                                decay_factor, sr_seed, sr_step,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode)
+                        else:
+                            _CUDA_MODULE.fused_update_2d_noclip(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, a,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode)
+
                     def l_lag(nb, a, pn):
-                        _CUDA_MODULE.fused_update_2d_lag(
-                            param_flat, grad_flat_2d, m_q_flat, m_scale_flat, _row_fp32, _col_fp32, row_mean_val_flat, nb, a, pn,
-                            beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
+                        if sr_ctx is not None:
+                            decay_factor, sr_seed, sr_step = sr_ctx
+                            _CUDA_MODULE.fused_update_2d_lag_sr(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, nb, a, pn,
+                                decay_factor, sr_seed, sr_step,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
+                        else:
+                            _CUDA_MODULE.fused_update_2d_lag(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, nb, a, pn,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
+
                     def l_norm(nb):
                         _CUDA_MODULE.fused_update_2d_norm(
-                            grad_flat_2d, m_q_flat, m_scale_flat, _row_fp32, _col_fp32, row_mean_val_flat, nb,
+                            grad_flat_2d, m_q_flat, m_scale_flat,
+                            row_cuda, col_cuda, row_mean_val_flat, nb,
                             beta1, R, C, numel, m_curr_block_size, m_bits, m_mode)
+
                     def l_apply(nb, a):
-                        _CUDA_MODULE.fused_update_2d_apply(
-                            param_flat, grad_flat_2d, m_q_flat, m_scale_flat, _row_fp32, _col_fp32, row_mean_val_flat, nb, a,
-                            beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
+                        if sr_ctx is not None:
+                            decay_factor, sr_seed, sr_step = sr_ctx
+                            _CUDA_MODULE.fused_update_2d_apply_sr(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, nb, a,
+                                decay_factor, sr_seed, sr_step,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
+                        else:
+                            _CUDA_MODULE.fused_update_2d_apply(
+                                param_flat, grad_flat_2d, m_q_flat, m_scale_flat,
+                                row_cuda, col_cuda, row_mean_val_flat, nb, a,
+                                beta1, R, C, numel, m_curr_block_size, m_bits, m_mode, d)
 
                     _dispatch_cuda_clip(state, param_work.device, alpha, d, enable_fira_for_adafactor, fira_margin, lag_norm,
                                         l_noclip, l_lag, l_norm, l_apply)
@@ -2025,10 +2361,12 @@ def _update_param_8bit(
                 inv_row, inv_col = _factored_inv_std(row_var, col_var, row_mean_val)
                 _fallback_2d_update(param_work, grad_fp32, state, alpha, d, enable_fira_for_adafactor, fira_margin,
                                     beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-                                    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type)
+                                    inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type, sr_ctx)
 
-        elif _cuda_ready and beta3 is None and (not quantize or v_quant_type == 'fp32' or beta1 is None):
-            # Unified 2D Full Precision Path (Adafactor/AdamW)
+        elif _cuda_ready and beta3 is None and (
+                not quantize or v_quant_type == 'fp32' or beta1 is None
+                or (sr_ctx is not None and m_quant_type == 'fp32')):
+            # Unified 2D full-state / no-M kernel path
             m_flat = None
             b1_val = 0.0
             if beta1 is not None:
@@ -2045,27 +2383,53 @@ def _update_param_8bit(
             rm_flat = row_mean_val.view(-1)
 
             def l_noclip(a):
-                _CUDA_MODULE.fused_update_2d_full_noclip(
-                    p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, a,
-                    b1_val, R, C, numel, m_block_size)
+                if sr_ctx is not None:
+                    decay_factor, sr_seed, sr_step = sr_ctx
+                    _CUDA_MODULE.fused_update_2d_full_noclip_sr(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, a,
+                        decay_factor, sr_seed, sr_step,
+                        b1_val, R, C, numel, m_block_size)
+                else:
+                    _CUDA_MODULE.fused_update_2d_full_noclip(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, a,
+                        b1_val, R, C, numel, m_block_size)
+
             def l_lag(nb, a, pn):
-                _CUDA_MODULE.fused_update_2d_full_lag(
-                    p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a, pn,
-                    b1_val, R, C, numel, m_block_size, d)
+                if sr_ctx is not None:
+                    decay_factor, sr_seed, sr_step = sr_ctx
+                    _CUDA_MODULE.fused_update_2d_full_lag_sr(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a, pn,
+                        decay_factor, sr_seed, sr_step,
+                        b1_val, R, C, numel, m_block_size, d)
+                else:
+                    _CUDA_MODULE.fused_update_2d_full_lag(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a, pn,
+                        b1_val, R, C, numel, m_block_size, d)
+
             def l_norm(nb):
                 _CUDA_MODULE.fused_update_2d_full_norm(
                     g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb,
                     b1_val, R, C, numel, m_block_size)
+
             def l_apply(nb, a):
-                _CUDA_MODULE.fused_update_2d_full_apply(
-                    p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a,
-                    b1_val, R, C, numel, m_block_size, d)
+                if sr_ctx is not None:
+                    decay_factor, sr_seed, sr_step = sr_ctx
+                    _CUDA_MODULE.fused_update_2d_full_apply_sr(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a,
+                        decay_factor, sr_seed, sr_step,
+                        b1_val, R, C, numel, m_block_size, d)
+                else:
+                    _CUDA_MODULE.fused_update_2d_full_apply(
+                        p_flat, g_flat, m_flat, row_var_flat, col_var_flat, rm_flat, nb, a,
+                        b1_val, R, C, numel, m_block_size, d)
 
             _dispatch_cuda_clip(state, param_work.device, alpha, d, enable_fira_for_adafactor, fira_margin, lag_norm,
                                 l_noclip, l_lag, l_norm, l_apply)
 
-        elif _cuda_ready and beta3 is not None and beta1 is not None and (not quantize or v_quant_type == 'fp32'):
-            # Unified 2D CAME Full Precision Path
+        elif _cuda_ready and beta3 is not None and beta1 is not None and (
+                not quantize or v_quant_type == 'fp32'
+                or (sr_ctx is not None and m_quant_type == 'fp32')):
+            # Unified 2D CAME full-M path
             need_norm = enable_fira_for_adafactor
 
             m_flat = state.get("m")
@@ -2073,10 +2437,13 @@ def _update_param_8bit(
                 m_flat = m_flat.contiguous()
                 state["m"] = m_flat
 
+            row_came = row_var.view(-1) if row_var is not None else _row_fp32
+            col_came = col_var.view(-1) if col_var is not None else _col_fp32
+
             ut_sq_sum = _get_norm_buf(param_work.device)
             _CUDA_MODULE.compute_ut_rms(
                 grad_contig.reshape(-1),
-                row_var.view(-1), col_var.view(-1),
+                row_came, col_came,
                 row_mean_val.view(-1), ut_sq_sum,
                 R, C, numel)
             clip_factor = torch.clamp(torch.sqrt(ut_sq_sum / numel) / d, min=1.0) if d > 0 else _get_one(param_work.device)
@@ -2085,7 +2452,7 @@ def _update_param_8bit(
             res_col_sum = torch.zeros(batch_size * C, device=param_work.device, dtype=torch.float32)
             _CUDA_MODULE.fused_came_full_pass1(
                 grad_contig.reshape(-1), m_flat.view(-1),
-                row_var.view(-1), col_var.view(-1),
+                row_came, col_came,
                 row_mean_val.view(-1),
                 res_row_sum, res_col_sum,
                 clip_factor,
@@ -2122,12 +2489,21 @@ def _update_param_8bit(
                     R, C, numel, m_block_size, True)
                 alpha, norm_buf = _apply_fira_cuda(state, norm_buf, alpha, fira_margin)
 
-            _CUDA_MODULE.fused_came_full_pass2(
-                param_work.reshape(-1), m_flat.view(-1),
-                c_row.view(-1), c_col.view(-1),
-                c_row_mean.view(-1),
-                _get_norm_buf(param_work.device), alpha,
-                R, C, numel, m_block_size, False)
+            if sr_ctx is not None:
+                decay_factor, sr_seed, sr_step = sr_ctx
+                _CUDA_MODULE.fused_came_full_pass2_sr(
+                    param_work.reshape(-1), m_flat.view(-1),
+                    c_row.view(-1), c_col.view(-1),
+                    c_row_mean.view(-1), alpha,
+                    decay_factor, sr_seed, sr_step,
+                    R, C, numel, m_block_size)
+            else:
+                _CUDA_MODULE.fused_came_full_pass2(
+                    param_work.reshape(-1), m_flat.view(-1),
+                    c_row.view(-1), c_col.view(-1),
+                    c_row_mean.view(-1),
+                    _get_norm_buf(param_work.device), alpha,
+                    R, C, numel, m_block_size, False)
 
         else:
             # 2D Fallback Path
@@ -2135,7 +2511,7 @@ def _update_param_8bit(
             inv_row, inv_col = _factored_inv_std(row_var, col_var, row_mean_val)
             _fallback_2d_update(param_work, grad_fp32, state, alpha, d, enable_fira_for_adafactor, fira_margin,
                                 beta1, beta3, eps_came, eps1, m_quant_type, m_curr_block_size, quantize,
-                                inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type)
+                                inv_row, inv_col, curr_block_size, v_quant_type, c_quant_type, sr_ctx)
 
         if needs_copy_back:
             param.copy_(param_work)
@@ -2185,15 +2561,15 @@ def _update_param_apollo(
     enable_fira_for_apollo: bool = True, fira_margin: float = 0.01,
     eps_came: float = 1e-16, beta3: Optional[float] = None,
     bias_correction: Optional[bool] = None,
+    stochastic_round_writeback: bool = False,
 ):
+    grad_work = grad.float()
+    if grad_work.data_ptr() == grad.data_ptr():
+        grad_work = grad_work.clone()
     if maximize:
-        grad_work = grad.neg().float()
-    else:
-        grad_work = grad.float()
-        if grad_work.data_ptr() == grad.data_ptr():
-            grad_work = grad_work.clone()
-            
-    grad_work[~torch.isfinite(grad_work)] = 0.0
+        grad_work.neg_()
+    torch.nan_to_num_(grad_work, nan=0.0, posinf=0.0, neginf=0.0)
+
     update_low = None
     _cuda_ready = _load_cuda_module(use_cuda_kernel)
     if not param.is_contiguous():
@@ -2203,10 +2579,30 @@ def _update_param_apollo(
         param_work = param
         needs_copy_back = False
 
+    use_bf16 = param_work.dtype == torch.bfloat16
+    use_fp16 = param_work.dtype == torch.float16
+    native_grad_binding = None
+    if _cuda_ready and _CUDA_MODULE is not None and _CUDA_AVAILABLE and grad.dtype == param_work.dtype:
+        if stochastic_round_writeback and use_bf16 and hasattr(_CUDA_MODULE, "apollo_apply_bf16_sr_native"):
+            native_grad_binding = _CUDA_MODULE.apollo_apply_bf16_sr_native
+        elif stochastic_round_writeback and use_fp16 and hasattr(_CUDA_MODULE, "apollo_apply_fp16_sr_native"):
+            native_grad_binding = _CUDA_MODULE.apollo_apply_fp16_sr_native
+        elif (not stochastic_round_writeback) and use_bf16 and hasattr(_CUDA_MODULE, "apollo_apply_bf16_det_native"):
+            native_grad_binding = _CUDA_MODULE.apollo_apply_bf16_det_native
+        elif (not stochastic_round_writeback) and use_fp16 and hasattr(_CUDA_MODULE, "apollo_apply_fp16_det_native"):
+            native_grad_binding = _CUDA_MODULE.apollo_apply_fp16_det_native
+
+    grad_native = grad if native_grad_binding is not None else None
+
     original_shape = param_work.shape
     if param_work.dim() > 2:
         param_work = param_work.reshape(param_work.shape[0], -1)
         grad_work = grad_work.reshape(grad_work.shape[0], -1)
+        if grad_native is not None:
+            grad_native = grad_native.reshape(grad_native.shape[0], -1)
+
+    if grad_native is not None and not grad_native.is_contiguous():
+        grad_native = grad_native.contiguous()
 
     step = state["step"] + 1
     state["step"] = step
@@ -2229,13 +2625,28 @@ def _update_param_apollo(
 
     R, C = shape[-2], shape[-1]
     side = "right" if R >= C else "left"
+
+    native_norm_G_sq = None
+    native_grad_norm = None
+    if grad_native is not None:
+        if apollo_scale_type == "channel":
+            norm_dim = -1 if side == "right" else -2
+            native_norm_G_sq = torch.linalg.vector_norm(
+                grad_work, ord=2, dim=norm_dim, keepdim=True, dtype=torch.float32
+            ).square()
+        else:
+            native_grad_norm = torch.linalg.vector_norm(
+                grad_work, ord=2, dtype=torch.float32
+            )
+
     if side == "right":
         grad_low = torch.matmul(grad_work, proj_matrix_T).float()
     else:
         grad_low = torch.matmul(proj_matrix_T, grad_work).float()
 
-    norm_G = None
-    norm_G_sq = None
+    if grad_native is not None:
+        del grad_work
+
     scaling_factor_computed = False
 
     if apollo_factorize:
@@ -2401,8 +2812,7 @@ def _update_param_apollo(
                     else:
                         N, D, stride_N, stride_D = 1, grad_low_numel, grad_low_numel, 1
 
-                    norm_update = torch.empty(N, device=grad_low.device, dtype=torch.float32)
-                    norm_grad = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                    norm_update, norm_grad = _get_apollo_norm_pair(grad_low.device, N)
                     
                     _CUDA_MODULE.apollo_came_compute_update_norms(
                         m_temp, 
@@ -2487,8 +2897,7 @@ def _update_param_apollo(
                             N, D = 1, grad_low_numel
                             stride_N, stride_D = grad_low_numel, 1
                         
-                        norm_update = torch.empty(N, device=grad_low.device, dtype=torch.float32)
-                        norm_grad = torch.empty(N, device=grad_low.device, dtype=torch.float32)
+                        norm_update, norm_grad = _get_apollo_norm_pair(grad_low.device, N)
                         _v_for_norm = _v_fp32 if (quantize and v_quant_type != 'fp32') else v_low_deq.flatten()
                         _CUDA_MODULE.compute_apollo_norms(
                             _m_fp32,
@@ -2526,44 +2935,48 @@ def _update_param_apollo(
         scaling_factor = scaling_factor * apollo_scale_val
 
     if apollo_scale_type == "channel":
-        if side == "right":
-            norm_G = torch.linalg.vector_norm(grad_work, ord=2, dim=-1, keepdim=True, dtype=torch.float32)
-            norm_G_sq = norm_G.square()
+        if native_norm_G_sq is None:
+            norm_dim = -1 if side == "right" else -2
+            norm_G_sq = torch.linalg.vector_norm(
+                grad_work, ord=2, dim=norm_dim, keepdim=True, dtype=torch.float32
+            ).square()
         else:
-            norm_G = torch.linalg.vector_norm(grad_work, ord=2, dim=-2, keepdim=True, dtype=torch.float32)
-            norm_G_sq = norm_G.square()
-        current_norm_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
-
+            norm_G_sq = native_norm_G_sq
+        norm_unscaled_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
     else:
-        current_norm_t = torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32) * scaling_factor
+        grad_norm_t = (
+            native_grad_norm if native_grad_norm is not None
+            else torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32)
+        )
+        norm_unscaled_t = grad_norm_t * scaling_factor
 
-    is_finite = torch.isfinite(current_norm_t)
-    current_norm_t = torch.where(is_finite, current_norm_t, torch.zeros_like(current_norm_t))
-
-    if not enable_fira_for_apollo:
-        final_scale = scaling_factor
-    else:
+    if enable_fira_for_apollo:
+        current_norm_t = torch.where(
+            torch.isfinite(norm_unscaled_t),
+            norm_unscaled_t,
+            torch.zeros_like(norm_unscaled_t),
+        )
         fira_fs = _compute_fira_scale(
             state, current_norm_t, fira_margin, param_work.device,
             state_key="scaled_grad_norm_prev")
         final_scale = scaling_factor * fira_fs
+    else:
+        final_scale = scaling_factor
 
     # --- APOLLO Scale Back ---
     if not apollo_scale_front:
         final_scale = final_scale * apollo_scale_val
 
-    numel = grad_work.numel()
-    if apollo_scale_type == "channel":
-        norm_unscaled_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
-    else:
-        norm_unscaled_t = torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32) * scaling_factor
-        
-    denom_t = torch.clamp_min(norm_unscaled_t / (math.sqrt(numel) * d), 1.0) if d > 0 else _get_one(param_work.device)
+    numel = param_work.numel()
+    denom_t = torch.clamp_min(
+        norm_unscaled_t / (math.sqrt(numel) * d), 1.0
+    ) if d > 0 else _get_one(param_work.device)
 
     if weight_decay != 0:
         wd_multiplier_t = alpha_t if scale_weight_decay else rho_t
         decay_factor = 1.0 - (wd_multiplier_t * weight_decay)
-        param_work.mul_(decay_factor)
+    else:
+        decay_factor = None
 
     update_scale_t = -alpha_t / denom_t
     
@@ -2576,15 +2989,63 @@ def _update_param_apollo(
                 update_scale_t = update_scale_t * (math.sqrt(bc2) / bc1)
             else:
                 update_scale_t = update_scale_t / bc1
-        
-    if apollo_scale_type == "channel":
-        final_scale_cast = final_scale.to(grad_work.dtype)
-        param_work.addcmul_(grad_work, final_scale_cast, value=update_scale_t)
-    else:
-        param_work.add_(grad_work, alpha=update_scale_t * final_scale)
 
-    if apollo_scale_type == "channel":
-        del norm_G_sq, norm_G
+    use_sr_writeback = stochastic_round_writeback and (use_bf16 or use_fp16)
+    use_fused_det_bf16_fallback = (
+        not stochastic_round_writeback and use_bf16
+        and _cuda_ready and _CUDA_MODULE is not None and _CUDA_AVAILABLE
+    )
+
+    if grad_native is None and (use_sr_writeback or use_fused_det_bf16_fallback) and not grad_work.is_contiguous():
+        grad_work = grad_work.contiguous()
+
+    side_right = (side == "right")
+    is_channel = 1 if apollo_scale_type == "channel" else 0
+    decay_t = decay_factor if decay_factor is not None else _get_one(param_work.device)
+
+    if native_grad_binding is not None:
+        args = (
+            param_work, grad_native, final_scale, decay_t, update_scale_t,
+            int(side_right), is_channel, int(maximize),
+        )
+        if stochastic_round_writeback:
+            sr_seed = int(state.get("sr_seed", 0))
+            sr_step = int(state.get("step", 0))
+            native_grad_binding(*args, sr_seed, sr_step)
+        else:
+            native_grad_binding(*args)
+    elif use_sr_writeback:
+        sr_seed = int(state.get("sr_seed", 0))
+        sr_step = int(state.get("step", 0))
+        if _cuda_ready and _CUDA_MODULE is not None and _CUDA_AVAILABLE:
+            sr_kernel = (
+                _CUDA_MODULE.apollo_apply_bf16_sr if use_bf16
+                else _CUDA_MODULE.apollo_apply_fp16_sr
+            )
+            sr_kernel(
+                param_work, grad_work, final_scale, decay_t, update_scale_t,
+                int(side_right), is_channel, sr_seed, sr_step,
+            )
+        else:
+            param_fp32 = param_work.to(torch.float32)
+            if decay_factor is not None:
+                param_fp32 = param_fp32 * decay_factor
+            param_fp32 = param_fp32 + grad_work * final_scale.to(torch.float32) * update_scale_t
+            param_work.copy_(_stochastic_round_lowp_pytorch(
+                param_fp32, param_work.dtype, seed=sr_seed, step=sr_step))
+    elif use_fused_det_bf16_fallback:
+        _CUDA_MODULE.apollo_apply_bf16_det(
+            param_work, grad_work, final_scale, decay_t, update_scale_t,
+            int(side_right), is_channel,
+        )
+    else:
+        if decay_factor is not None:
+            param_work.mul_(decay_factor)
+        if apollo_scale_type == "channel":
+            param_work.addcmul_(grad_work, final_scale.to(grad_work.dtype), value=update_scale_t)
+        else:
+            param_work.add_(grad_work, alpha=update_scale_t * final_scale)
+
     del grad_low, scaling_factor, final_scale, proj_matrix_T, update_low
     
     if needs_copy_back:

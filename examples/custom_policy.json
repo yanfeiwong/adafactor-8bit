@@ -1,0 +1,63 @@
+{
+  "defaults": {
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "weight_decay": 0.001,
+    "relative_step": false,
+    "scale_parameter": false,
+    "scale_weight_decay": false,
+    "block_size": 256,
+    "m_block_size": 256,
+    "enable_fira_for_adafactor": true,
+    "fira_margin": 0.01
+  },
+  "presets": {
+    "adam": {
+      "preset": "adamw",
+      "factored": false,
+      "beta3": null,
+      "d": 0.0,
+      "eps": [1e-8, 0.001]
+    },
+    "apollo_training": {
+      "preset": "apollo",
+      "beta3": null,
+      "d": 0.0,
+      "eps": [1e-8, 0.001],
+      "apollo_rank": 8,
+      "apollo_update_proj_gap": 200,
+      "apollo_scale_type": "channel",
+      "apollo_scale": 1.0,
+      "apollo_eps": 1e-8,
+      "apollo_factorize": false,
+      "apollo_cache_proj": false,
+      "enable_fira_for_apollo": true
+    }
+  },
+  "mapping": {
+    "one_d": {
+      "preset": "adam",
+      "weight_decay": 0.0,
+      "quantize": false
+    },
+    "embedding": {
+      "preset": "adam",
+      "beta1": null,
+      "weight_decay": 0.0,
+      "quantize": false
+    },
+    "matrix": {
+      "preset": "adam",
+      "quantize": true,
+      "m_quant_type": "uf8",
+      "v_quant_type": "al8"
+    },
+    "apollo": {
+      "preset": "apollo_training",
+      "quantize": true,
+      "m_block_size": 128,
+      "m_quant_type": "uf4",
+      "v_quant_type": "al8"
+    }
+  }
+}
