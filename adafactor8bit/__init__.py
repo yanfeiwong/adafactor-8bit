@@ -5,4 +5,4 @@ from .optimizer import Adafactor8Bit
 from .routing import build_param_groups
 
 __all__ = ["Adafactor8Bit", "build_param_groups"]
-__version__ = "0.4.5"
+__version__ = "0.4.6"

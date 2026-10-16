@@ -732,8 +732,39 @@ def _apollo_m_ema(state, U_t_or_grad, beta1, m_quant_type, m_curr_block_size, nu
 # ==========================================
 # 8. FiRA Update Scaling
 # ==========================================
+def _fira_scalar_cuda(state: Dict[str, Any], x: Tensor, alpha: Optional[Tensor],
+                      fira_margin: float, state_key: str) -> Optional[Tensor]:
+    if (_CUDA_MODULE is None or not _CUDA_AVAILABLE
+            or not hasattr(_CUDA_MODULE, "fira_scalar")
+            or not x.is_cuda or x.dtype != torch.float32 or x.numel() != 1
+            or not math.isfinite(fira_margin)):
+        return None
+    apply = alpha is not None
+    shape = torch.Size([]) if apply else x.shape
+    fp = state.get(state_key)
+    if fp is not None:
+        if not isinstance(fp, Tensor):
+            fp = torch.tensor(fp, device=x.device, dtype=torch.float32)
+        if fp.dtype != torch.float32 or fp.device != x.device or fp.shape != shape:
+            return None
+    if apply and (alpha.dtype != torch.float32 or alpha.device != x.device or alpha.numel() != 1):
+        return None
+    margin = 1.0 + fira_margin
+    out = _CUDA_MODULE.fira_scalar(
+        x, fp if fp is not None else x, alpha if apply else x,
+        fp is not None, apply, margin, 1.0 / margin)
+    state[state_key] = out[1].view(shape)
+    return out
+
+
 def _compute_fira_scale(state: Dict[str, Any], curr_norm: Tensor,
-                        fira_margin: float, device: torch.device, state_key: str = "fira_prev_norm") -> Tensor:
+                        fira_margin: float, device: torch.device, state_key: str = "fira_prev_norm",
+                        use_cuda_kernel: bool = False) -> Tensor:
+    if use_cuda_kernel:
+        shape = curr_norm.shape if state.get(state_key) is not None else torch.Size([])
+        out = _fira_scalar_cuda(state, curr_norm, None, fira_margin, state_key)
+        if out is not None:
+            return out[0].view(shape)
     is_fin = torch.isfinite(curr_norm)
     curr_norm = torch.where(is_fin, curr_norm, torch.zeros_like(curr_norm))
     fp = state.get(state_key, None)
@@ -752,6 +783,9 @@ def _compute_fira_scale(state: Dict[str, Any], curr_norm: Tensor,
 
 
 def _apply_fira_cuda(state: Dict[str, Any], total_sum_sq: Tensor, alpha: Tensor, fira_margin: float) -> Tuple[Tensor, Tensor]:
+    out = _fira_scalar_cuda(state, total_sum_sq, alpha, fira_margin, "fira_prev_norm")
+    if out is not None:
+        return out[0].view(alpha.shape), out[2].view(total_sum_sq.shape)
     current_norm = total_sum_sq.sqrt().view([])
     is_finite = torch.isfinite(current_norm)
     total_sum_sq = torch.where(is_finite, total_sum_sq, torch.zeros_like(total_sum_sq))
@@ -1033,7 +1067,8 @@ def _dispatch_cuda_clip(state, device, alpha, d, enable_fira, fira_margin, lag_n
         curr_norm = norm_buf.sqrt()
         state["prev_update_norm"] = curr_norm
         if enable_fira:
-            state["lag_fira_scale"] = _compute_fira_scale(state, curr_norm.view([]), fira_margin, device)
+            state["lag_fira_scale"] = _compute_fira_scale(
+                state, curr_norm.view([]), fira_margin, device, use_cuda_kernel=True)
     else:
         norm_buf = _get_norm_buf(device)
         launch_norm(norm_buf)
@@ -2626,9 +2661,10 @@ def _update_param_apollo(
     R, C = shape[-2], shape[-1]
     side = "right" if R >= C else "left"
 
+    need_norm = enable_fira_for_apollo or d > 0
     native_norm_G_sq = None
     native_grad_norm = None
-    if grad_native is not None:
+    if need_norm and grad_native is not None:
         if apollo_scale_type == "channel":
             norm_dim = -1 if side == "right" else -2
             native_norm_G_sq = torch.linalg.vector_norm(
@@ -2674,7 +2710,7 @@ def _update_param_apollo(
                 row_mean_val = row_var.mean(dim=-2, keepdim=True).clamp(min=_LOG_QUANT_FLOOR)
                 inv_row, inv_col = _factored_inv_std(row_var, col_var, row_mean_val)
                 
-                U_t = grad_low.mul_(inv_row).mul_(inv_col)
+                U_t = grad_low.mul(inv_row).mul_(inv_col)
                 if d > 0:
                     rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
                     U_t.div_(torch.clamp(rms_u / d, min=1.0))
@@ -2701,7 +2737,7 @@ def _update_param_apollo(
                     _quant_v(state, "conf_row_low", c_row, curr_block_size, c_quant_type)
                     _quant_v(state, "conf_col_low", c_col, curr_block_size, c_quant_type)
                 else:
-                    if "conf_row_low" not in state:
+                    if state.get("conf_row_low") is None:
                         state["conf_row_low"] = torch.zeros_like(res_row)
                         state["conf_col_low"] = torch.zeros_like(res_col)
                     state["conf_row_low"].lerp_(res_row, 1.0 - beta3)
@@ -2773,7 +2809,7 @@ def _update_param_apollo(
                     else:
                         state["res_low"] = torch.zeros_like(grad_low)
 
-                if quantize and _cuda_ready and m_quant_type != 'fp32' and v_quant_type != 'fp32':
+                if quantize and _cuda_ready and m_quant_type != 'fp32' and v_quant_type != 'fp32' and c_quant_type != 'fp32':
                     if state.get("m_low_q") is None:
                         _m_init_state(state, grad_low_numel, m_curr_block_size, m_quant_type, grad_low.device, prefix="m_low")
                     _res_fp32 = _deq_v(state, "res_low")
@@ -2830,7 +2866,7 @@ def _update_param_apollo(
                 else:
                     v_low_reshaped = v_low_deq.view_as(grad_low)
                     
-                    U_t = grad_low.mul_(v_low_reshaped.clamp(min=eps_sq).rsqrt())
+                    U_t = grad_low * v_low_reshaped.clamp(min=eps_sq).rsqrt()
                     if d > 0:
                         rms_u = torch.linalg.vector_norm(U_t) / math.sqrt(U_t.numel())
                         U_t.div_(torch.clamp(rms_u / d, min=1.0))
@@ -2934,31 +2970,27 @@ def _update_param_apollo(
     if apollo_scale_front:
         scaling_factor = scaling_factor * apollo_scale_val
 
-    if apollo_scale_type == "channel":
-        if native_norm_G_sq is None:
-            norm_dim = -1 if side == "right" else -2
-            norm_G_sq = torch.linalg.vector_norm(
-                grad_work, ord=2, dim=norm_dim, keepdim=True, dtype=torch.float32
-            ).square()
+    if need_norm:
+        if apollo_scale_type == "channel":
+            if native_norm_G_sq is None:
+                norm_dim = -1 if side == "right" else -2
+                norm_G_sq = torch.linalg.vector_norm(
+                    grad_work, ord=2, dim=norm_dim, keepdim=True, dtype=torch.float32
+                ).square()
+            else:
+                norm_G_sq = native_norm_G_sq
+            norm_unscaled_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
         else:
-            norm_G_sq = native_norm_G_sq
-        norm_unscaled_t = torch.sqrt((norm_G_sq * scaling_factor.square()).sum())
-    else:
-        grad_norm_t = (
-            native_grad_norm if native_grad_norm is not None
-            else torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32)
-        )
-        norm_unscaled_t = grad_norm_t * scaling_factor
+            grad_norm_t = (
+                native_grad_norm if native_grad_norm is not None
+                else torch.linalg.vector_norm(grad_work, ord=2, dtype=torch.float32)
+            )
+            norm_unscaled_t = grad_norm_t * scaling_factor
 
     if enable_fira_for_apollo:
-        current_norm_t = torch.where(
-            torch.isfinite(norm_unscaled_t),
-            norm_unscaled_t,
-            torch.zeros_like(norm_unscaled_t),
-        )
         fira_fs = _compute_fira_scale(
-            state, current_norm_t, fira_margin, param_work.device,
-            state_key="scaled_grad_norm_prev")
+            state, norm_unscaled_t, fira_margin, param_work.device,
+            state_key="scaled_grad_norm_prev", use_cuda_kernel=_cuda_ready)
         final_scale = scaling_factor * fira_fs
     else:
         final_scale = scaling_factor

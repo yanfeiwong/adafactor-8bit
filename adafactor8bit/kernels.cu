@@ -3,6 +3,9 @@
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -2996,10 +2999,95 @@ void apollo_apply_fp16_sr_native_cuda(
         side_right, is_channel, maximize, (uint64_t)sr_seed, (uint64_t)sr_step, R, C);
 }
 
+// --- FiRA Scalar Update ---
+
+// Explicit rounding keeps FiRA independent of --use_fast_math.
+__device__ __forceinline__ float fira_add(float a, float b) {
+    float r;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ float fira_mul(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ float fira_div(float a, float b) {
+    float r;
+    asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ float fira_sqrt(float a) {
+    float r;
+    asm("sqrt.rn.f32 %0, %1;" : "=f"(r) : "f"(a));
+    return r;
+}
+
+template<bool APPLY, bool HAS_PREV>
+__global__ void fira_scalar_kernel(
+    const float* x, const float* prev, const float* alpha, float* out,
+    int64_t n, float margin, float inv_margin)
+{
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float input = x[i];
+    float norm = APPLY ? fira_sqrt(input) : input;
+    bool finite = isfinite(norm);
+    float curr = finite ? norm : 0.0f;
+    float scale = 1.0f, next = curr;
+    if constexpr (HAS_PREV) {
+        float p = prev[i];
+        float ratio = fira_div(curr, fira_add(p, 1.0e-8f));
+        float clamped = isnan(ratio) ? ratio : fmaxf(ratio, margin);
+        float limiter = fira_mul(clamped, inv_margin);
+        bool reset = p < 1.0e-6f;
+        scale = reset ? 1.0f : fira_div(1.0f, limiter);
+        next = reset ? curr : fira_mul(curr, scale);
+    }
+    out[i] = APPLY ? fira_mul(alpha[i], scale) : scale;
+    out[n + i] = next;
+    out[2 * n + i] = finite ? input : 0.0f;
+}
+
+torch::Tensor fira_scalar_cuda(
+    torch::Tensor x, torch::Tensor prev, torch::Tensor alpha,
+    bool has_prev, bool apply, double margin, double inv_margin)
+{
+    for (const auto& t : {x, prev, alpha}) {
+        TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kFloat && t.is_contiguous(),
+                    "FiRA expects contiguous CUDA FP32 tensors");
+        TORCH_CHECK(t.device() == x.device() && t.numel() == x.numel(), "FiRA input mismatch");
+    }
+    c10::cuda::CUDAGuard guard(x.device());
+    int64_t n = x.numel();
+    auto out = torch::empty({3 * n}, x.options());
+    if (n == 0) return out;
+    int threads = 128;
+    int blocks = (n + threads - 1) / threads;
+    auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+    #define FIRA_LAUNCH(A, H) fira_scalar_kernel<A, H><<<blocks, threads, 0, stream>>>( \
+        x.data_ptr<float>(), prev.data_ptr<float>(), alpha.data_ptr<float>(), \
+        out.data_ptr<float>(), n, (float)margin, (float)inv_margin)
+    if (apply) {
+        if (has_prev) { FIRA_LAUNCH(true, true); }
+        else { FIRA_LAUNCH(true, false); }
+    } else {
+        if (has_prev) { FIRA_LAUNCH(false, true); }
+        else { FIRA_LAUNCH(false, false); }
+    }
+    #undef FIRA_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 // ==========================================
 // 13. Python Bindings
 // ==========================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fira_scalar", &fira_scalar_cuda);
     m.def("set_qmap", &set_qmap_cuda);
     m.def("fused_log_quantize_lerp", &fused_log_quantize_lerp_cuda);
     m.def("fused_m_quantize_lerp", &fused_m_quantize_lerp_cuda);
